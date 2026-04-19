@@ -128,11 +128,11 @@ class GiftCodeHandler:
             """Redeem a gift code for all registered players."""
             await self._handle_redeem_gift_code_slash(interaction, gift_code)
 
-        @self._bot.tree.command(name="addplayer", description="Add a player to gift code redemption list")
-        @app_commands.describe(player_id="The player ID (API name) to add")
-        async def add_player(interaction: discord.Interaction, player_id: str):
+        @self._bot.tree.command(name="addplayer", description="Add one or more players to gift code redemption list")
+        @app_commands.describe(player_ids="The player ID(s) to add, comma-separated")
+        async def add_player(interaction: discord.Interaction, player_ids: str):
             """Add a player to gift code list using API name."""
-            await self._handle_add_player_slash(interaction, player_id)
+            await self._handle_add_player_slash(interaction, player_ids)
 
         @self._bot.tree.command(name="removeplayer", description="Remove a player from gift code redemption list")
         @app_commands.describe(player_id="The player ID to remove")
@@ -809,27 +809,23 @@ class GiftCodeHandler:
                 castle_level=resolved_castle_level,
             )
 
-    async def _handle_add_player_slash(self, interaction: discord.Interaction, player_id: str):
-        """Handle adding a player to the redemption list."""
+    async def _handle_add_player_slash(self, interaction: discord.Interaction, player_ids: str):
+        """Handle adding one or more players to the redemption list."""
         await interaction.response.defer(thinking=True)
 
         try:
-            # Validate player exists via PlayerInfoService
-            player_info = await self._player_info_service.get_player_info(player_id)
-            if player_info is None:
-                embed = discord.Embed(
-                    title="❌ Player Not Found",
-                    description=(
-                        f"Could not find a player with ID `{player_id}`.\n"
-                        f"Please verify the ID in-game and try again."
-                    ),
-                    color=discord.Color.red(),
+            # Parse multiple comma-separated IDs
+            import re
+            raw_ids = [pid.strip() for pid in re.split(r'[,\s]+', player_ids) if pid.strip()]
+            if not raw_ids:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="❌ Invalid Input",
+                        description="No valid player IDs provided.",
+                        color=discord.Color.red(),
+                    )
                 )
-                await interaction.followup.send(embed=embed)
-                logger.warning(f"Attempt to add non-existent player ID {player_id}")
                 return
-
-            await self._sync_player_metadata_from_lookup(player_id, player_info)
 
             db = get_db()
             async with db.session() as session:
@@ -841,49 +837,81 @@ class GiftCodeHandler:
                     interaction.user.display_name,
                 )
 
-                # Use API-provided name only
-                resolved_player_id = str(player_info.get("playerId") or player_id)
-                resolved_name = player_info.get("name")
-                resolved_kingdom = str(player_info.get("kingdom")) if player_info.get("kingdom") is not None else None
-                resolved_castle_level = (
-                    str(player_info.get("levelRenderedDetailed") or player_info.get("level"))
-                    if (player_info.get("levelRenderedDetailed") or player_info.get("level") is not None)
-                    else None
-                )
+            added_players = []
+            not_found_players = []
 
-                await DatabaseService.add_registered_player(
-                    session,
-                    player_id=resolved_player_id,
-                    added_by_user_id=interaction.user.id,
-                    player_name=resolved_name,
-                    kingdom=resolved_kingdom,
-                    castle_level=resolved_castle_level,
-                    enabled=True,
-                )
+            for pid in raw_ids:
+                # Validate player exists via PlayerInfoService
+                player_info = await self._player_info_service.get_player_info(pid)
+                if player_info is None:
+                    not_found_players.append(pid)
+                    logger.warning(f"Attempt to add non-existent player ID {pid}")
+                    continue
 
+                await self._sync_player_metadata_from_lookup(pid, player_info)
+
+                db = get_db()
+                async with db.session() as session:
+                    # Use API-provided name only
+                    resolved_player_id = str(player_info.get("playerId") or pid)
+                    resolved_name = player_info.get("name")
+                    resolved_kingdom = str(player_info.get("kingdom")) if player_info.get("kingdom") is not None else None
+                    resolved_castle_level = (
+                        str(player_info.get("levelRenderedDetailed") or player_info.get("level"))
+                        if (player_info.get("levelRenderedDetailed") or player_info.get("level") is not None)
+                        else None
+                    )
+
+                    await DatabaseService.add_registered_player(
+                        session,
+                        player_id=resolved_player_id,
+                        added_by_user_id=interaction.user.id,
+                        player_name=resolved_name,
+                        kingdom=resolved_kingdom,
+                        castle_level=resolved_castle_level,
+                        enabled=True,
+                    )
+                    
+                    added_players.append(f"`{resolved_player_id}`" + (f" ({resolved_name})" if resolved_name else ""))
+                    logger.info(f"Player {resolved_player_id} added by {interaction.user.id}")
+
+            # Build final response embed
+            if not added_players and not_found_players:
                 embed = discord.Embed(
-                    title="✅ Player Added Successfully",
-                    description="Player profile saved and enabled for gift code redemption.",
-                    color=discord.Color.green(),
+                    title="❌ Players Not Found",
+                    description=f"Could not find any of the provided player IDs: {', '.join('`' + p + '`' for p in not_found_players)}\nPlease verify the IDs in-game and try again.",
+                    color=discord.Color.red(),
                 )
-                embed.add_field(name="Player ID", value=f"`{resolved_player_id}`", inline=True)
-                if resolved_name:
-                    embed.add_field(name="Player Name", value=resolved_name, inline=True)
-                if resolved_kingdom:
-                    embed.add_field(name="Kingdom", value=resolved_kingdom, inline=True)
-                if resolved_castle_level:
-                    embed.add_field(name="Castle Level", value=resolved_castle_level, inline=True)
-                embed.add_field(name="Status", value="✅ Enabled", inline=True)
-
                 await interaction.followup.send(embed=embed)
-                logger.info(f"Player {resolved_player_id} added by {interaction.user.id}")
+                return
+
+            embed = discord.Embed(
+                title=f"✅ {len(added_players)} Player(s) Added Successfully",
+                description="Player profiles saved and enabled for gift code redemption.",
+                color=discord.Color.green(),
+            )
+            
+            # Use chunks so we don't hit max limit of discord fields
+            chunk_size = 10
+            for i in range(0, len(added_players), chunk_size):
+                chunk = added_players[i:i+chunk_size]
+                embed.add_field(name=f"Added Players ({i+1}-{i+len(chunk)})", value="\n".join(chunk), inline=False)
+                
+            if not_found_players:
+                embed.add_field(
+                    name="❌ Not Found",
+                    value=", ".join(not_found_players),
+                    inline=False
+                )
+
+            await interaction.followup.send(embed=embed)
 
         except Exception as e:
-            logger.error(f"Error adding player {player_id}: {e}", exc_info=True)
+            logger.error(f"Error adding players {player_ids}: {e}", exc_info=True)
             await interaction.followup.send(
                 embed=self._build_status_embed(
-                    title="❌ Could Not Add Player",
-                    description="An error occurred while adding the player.",
+                    title="❌ Could Not Add Players",
+                    description="An error occurred while adding the players. Please check logs.",
                     color=discord.Color.red(),
                 )
             )

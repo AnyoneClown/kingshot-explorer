@@ -34,6 +34,7 @@ class KVKService(IKVKService):
         """
         self._api_base_url = api_base_url
         self._endpoint_template = f"{api_base_url}/nexus/kingdoms/{{kingdom_number}}"
+        self._matches_endpoint_template = "https://kingshot.net/api/kvk/matches?kingdom_a={kingdom_number}"
         self._session: Optional[aiohttp.ClientSession] = None
         logger.info(f"KVKService initialized with endpoint template: {self._endpoint_template}")
 
@@ -71,33 +72,86 @@ class KVKService(IKVKService):
             Dictionary containing the API response with kingdom stats
         """
         endpoint = self._endpoint_template.format(kingdom_number=kingdom_number)
-        logger.info(f"Fetching KVK stats for kingdom {kingdom_number} from {endpoint}")
+        matches_endpoint = self._matches_endpoint_template.format(kingdom_number=kingdom_number)
+        logger.info(f"Fetching KVK stats for kingdom {kingdom_number} from {endpoint} and {matches_endpoint}")
 
         try:
             http_session = await self.ensure_session()
 
-            async with http_session.get(
-                endpoint,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
-                response_data = await response.json(content_type=None)
+            nexus_task = http_session.get(endpoint, timeout=aiohttp.ClientTimeout(total=10))
+            matches_task = http_session.get(matches_endpoint, timeout=aiohttp.ClientTimeout(total=10))
 
-                if response.status == 200 and response_data.get("status") == "success":
-                    data = response_data.get("data", {})
-                    logger.info(f"Successfully fetched KVK stats for kingdom {kingdom_number}")
-                    return {
-                        "success": True,
-                        "data": data,
-                        "message": response_data.get("message", "Kingdom stats retrieved successfully"),
-                    }
+            responses = await asyncio.gather(nexus_task, matches_task, return_exceptions=True)
+            nexus_response, matches_response = responses
 
-                error_message = response_data.get("message", "Failed to fetch kingdom stats")
-                logger.warning(f"Failed to fetch KVK stats for kingdom {kingdom_number}: {error_message}")
+            if isinstance(nexus_response, Exception):
+                raise nexus_response
+
+            response_data = await nexus_response.json(content_type=None)
+
+            if nexus_response.status == 200 and response_data.get("status") == "success":
+                data = response_data.get("data", {})
+                
+                # Fetch and merge matches
+                if not isinstance(matches_response, Exception) and matches_response.status == 200:
+                    matches_json = await matches_response.json(content_type=None)
+                    if matches_json.get("status") == "success":
+                        raw_matches = matches_json.get("data", [])
+                        history = data.get("history", [])
+                        
+                        history_map = {item.get("kvk"): item for item in history if item.get("kvk") is not None}
+                        merged_history = []
+                        
+                        for m in raw_matches:
+                            kvk_number = m.get("season_id")
+                            if not kvk_number:
+                                continue
+                                
+                            if kvk_number in history_map:
+                                merged_history.append(history_map.pop(kvk_number))
+                            else:
+                                kingdom_a = m.get("kingdom_a")
+                                kingdom_b = m.get("kingdom_b")
+                                opponent = kingdom_b if kingdom_a == kingdom_number else kingdom_a
+                                
+                                winner = m.get("castle_winner") or m.get("prep_winner")
+                                if winner == kingdom_number:
+                                    result = "win"
+                                elif winner == opponent:
+                                    result = "loss"
+                                else:
+                                    result = "draw"
+
+                                merged_history.append({
+                                    "kvk": kvk_number,
+                                    "kingdom": kingdom_number,
+                                    "opponent": opponent,
+                                    "ratingBefore": None,
+                                    "ratingAfter": None,
+                                    "result": result,
+                                    "ratingChange": None
+                                })
+                        
+                        # Add remaining nexus history that wasn't in matches
+                        merged_history.extend(history_map.values())
+                        # Sort by kvk descending
+                        merged_history.sort(key=lambda x: x.get("kvk", 0), reverse=True)
+                        data["history"] = merged_history
+
+                logger.info(f"Successfully fetched KVK stats for kingdom {kingdom_number}")
                 return {
-                    "success": False,
-                    "message": error_message,
-                    "status_code": response.status,
+                    "success": True,
+                    "data": data,
+                    "message": response_data.get("message", "Kingdom stats retrieved successfully"),
                 }
+
+            error_message = response_data.get("message", "Failed to fetch kingdom stats")
+            logger.warning(f"Failed to fetch KVK stats for kingdom {kingdom_number}: {error_message}")
+            return {
+                "success": False,
+                "message": error_message,
+                "status_code": nexus_response.status,
+            }
 
         except aiohttp.ClientError as e:
             logger.error(f"Network error fetching KVK stats for kingdom {kingdom_number}: {e}", exc_info=True)
