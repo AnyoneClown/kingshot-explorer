@@ -8,7 +8,7 @@ import os
 
 import discord
 from discord.ext import commands
-from google import genai
+from openai import OpenAI
 
 from config import BotConfig
 from config.logging_config import setup_logging
@@ -46,8 +46,15 @@ class TranslatorBot:
 
         # Initialize services
         logger.info("Initializing services...")
-        gemini_client = genai.Client()
-        self.translation_service = TranslationService(gemini_client)
+        nvidia_client = OpenAI(
+            base_url=config.nvidia_base_url,
+            api_key=config.nvidia_api_key,
+        )
+        self.translation_service = TranslationService(
+            nvidia_client,
+            model=config.nvidia_model,
+            max_chat_response_chars=config.max_chat_response_chars,
+        )
         self.event_scheduler_service = EventSchedulerService()
         self.player_info_service = PlayerInfoService()
         self.gift_code_service = GiftCodeService()

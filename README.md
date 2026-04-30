@@ -6,6 +6,7 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 
 - Slash command based bot architecture.
 - Auto-translation and manual translation features.
+- NVIDIA NIM powered translation plus contextual chat replies.
 - Event scheduling with background task execution.
 - Player info lookups and KVK command support.
 - Gift code polling and auto-redemption for registered players.
@@ -49,9 +50,16 @@ pip install -r requirements.txt
 ```env
 DISCORD_TOKEN=your_discord_bot_token_here
 COCKROACHDB_URL=cockroachdb+asyncpg://postgres:password@host:26257/database-name
+NVIDIA_API_KEY=your_nvidia_api_key_here
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+NVIDIA_MODEL=openai/gpt-oss-120b
 COMMAND_PREFIX=!
 TRANSLATOR_ROLE=Translator
 AUTO_REDEEM_CHANNELS=123456789012345678,876543210987654321
+RANDOM_REPLY_CHANCE=0.08
+RANDOM_REPLY_COOLDOWN_SECONDS=180
+CHAT_HISTORY_LIMIT=12
+MAX_CHAT_RESPONSE_CHARS=500
 LOG_LEVEL=INFO
 ```
 
@@ -98,6 +106,7 @@ main.py      Application entrypoint
 
 - OCR functionality has been removed from this project.
 - Keep AUTO_REDEEM_CHANNELS empty if you do not want announcement messages.
+- The bot will always answer when directly mentioned or replied to, and it can also reply randomly based on recent channel history.
 
 ## License
 
