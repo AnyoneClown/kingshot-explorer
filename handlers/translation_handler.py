@@ -259,15 +259,26 @@ class TranslationHandler:
         if self._config and message.author.id in self._config.banned_players:
             return
 
-        if not self._should_attempt_reply(message):
+        direct_trigger = self._is_direct_mention_or_reply(message)
+        if not self._should_attempt_reply(message, direct_trigger=direct_trigger):
             return
 
         try:
             history = await self._collect_conversation_context(message)
             async with message.channel.typing():
-                reply_text = self._translation_service.generate_contextual_reply(message.content, history)
+                reply_text = self._translation_service.generate_contextual_reply(
+                    message.content,
+                    history,
+                    force_reply=direct_trigger,
+                )
 
             if not reply_text:
+                logger.info(
+                    "Contextual chat produced no reply for message %s in channel %s (direct_trigger=%s)",
+                    message.id,
+                    message.channel.id,
+                    direct_trigger,
+                )
                 return
 
             await message.reply(
@@ -279,9 +290,12 @@ class TranslationHandler:
         except Exception as e:
             logger.error(f"Contextual chat error: {e}", exc_info=True)
 
-    def _should_attempt_reply(self, message: discord.Message) -> bool:
+    def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
         """Return True if the bot should try generating a chat reply."""
-        if self._is_direct_mention_or_reply(message):
+        if direct_trigger is None:
+            direct_trigger = self._is_direct_mention_or_reply(message)
+
+        if direct_trigger:
             return True
 
         if not self._config:

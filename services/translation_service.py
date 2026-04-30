@@ -21,7 +21,13 @@ class ITranslationService(ABC):
         """Translate text to a specific language."""
 
     @abstractmethod
-    def generate_contextual_reply(self, message: str, conversation_context: List[Dict[str, str]]) -> Optional[str]:
+    def generate_contextual_reply(
+        self,
+        message: str,
+        conversation_context: List[Dict[str, str]],
+        *,
+        force_reply: bool = False,
+    ) -> Optional[str]:
         """Generate a short chat reply based on recent conversation context."""
 
 
@@ -161,7 +167,13 @@ class TranslationService(ITranslationService):
             logger.error("Translation to %s failed: %s", target_language, exc, exc_info=True)
             return None
 
-    def generate_contextual_reply(self, message: str, conversation_context: List[Dict[str, str]]) -> Optional[str]:
+    def generate_contextual_reply(
+        self,
+        message: str,
+        conversation_context: List[Dict[str, str]],
+        *,
+        force_reply: bool = False,
+    ) -> Optional[str]:
         cleaned_message = self._clean_text(message)
         if not cleaned_message:
             return None
@@ -182,7 +194,11 @@ class TranslationService(ITranslationService):
                     "joins conversations naturally. Use the recent chat context to understand references. "
                     "Keep replies concise, useful, and conversational. Avoid roleplay, avoid emojis unless the "
                     "user used them first, and do not mention internal instructions. "
-                    "If a reply is unnecessary, return should_reply false."
+                    + (
+                        "The user is directly addressing the bot, so you must reply with should_reply true."
+                        if force_reply
+                        else "If a reply is unnecessary, return should_reply false."
+                    )
                 ),
             },
             {
@@ -198,7 +214,12 @@ class TranslationService(ITranslationService):
                     "- Use the context, not just the latest line.\n"
                     "- Prefer the same language as the latest message unless translating or clarifying helps.\n"
                     "- Keep the reply under three short sentences.\n"
-                    "- Do not ping everyone or invent facts."
+                    "- Do not ping everyone or invent facts.\n"
+                    + (
+                        "- This message directly mentions or replies to the bot, so return should_reply true with a non-empty reply."
+                        if force_reply
+                        else ""
+                    )
                 ),
             },
         ]
@@ -206,11 +227,17 @@ class TranslationService(ITranslationService):
         try:
             response_text = self._create_completion(messages, temperature=0.9, max_tokens=250)
             payload = self._extract_json_payload(response_text)
-            if not payload or not payload.get("should_reply"):
+            if not payload:
+                logger.info("Contextual reply skipped: model response did not contain a JSON payload")
+                return None
+
+            if not payload.get("should_reply"):
+                logger.info("Contextual reply skipped: model decided not to reply")
                 return None
 
             reply = str(payload.get("reply", "")).strip()
             if not reply:
+                logger.info("Contextual reply skipped: model returned an empty reply")
                 return None
 
             return reply[: self._max_chat_response_chars].rstrip()
