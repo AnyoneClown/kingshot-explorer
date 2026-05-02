@@ -177,6 +177,27 @@ def test_generate_contextual_reply_force_reply_uses_plain_text_when_model_omits_
     assert result == "You just said: JUST SAY WHAT DID I SAY JUST NOW"
 
 
+def test_generate_contextual_reply_recovers_truncated_json_reply():
+    expected_reply = (
+        "Reginald’s last thing was “Holy guacamole.” Earlier he asked about eBay items, "
+        "said “Jesus Christ,” “Welp,” and “I’m sleep-deprived giggling.”"
+    )
+    service = TranslationService(
+        FakeClient(['{"should_reply":true,"reply":"' + expected_reply]),
+        model="openai/gpt-oss-120b",
+    )
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "What did reg say?",
+            [{"author": "Reginald", "content": "Holy guacamole"}],
+            force_reply=True,
+        )
+    )
+
+    assert result == expected_reply
+
+
 def test_generate_contextual_reply_random_candidate_ignores_plain_text_without_json():
     service = TranslationService(
         FakeClient(["This is a plain text answer"]),

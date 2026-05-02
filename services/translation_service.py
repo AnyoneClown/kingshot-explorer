@@ -51,7 +51,7 @@ class TranslationService(ITranslationService):
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
-    def _extract_json_payload(self, response_text: str) -> Optional[Dict[str, str]]:
+    def _extract_json_payload(self, response_text: str) -> Optional[Dict[str, object]]:
         """Extract the first JSON object from a model response."""
         if not response_text:
             return None
@@ -70,8 +70,31 @@ class TranslationService(ITranslationService):
                 if isinstance(payload, dict):
                     return payload
             except json.JSONDecodeError:
-                continue
+                payload = self._extract_truncated_contextual_reply_payload(stripped[index:])
+                if payload:
+                    return payload
         return None
+
+    def _extract_truncated_contextual_reply_payload(self, response_text: str) -> Optional[Dict[str, object]]:
+        """Recover contextual replies when the model truncates the closing JSON quote/brace."""
+        if '"should_reply"' not in response_text or '"reply"' not in response_text:
+            return None
+
+        should_reply_match = re.search(r'"should_reply"\s*:\s*(true|false)', response_text, flags=re.IGNORECASE)
+        reply_match = re.search(r'"reply"\s*:\s*"((?:\\.|[^"\\])*)', response_text, flags=re.DOTALL)
+        if not should_reply_match or not reply_match:
+            return None
+
+        reply_fragment = reply_match.group(1).strip()
+        try:
+            reply = json.loads(f'"{reply_fragment}"')
+        except json.JSONDecodeError:
+            reply = reply_fragment
+
+        return {
+            "should_reply": should_reply_match.group(1).lower() == "true",
+            "reply": reply,
+        }
 
     def _extract_plain_reply(self, response_text: str) -> Optional[str]:
         """Extract a usable plain-text answer when a forced reply omits JSON."""
