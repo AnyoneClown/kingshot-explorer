@@ -23,6 +23,7 @@ class EventHandler:
         """
         self._scheduler_service = scheduler_service
         self._bot = bot
+        self._scheduler_loop = None
 
     def register_commands(self):
         """Register all event scheduling commands with the bot."""
@@ -50,6 +51,9 @@ class EventHandler:
 
     def start_scheduler_task(self):
         """Start the background task that checks for due events."""
+        if self._scheduler_loop and self._scheduler_loop.is_running():
+            logger.info("Event scheduler task already running; skipping duplicate start")
+            return
 
         @tasks.loop(minutes=1)
         async def check_scheduled_events():
@@ -64,7 +68,12 @@ class EventHandler:
                 for event_time, role_names, message in events:
                     await self._send_event_notification(channel, role_names, message)
 
+        self._scheduler_loop = check_scheduled_events
         check_scheduled_events.start()
+
+    def is_scheduler_running(self) -> bool:
+        """Return whether the scheduler loop is currently active."""
+        return bool(self._scheduler_loop and self._scheduler_loop.is_running())
 
     async def _handle_schedule_event(self, interaction: discord.Interaction, date: str, time: str, message: str):
         """Handle scheduling a new event."""

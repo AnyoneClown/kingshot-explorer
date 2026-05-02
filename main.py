@@ -5,15 +5,24 @@ Follows SOLID principles for maintainability and extensibility.
 
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from config import BotConfig
 from config.logging_config import setup_logging
 from db import init_db
-from handlers import DatabaseHandler, EventHandler, GiftCodeHandler, KVKHandler, PlayerInfoHandler, TranslationHandler
+from handlers import (
+    DatabaseHandler,
+    EventHandler,
+    GiftCodeHandler,
+    KVKHandler,
+    PlayerInfoHandler,
+    StatusHandler,
+    TranslationHandler,
+)
 from services import EventSchedulerService, GiftCodeService, KVKService, PlayerInfoService, TranslationService
 
 logger = logging.getLogger(__name__)
@@ -30,6 +39,7 @@ class TranslatorBot:
             config: Bot configuration object
         """
         self.config = config
+        self.started_at = datetime.now(timezone.utc)
         logger.info("Initializing TranslatorBot")
 
         # Initialize database
@@ -46,12 +56,12 @@ class TranslatorBot:
 
         # Initialize services
         logger.info("Initializing services...")
-        nvidia_client = OpenAI(
+        self.nvidia_client = AsyncOpenAI(
             base_url=config.nvidia_base_url,
             api_key=config.nvidia_api_key,
         )
         self.translation_service = TranslationService(
-            nvidia_client,
+            self.nvidia_client,
             model=config.nvidia_model,
             max_chat_response_chars=config.max_chat_response_chars,
         )
@@ -69,6 +79,13 @@ class TranslatorBot:
         self.gift_code_handler = GiftCodeHandler(self.gift_code_service, self.player_info_service, self.bot, config)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)
+        self.status_handler = StatusHandler(
+            self.bot,
+            config,
+            event_handler=self.event_handler,
+            gift_code_handler=self.gift_code_handler,
+            started_at=self.started_at,
+        )
         logger.info("All handlers initialized")
 
         # Setup bot
@@ -148,6 +165,7 @@ class TranslatorBot:
         self.kvk_handler.register_commands()
         self.database_handler.register_commands()
         self.database_handler.register_events()
+        self.status_handler.register_commands()
         logger.info("All command handlers registered")
 
     def run(self):
@@ -169,6 +187,11 @@ class TranslatorBot:
                 logger.info("Database connections closed")
             except Exception as e:
                 logger.error(f"Error closing database: {e}")
+            try:
+                asyncio.run(self.nvidia_client.close())
+                logger.info("NVIDIA client closed")
+            except Exception as e:
+                logger.error(f"Error closing NVIDIA client: {e}")
 
 
 def main():

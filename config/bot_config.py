@@ -19,7 +19,7 @@ class BotConfig:
     nvidia_model: str = "openai/gpt-oss-120b"
     random_reply_chance: float = 0.08
     random_reply_cooldown_seconds: int = 180
-    chat_history_limit: int = 12
+    chat_history_limit: int = 25
     max_chat_response_chars: int = 500
     banned_players: set = None
     auto_redeem_channels: set = None
@@ -88,7 +88,7 @@ class BotConfig:
             nvidia_model=os.getenv("NVIDIA_MODEL", "openai/gpt-oss-120b"),
             random_reply_chance=float(os.getenv("RANDOM_REPLY_CHANCE", "0.08")),
             random_reply_cooldown_seconds=int(os.getenv("RANDOM_REPLY_COOLDOWN_SECONDS", "180")),
-            chat_history_limit=int(os.getenv("CHAT_HISTORY_LIMIT", "12")),
+            chat_history_limit=int(os.getenv("CHAT_HISTORY_LIMIT", "25")),
             max_chat_response_chars=int(os.getenv("MAX_CHAT_RESPONSE_CHARS", "500")),
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,

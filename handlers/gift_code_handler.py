@@ -117,6 +117,7 @@ class GiftCodeHandler:
         self._player_info_service = player_info_service
         self._bot = bot
         self._config = config
+        self._polling_loop = None
         logger.info("GiftCodeHandler initialized")
 
     def register_commands(self):
@@ -163,6 +164,9 @@ class GiftCodeHandler:
 
     def start_polling_task(self):
         """Start the background task that checks for new gift codes."""
+        if self._polling_loop and self._polling_loop.is_running():
+            logger.info("Gift code polling task already running; skipping duplicate start")
+            return
 
         @tasks.loop(minutes=1)
         async def poll_gift_codes():
@@ -361,7 +365,12 @@ class GiftCodeHandler:
             logger.info("Waiting for bot to be ready before starting gift code polling...")
             await self._bot.wait_until_ready()
 
+        self._polling_loop = poll_gift_codes
         poll_gift_codes.start()
+
+    def is_polling_running(self) -> bool:
+        """Return whether the gift-code polling loop is currently active."""
+        return bool(self._polling_loop and self._polling_loop.is_running())
 
     async def _handle_list_gift_codes_slash(self, interaction: discord.Interaction):
         """Handle listing available gift codes."""

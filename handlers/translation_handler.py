@@ -7,6 +7,7 @@ import discord
 from discord.ext import commands
 
 from db import get_db
+from handlers.ui import EmbedColors, build_status_embed
 from services.database_service import DatabaseService
 from services.translation_service import ITranslationService
 
@@ -69,11 +70,23 @@ class TranslationHandler:
         """Handle translation to a specific language command."""
         # Check if user is banned from translation
         if self._config and ctx.author.id in self._config.banned_players:
-            await ctx.reply("⛔ You are currently blocked from using translation commands.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Translation Blocked",
+                    description="You are currently blocked from using translation commands.",
+                    color=EmbedColors.ERROR,
+                )
+            )
             return
 
         if not ctx.message.reference:
-            await ctx.reply("💬 Reply to a message first, then use this command (example: `!t spanish`).")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Reply Required",
+                    description="Reply to a message first, then use this command. Example: `!t spanish`.",
+                    color=EmbedColors.WARNING,
+                )
+            )
             return
 
         try:
@@ -81,20 +94,38 @@ class TranslationHandler:
             text_to_translate = original_message.content
 
             if not text_to_translate:
-                await ctx.reply("⚠️ The replied-to message is empty.")
+                await ctx.reply(
+                    embed=build_status_embed(
+                        title="Empty Message",
+                        description="The replied-to message does not contain text to translate.",
+                        color=EmbedColors.WARNING,
+                    )
+                )
                 return
 
             async with ctx.typing():
-                result = self._translation_service.translate_to_language(text_to_translate, target_language)
+                result = await self._translation_service.translate_to_language(text_to_translate, target_language)
 
             if result:
                 translated_text = result.get("text")
                 if not translated_text:
-                    await ctx.reply("❌ Translation completed but no text was returned.")
+                    await ctx.reply(
+                        embed=build_status_embed(
+                            title="Translation Failed",
+                            description="The AI service responded, but no translated text was returned.",
+                            color=EmbedColors.ERROR,
+                        )
+                    )
                     return
 
                 quoted_text = self._as_quote_block(self._truncate_for_discord(translated_text, 1500))
-                await ctx.reply(f"🌐 **Translated to {target_language}**\n{quoted_text}")
+                embed = build_status_embed(
+                    title=f"Translated to {target_language}",
+                    description=quoted_text,
+                    color=EmbedColors.INFO,
+                    footer="DS Translator",
+                )
+                await ctx.reply(embed=embed)
 
                 # Track in database
                 try:
@@ -121,20 +152,47 @@ class TranslationHandler:
                 except Exception as db_error:
                     logger.error(f"Database tracking error: {db_error}", exc_info=True)
             else:
-                await ctx.reply(f"❌ I couldn't translate that to {target_language}. Try a different language name.")
+                await ctx.reply(
+                    embed=build_status_embed(
+                        title="Translation Failed",
+                        description=(
+                            f"I couldn't translate that to `{target_language}`. "
+                            "Try a common language name like `Spanish`, `French`, or `English`."
+                        ),
+                        color=EmbedColors.ERROR,
+                    )
+                )
         except Exception as e:
             logger.error(f"Error in translate command: {e}")
-            await ctx.reply("❌ An error occurred while processing your translation request.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Translation Unavailable",
+                    description="The translation request failed. Try again in a moment.",
+                    color=EmbedColors.ERROR,
+                )
+            )
 
     async def _handle_translate_to_english(self, ctx):
         """Handle translation to English command."""
         # Check if user is banned from translation
         if self._config and ctx.author.id in self._config.banned_players:
-            await ctx.reply("⛔ You are currently blocked from using translation commands.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Translation Blocked",
+                    description="You are currently blocked from using translation commands.",
+                    color=EmbedColors.ERROR,
+                )
+            )
             return
 
         if not ctx.message.reference:
-            await ctx.reply("💬 Reply to a message first, then use `!en`.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Reply Required",
+                    description="Reply to a message first, then use `!en`.",
+                    color=EmbedColors.WARNING,
+                )
+            )
             return
 
         try:
@@ -142,20 +200,39 @@ class TranslationHandler:
             text_to_translate = original_message.content
 
             if not text_to_translate:
-                await ctx.reply("⚠️ The replied-to message is empty.")
+                await ctx.reply(
+                    embed=build_status_embed(
+                        title="Empty Message",
+                        description="The replied-to message does not contain text to translate.",
+                        color=EmbedColors.WARNING,
+                    )
+                )
                 return
 
-            result = self._translation_service.translate_to_english(text_to_translate)
+            async with ctx.typing():
+                result = await self._translation_service.translate_to_english(text_to_translate)
 
             if result and result.get("language").lower() not in ("english", "en"):
                 translated_text = result.get("text")
                 source_language = result.get("language")
                 if not translated_text:
-                    await ctx.reply("❌ Translation completed but no text was returned.")
+                    await ctx.reply(
+                        embed=build_status_embed(
+                            title="Translation Failed",
+                            description="The AI service responded, but no translated text was returned.",
+                            color=EmbedColors.ERROR,
+                        )
+                    )
                     return
 
                 quoted_text = self._as_quote_block(self._truncate_for_discord(translated_text, 1500))
-                await ctx.reply(f"🌐 **Translated from {source_language}**\n{quoted_text}")
+                embed = build_status_embed(
+                    title=f"Translated from {source_language}",
+                    description=quoted_text,
+                    color=EmbedColors.INFO,
+                    footer="DS Translator",
+                )
+                await ctx.reply(embed=embed)
 
                 # Track in database
                 try:
@@ -182,20 +259,50 @@ class TranslationHandler:
                 except Exception as db_error:
                     logger.error(f"Database tracking error: {db_error}", exc_info=True)
             elif result:
-                await ctx.reply("✅ The message already appears to be in English.")
+                await ctx.reply(
+                    embed=build_status_embed(
+                        title="Already English",
+                        description="The replied-to message already appears to be in English.",
+                        color=EmbedColors.SUCCESS,
+                    )
+                )
             else:
-                await ctx.reply("❌ I couldn't translate that message.")
+                await ctx.reply(
+                    embed=build_status_embed(
+                        title="Translation Failed",
+                        description="I couldn't translate that message. Try again with a clearer text message.",
+                        color=EmbedColors.ERROR,
+                    )
+                )
         except Exception as e:
             logger.error(f"Error in !en command: {e}")
-            await ctx.reply("❌ An error occurred while translating.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Translation Unavailable",
+                    description="The translation request failed. Try again in a moment.",
+                    color=EmbedColors.ERROR,
+                )
+            )
 
     async def _handle_command_error(self, ctx, error):
         """Handle errors for translation commands."""
         if isinstance(error, commands.MissingRole):
-            await ctx.reply("⛔ You need the `Translator` role to use this command.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Missing Role",
+                    description="You need the `Translator` role to use this command.",
+                    color=EmbedColors.ERROR,
+                )
+            )
         else:
             logger.error(f"Unhandled error in command: {error}")
-            await ctx.reply("❌ An unexpected error occurred.")
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Command Failed",
+                    description="An unexpected error occurred while processing the command.",
+                    color=EmbedColors.ERROR,
+                )
+            )
 
     async def _handle_auto_translation(self, message: discord.Message):
         """Automatically translate messages from users with Translator role."""
@@ -215,7 +322,7 @@ class TranslationHandler:
             return
 
         try:
-            result = self._translation_service.translate_to_english(message.content)
+            result = await self._translation_service.translate_to_english(message.content)
 
             if result and result.get("language") != "English":
                 translated_text = result.get("text")
@@ -265,11 +372,13 @@ class TranslationHandler:
 
         try:
             history = await self._collect_conversation_context(message)
+            reply_context = await self._collect_reply_context(message)
             async with message.channel.typing():
-                reply_text = self._translation_service.generate_contextual_reply(
+                reply_text = await self._translation_service.generate_contextual_reply(
                     message.content,
                     history,
                     force_reply=direct_trigger,
+                    reply_context=reply_context,
                 )
 
             if not reply_text:
@@ -329,10 +438,10 @@ class TranslationHandler:
 
         return False
 
-    async def _collect_conversation_context(self, message: discord.Message) -> List[Dict[str, str]]:
+    async def _collect_conversation_context(self, message: discord.Message) -> List[Dict[str, object]]:
         """Collect recent messages above the current one for context."""
-        history_limit = self._config.chat_history_limit if self._config else 12
-        collected: List[Dict[str, str]] = []
+        history_limit = self._config.chat_history_limit if self._config else 25
+        collected: List[Dict[str, object]] = []
 
         async for previous in message.channel.history(limit=history_limit, before=message, oldest_first=False):
             if previous.author.bot and previous.author != self._bot.user:
@@ -345,12 +454,44 @@ class TranslationHandler:
             collected.append(
                 {
                     "author": previous.author.display_name,
+                    "is_bot": previous.author == self._bot.user,
+                    "timestamp": previous.created_at.isoformat(),
                     "content": content,
                 }
             )
 
         collected.reverse()
         return collected
+
+    async def _collect_reply_context(self, message: discord.Message) -> Dict[str, object] | None:
+        """Collect the exact message this message replies to, if available."""
+        reference = message.reference
+        if not reference:
+            return None
+
+        resolved = getattr(reference, "resolved", None)
+        replied_to = resolved if isinstance(resolved, discord.Message) else None
+
+        if replied_to is None and reference.message_id:
+            try:
+                replied_to = await message.channel.fetch_message(reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.debug("Could not fetch replied-to message %s", reference.message_id, exc_info=True)
+                return None
+
+        if replied_to is None:
+            return None
+
+        content = (replied_to.content or "").strip()
+        if not content:
+            return None
+
+        return {
+            "author": replied_to.author.display_name,
+            "is_bot": replied_to.author == self._bot.user,
+            "timestamp": replied_to.created_at.isoformat(),
+            "content": content,
+        }
 
     @staticmethod
     def _truncate_for_discord(text: str, limit: int = 1500) -> str:
