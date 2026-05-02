@@ -73,6 +73,29 @@ class TranslationService(ITranslationService):
                 continue
         return None
 
+    def _extract_plain_reply(self, response_text: str) -> Optional[str]:
+        """Extract a usable plain-text answer when a forced reply omits JSON."""
+        if not response_text:
+            return None
+
+        stripped = response_text.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json|text)?\s*", "", stripped, flags=re.IGNORECASE)
+            stripped = re.sub(r"\s*```$", "", stripped)
+
+        stripped = stripped.strip()
+        if not stripped:
+            return None
+
+        lower = stripped.lower()
+        if "should_reply" in lower and "reply" in lower:
+            return None
+
+        if stripped in {"{}", "[]", "null"}:
+            return None
+
+        return stripped
+
     async def _create_completion(
         self,
         messages: List[Dict[str, str]],
@@ -262,22 +285,39 @@ class TranslationService(ITranslationService):
         ]
 
         try:
+            logger.info(
+                "Contextual reply request: force_reply=%s latest_message=%r replied_to=%r recent_context=%r",
+                force_reply,
+                cleaned_message,
+                replied_to_block,
+                history_block,
+            )
             response_text = await self._create_completion(messages, temperature=0.9, max_tokens=250)
+            logger.info("Contextual reply raw model response: %r", response_text)
+
             payload = self._extract_json_payload(response_text)
             if not payload:
                 logger.info("Contextual reply skipped: model response did not contain a JSON payload")
+                if force_reply:
+                    plain_reply = self._extract_plain_reply(response_text)
+                    if plain_reply:
+                        final_reply = plain_reply[: self._max_chat_response_chars].rstrip()
+                        logger.info("Contextual reply final plain-text reply: %r", final_reply)
+                        return final_reply
                 return self._FORCED_REPLY_FALLBACK if force_reply else None
 
             if not force_reply and not payload.get("should_reply"):
-                logger.info("Contextual reply skipped: model decided not to reply")
+                logger.info("Contextual reply skipped: model decided not to reply payload=%r", payload)
                 return None
 
             reply = str(payload.get("reply", "")).strip()
             if not reply:
-                logger.info("Contextual reply skipped: model returned an empty reply")
+                logger.info("Contextual reply skipped: model returned an empty reply payload=%r", payload)
                 return self._FORCED_REPLY_FALLBACK if force_reply else None
 
-            return reply[: self._max_chat_response_chars].rstrip()
+            final_reply = reply[: self._max_chat_response_chars].rstrip()
+            logger.info("Contextual reply final JSON reply: %r", final_reply)
+            return final_reply
         except Exception as exc:
             logger.error("Contextual reply generation failed: %s", exc, exc_info=True)
             return self._FORCED_REPLY_FALLBACK if force_reply else None

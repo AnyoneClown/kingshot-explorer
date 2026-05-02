@@ -160,6 +160,40 @@ def test_generate_contextual_reply_force_reply_uses_text_when_model_declines():
     assert result == "What do you need help with?"
 
 
+def test_generate_contextual_reply_force_reply_uses_plain_text_when_model_omits_json():
+    service = TranslationService(
+        FakeClient(["You just said: JUST SAY WHAT DID I SAY JUST NOW"]),
+        model="openai/gpt-oss-120b",
+    )
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "JUST SAY WHAT DID I SAY JUST NOW",
+            [{"author": "Denis", "content": "What did reg say?"}],
+            force_reply=True,
+        )
+    )
+
+    assert result == "You just said: JUST SAY WHAT DID I SAY JUST NOW"
+
+
+def test_generate_contextual_reply_random_candidate_ignores_plain_text_without_json():
+    service = TranslationService(
+        FakeClient(["This is a plain text answer"]),
+        model="openai/gpt-oss-120b",
+    )
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "maybe",
+            [{"author": "Denis", "content": "What did reg say?"}],
+            force_reply=False,
+        )
+    )
+
+    assert result is None
+
+
 def test_generate_contextual_reply_force_reply_falls_back_when_model_returns_empty_reply():
     service = TranslationService(
         FakeClient(['{"should_reply":false,"reply":""}']),
