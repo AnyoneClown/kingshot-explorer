@@ -28,24 +28,24 @@ class KVKHandler:
     def register_commands(self):
         """Register all KVK commands with the bot."""
 
-        @self._bot.tree.command(name="kvk", description="Get Nexus KVK stats for a kingdom")
+        @self._bot.tree.command(name="kvk", description="Get KVK match history for a kingdom")
         @app_commands.describe(kingdom_number="The kingdom number to fetch stats for (e.g., 830)")
         async def get_kvk_stats(interaction: discord.Interaction, kingdom_number: int):
-            """Get Nexus KVK stats for a kingdom."""
+            """Get KVK stats for a kingdom."""
             await self._handle_get_kvk_stats_slash(interaction, kingdom_number)
 
-        @self._bot.tree.command(name="kvk_compare", description="Compare Nexus KVK stats for two kingdoms")
+        @self._bot.tree.command(name="kvk_compare", description="Compare KVK match history for two kingdoms")
         @app_commands.describe(
             kingdom_a="First kingdom number to compare",
             kingdom_b="Second kingdom number to compare",
         )
         async def compare_kvk_stats(interaction: discord.Interaction, kingdom_a: int, kingdom_b: int):
-            """Compare Nexus KVK stats for two kingdoms."""
+            """Compare KVK stats for two kingdoms."""
             await self._handle_compare_kvk_slash(interaction, kingdom_a, kingdom_b)
 
     async def _handle_get_kvk_stats_slash(self, interaction: discord.Interaction, kingdom_number: int):
         """
-        Handle fetching Nexus KVK stats for a kingdom.
+        Handle fetching KVK stats for a kingdom.
 
         Args:
             interaction: Discord interaction
@@ -74,7 +74,7 @@ class KVKHandler:
             if not result.get("success"):
                 embed = self._build_status_embed(
                     title=f"❌ Could Not Fetch Kingdom {kingdom_number}",
-                    description="The Nexus API request failed.",
+                    description="The KVK matches API request failed.",
                     color=discord.Color.red(),
                 )
                 embed.add_field(name="Details", value=result.get("message", "Unknown error"), inline=False)
@@ -87,36 +87,37 @@ class KVKHandler:
             history = stats.get("history", [])
             wins = stats.get("wins", 0)
             losses = stats.get("losses", 0)
-            total = wins + losses
-            computed_win_rate = (wins / total * 100) if total > 0 else 0
-            win_rate = stats.get("winRate", computed_win_rate)
+            prep_wins = stats.get("prepWins", 0)
+            prep_losses = stats.get("prepLosses", 0)
+            latest = stats.get("latestMatch")
 
             embed = discord.Embed(
-                title=f"⚔️ Nexus KVK - Kingdom {kingdom_number}",
-                description=(
-                    f"Tier: **{stats.get('nexusTier', 'N/A')}** | "
-                    f"Stability: **{stats.get('stabilityLabel', 'N/A').title()}**"
-                ),
+                title=f"⚔️ KVK History - Kingdom {kingdom_number}",
+                description=self._build_latest_match_summary(latest),
                 color=discord.Color.red(),
             )
 
-            embed.add_field(name="Rank", value=f"#{stats.get('rank', 'N/A')}", inline=True)
-            embed.add_field(name="Rating", value=f"{self._format_float(stats.get('rating'))}", inline=True)
-            embed.add_field(name="Percentile", value=f"{self._format_float(stats.get('percentile'))}%", inline=True)
-            embed.add_field(name="Matches", value=str(stats.get("matchCount", total)), inline=True)
-            embed.add_field(name="W/L", value=f"{wins}/{losses}", inline=True)
-            embed.add_field(name="Win Rate", value=f"{self._format_float(win_rate)}%", inline=True)
+            embed.add_field(name="Castle Record", value=f"{wins}-{losses}", inline=True)
+            embed.add_field(name="Castle Win Rate", value=f"{self._format_float(stats.get('winRate'))}%", inline=True)
+            embed.add_field(name="Current Streak", value=stats.get("currentStreak", "N/A"), inline=True)
+            embed.add_field(name="Prep Record", value=f"{prep_wins}-{prep_losses}", inline=True)
+            embed.add_field(name="Prep Win Rate", value=f"{self._format_float(stats.get('prepWinRate'))}%", inline=True)
+            embed.add_field(name="Matches Tracked", value=str(stats.get("matchCount", 0)), inline=True)
+            embed.add_field(
+                name="Roles",
+                value=f"Attack: {stats.get('attacks', 0)} | Defense: {stats.get('defenses', 0)}",
+                inline=True,
+            )
+            embed.add_field(
+                name="Castle Work",
+                value=f"Captured: {stats.get('castleCaptures', 0)} | Held: {stats.get('defensesHeld', 0)}",
+                inline=True,
+            )
 
             if history:
                 history_lines = []
                 for entry in history[:8]:
-                    kvk_number = entry.get("kvk", "?")
-                    opponent = entry.get("opponent", "?")
-                    result_text = self._format_history_result(entry.get("result"))
-                    rating_change = self._format_signed_float(entry.get("ratingChange"))
-                    history_lines.append(
-                        f"KvK {kvk_number}: vs {opponent} | {result_text} | Rating {rating_change}"
-                    )
+                    history_lines.append(self._format_history_line(entry))
 
                 embed.add_field(
                     name="Recent History",
@@ -128,8 +129,7 @@ class KVKHandler:
 
             embed.set_footer(
                 text=(
-                    f"RD: {self._format_float(stats.get('rd'))} | "
-                    f"Volatility: {self._format_float(stats.get('vol'))} | Use /kvk_compare to compare kingdoms"
+                    "Source: Kingshot KVK matches API | Use /kvk_compare to compare kingdoms"
                 )
             )
 
@@ -147,7 +147,7 @@ class KVKHandler:
             )
 
     async def _handle_compare_kvk_slash(self, interaction: discord.Interaction, kingdom_a: int, kingdom_b: int):
-        """Handle comparing Nexus KVK stats for two kingdoms."""
+        """Handle comparing KVK stats for two kingdoms."""
         await interaction.response.defer(thinking=True)
 
         if kingdom_a <= 0 or kingdom_b <= 0:
@@ -188,6 +188,7 @@ class KVKHandler:
             stats_a = data.get("kingdom_a", {})
             stats_b = data.get("kingdom_b", {})
             score = data.get("score", {})
+            h2h = data.get("head_to_head", {})
 
             score_a = score.get(str(kingdom_a), 0)
             score_b = score.get(str(kingdom_b), 0)
@@ -207,22 +208,23 @@ class KVKHandler:
 
             embed.add_field(
                 name=f"Kingdom {kingdom_a}",
-                value=self._build_compact_stats(stats_a),
+                value=self._build_compact_match_stats(stats_a),
                 inline=True,
             )
             embed.add_field(
                 name=f"Kingdom {kingdom_b}",
-                value=self._build_compact_stats(stats_b),
+                value=self._build_compact_match_stats(stats_b),
                 inline=True,
             )
 
             metrics = [
-                ("Rating", stats_a.get("rating"), stats_b.get("rating")),
-                ("Rank", stats_a.get("rank"), stats_b.get("rank")),
-                ("Win Rate", stats_a.get("winRate"), stats_b.get("winRate")),
-                ("Wins", stats_a.get("wins"), stats_b.get("wins")),
-                ("Losses", stats_a.get("losses"), stats_b.get("losses")),
-                ("Percentile", stats_a.get("percentile"), stats_b.get("percentile")),
+                ("Castle Win Rate", stats_a.get("winRate"), stats_b.get("winRate")),
+                ("Castle Wins", stats_a.get("wins"), stats_b.get("wins")),
+                ("Castle Losses", stats_a.get("losses"), stats_b.get("losses")),
+                ("Prep Win Rate", stats_a.get("prepWinRate"), stats_b.get("prepWinRate")),
+                ("Prep Wins", stats_a.get("prepWins"), stats_b.get("prepWins")),
+                ("Castle Captures", stats_a.get("castleCaptures"), stats_b.get("castleCaptures")),
+                ("Defenses Held", stats_a.get("defensesHeld"), stats_b.get("defensesHeld")),
             ]
 
             comparison_lines = []
@@ -231,8 +233,13 @@ class KVKHandler:
                     f"{metric}: {self._format_metric(metric, value_a)} vs {self._format_metric(metric, value_b)}"
                 )
 
-            embed.add_field(name="Head-to-Head Metrics", value="\n".join(comparison_lines), inline=False)
-            embed.set_footer(text="Tip: Use /kvk for deeper details on one kingdom")
+            embed.add_field(name="Overall Metrics", value="\n".join(comparison_lines), inline=False)
+            embed.add_field(
+                name="Direct Matchups",
+                value=self._build_head_to_head_summary(kingdom_a, kingdom_b, h2h),
+                inline=False,
+            )
+            embed.set_footer(text="Use /kvk for recent match history on one kingdom")
 
             await interaction.followup.send(embed=embed)
             logger.info(f"Successfully compared kingdoms {kingdom_a} and {kingdom_b}")
@@ -259,41 +266,94 @@ class KVKHandler:
         except (TypeError, ValueError):
             return "N/A"
 
-    @staticmethod
-    def _format_signed_float(value: Any) -> str:
-        """Format signed numeric values with two decimals."""
-        try:
-            return f"{float(value):+,.2f}"
-        except (TypeError, ValueError):
-            return "N/A"
+    def _build_latest_match_summary(self, latest: Any) -> str:
+        """Build the embed description from the most recent match."""
+        if not latest:
+            return "No KVK matches found for this kingdom."
 
-    def _build_compact_stats(self, stats: Dict[str, Any]) -> str:
+        return (
+            f"Latest: **KvK #{latest.get('season_id', '?')}** vs **{latest.get('opponent', '?')}** "
+            f"on **{latest.get('season_date', 'Unknown date')}** | "
+            f"Castle: **{self._format_history_result(latest.get('castleResult'))}** | "
+            f"Prep: **{self._format_history_result(latest.get('prepResult'))}**"
+        )
+
+    def _format_history_line(self, entry: Dict[str, Any]) -> str:
+        """Format one normalized KVK match for Discord history."""
+        side = self._format_side(entry.get("side"))
+        castle = self._format_history_result(entry.get("castleResult"))
+        prep = self._format_history_result(entry.get("prepResult"))
+        return (
+            f"#{entry.get('season_id', '?')} {entry.get('season_date', 'Unknown')} "
+            f"vs {entry.get('opponent', '?')} | {side} | Castle {castle} | Prep {prep}"
+        )
+
+    def _build_compact_match_stats(self, stats: Dict[str, Any]) -> str:
         """Build compact per-kingdom comparison lines."""
         return (
-            f"Tier: {stats.get('nexusTier', 'N/A')}\n"
-            f"Rank: #{stats.get('rank', 'N/A')}\n"
-            f"Rating: {self._format_float(stats.get('rating'))}\n"
-            f"W/L: {stats.get('wins', 'N/A')}/{stats.get('losses', 'N/A')}\n"
-            f"Win Rate: {self._format_float(stats.get('winRate'))}%"
+            f"Castle: {stats.get('wins', 0)}-{stats.get('losses', 0)} "
+            f"({self._format_float(stats.get('winRate'))}%)\n"
+            f"Prep: {stats.get('prepWins', 0)}-{stats.get('prepLosses', 0)} "
+            f"({self._format_float(stats.get('prepWinRate'))}%)\n"
+            f"Roles: A{stats.get('attacks', 0)} / D{stats.get('defenses', 0)}\n"
+            f"Captured/Held: {stats.get('castleCaptures', 0)}/{stats.get('defensesHeld', 0)}\n"
+            f"Streak: {stats.get('currentStreak', 'N/A')}"
         )
 
     def _format_metric(self, metric: str, value: Any) -> str:
         """Format metric values for compare output."""
-        if metric in {"Rating", "Percentile", "Win Rate"}:
-            suffix = "%" if metric in {"Percentile", "Win Rate"} else ""
-            return f"{self._format_float(value)}{suffix}"
-        if metric == "Rank":
-            return f"#{value}" if value is not None else "N/A"
+        if metric in {"Castle Win Rate", "Prep Win Rate"}:
+            return f"{self._format_float(value)}%"
         return str(value) if value is not None else "N/A"
+
+    def _build_head_to_head_summary(self, kingdom_a: int, kingdom_b: int, h2h: Dict[str, Any]) -> str:
+        """Build direct-matchup comparison text."""
+        if not h2h.get("available"):
+            return h2h.get("message") or "Head-to-head data unavailable."
+
+        summary_a = h2h.get("kingdom_a", {})
+        summary_b = h2h.get("kingdom_b", {})
+        matches = h2h.get("matches", [])
+        total = summary_a.get("matchCount", 0)
+        if total == 0:
+            return "No direct KVK matchups found."
+
+        lines = [
+            f"Matches: {total}",
+            (
+                f"Castle: K{kingdom_a} {summary_a.get('wins', 0)}-{summary_a.get('losses', 0)} | "
+                f"K{kingdom_b} {summary_b.get('wins', 0)}-{summary_b.get('losses', 0)}"
+            ),
+            (
+                f"Prep: K{kingdom_a} {summary_a.get('prepWins', 0)}-{summary_a.get('prepLosses', 0)} | "
+                f"K{kingdom_b} {summary_b.get('prepWins', 0)}-{summary_b.get('prepLosses', 0)}"
+            ),
+        ]
+
+        recent = matches[:3]
+        if recent:
+            lines.append("Recent:")
+            lines.extend(self._format_history_line(match) for match in recent)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_side(side: Any) -> str:
+        normalized = str(side or "unknown").strip().lower()
+        if normalized == "attacker":
+            return "Attack"
+        if normalized == "defender":
+            return "Defense"
+        return "Unknown"
 
     @staticmethod
     def _format_history_result(result: Any) -> str:
-        """Normalize history result labels from Nexus API."""
+        """Normalize match result labels from KVK API."""
         normalized = str(result or "Unknown").strip().lower()
-        if normalized == "preparation":
-            return "Preparation (Prep Win, Battle Loss)"
         if normalized == "win":
             return "Win"
         if normalized == "loss":
             return "Loss"
+        if normalized == "unknown":
+            return "Unknown"
         return str(result or "Unknown")
