@@ -360,13 +360,13 @@ class TranslationHandler:
 
     async def _handle_contextual_chat(self, message: discord.Message):
         """Optionally reply to chat using recent message history as context."""
-        if not message.content.strip():
-            return
-
         if self._config and message.author.id in self._config.banned_players:
             return
 
-        direct_trigger = self._is_direct_mention_or_reply(message)
+        direct_trigger = await self._is_direct_mention_or_reply(message)
+        if not message.content.strip() and not direct_trigger:
+            return
+
         if not self._should_attempt_reply(message, direct_trigger=direct_trigger):
             return
 
@@ -402,7 +402,7 @@ class TranslationHandler:
     def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
         """Return True if the bot should try generating a chat reply."""
         if direct_trigger is None:
-            direct_trigger = self._is_direct_mention_or_reply(message)
+            direct_trigger = self._has_direct_mention_or_resolved_reply(message)
 
         if direct_trigger:
             return True
@@ -423,9 +423,9 @@ class TranslationHandler:
 
         return random.random() < self._config.random_reply_chance
 
-    def _is_direct_mention_or_reply(self, message: discord.Message) -> bool:
-        """Detect whether the message is directly aimed at the bot."""
-        if self._bot.user and self._bot.user in message.mentions:
+    def _has_direct_mention_or_resolved_reply(self, message: discord.Message) -> bool:
+        """Detect direct triggers that do not require an API fetch."""
+        if self._message_mentions_bot(message):
             return True
 
         reference = message.reference
@@ -433,10 +433,48 @@ class TranslationHandler:
             return False
 
         resolved = getattr(reference, "resolved", None)
-        if isinstance(resolved, discord.Message) and self._bot.user:
-            return resolved.author.id == self._bot.user.id
+        return self._message_is_from_bot(resolved)
 
-        return False
+    async def _is_direct_mention_or_reply(self, message: discord.Message) -> bool:
+        """Detect whether the message is directly aimed at the bot."""
+        if self._has_direct_mention_or_resolved_reply(message):
+            return True
+
+        reference = message.reference
+        if not reference:
+            return False
+
+        message_id = getattr(reference, "message_id", None)
+        if not message_id:
+            return False
+
+        try:
+            replied_to = await message.channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.debug("Could not fetch referenced message %s for direct reply detection", message_id, exc_info=True)
+            return False
+
+        return self._message_is_from_bot(replied_to)
+
+    def _message_mentions_bot(self, message: discord.Message) -> bool:
+        bot_user = self._bot.user
+        if not bot_user:
+            return False
+
+        bot_id = getattr(bot_user, "id", None)
+        return any(mention == bot_user or getattr(mention, "id", None) == bot_id for mention in message.mentions)
+
+    def _message_is_from_bot(self, message: object) -> bool:
+        bot_user = self._bot.user
+        if not message or not bot_user:
+            return False
+
+        author = getattr(message, "author", None)
+        if not author:
+            return False
+
+        bot_id = getattr(bot_user, "id", None)
+        return author == bot_user or getattr(author, "id", None) == bot_id
 
     async def _collect_conversation_context(self, message: discord.Message) -> List[Dict[str, object]]:
         """Collect recent messages above the current one for context."""

@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+from handlers.translation_handler import TranslationHandler
 from services.translation_service import TranslationService
 
 
@@ -140,3 +141,59 @@ def test_generate_contextual_reply_includes_strict_random_reply_policy():
     assert result is None
     assert "The bot is considering a random reply" in prompt_text
     assert "Return should_reply false for announcements, commands, logs" in prompt_text
+
+
+def test_generate_contextual_reply_force_reply_uses_text_when_model_declines():
+    service = TranslationService(
+        FakeClient(['{"should_reply":false,"reply":"What do you need help with?"}']),
+        model="openai/gpt-oss-120b",
+    )
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "<@123456>",
+            [],
+            force_reply=True,
+        )
+    )
+
+    assert result == "What do you need help with?"
+
+
+def test_generate_contextual_reply_force_reply_falls_back_when_model_returns_empty_reply():
+    service = TranslationService(
+        FakeClient(['{"should_reply":false,"reply":""}']),
+        model="openai/gpt-oss-120b",
+    )
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "<@123456>",
+            [],
+            force_reply=True,
+        )
+    )
+
+    assert result == "I saw your message, but I need a little more context to answer."
+
+
+def test_direct_reply_detection_fetches_unresolved_reference():
+    bot_user = SimpleNamespace(id=42)
+    referenced_message = SimpleNamespace(author=SimpleNamespace(id=42))
+
+    class FakeChannel:
+        async def fetch_message(self, message_id):
+            assert message_id == 99
+            return referenced_message
+
+    handler = TranslationHandler(
+        translation_service=SimpleNamespace(),
+        bot=SimpleNamespace(user=bot_user),
+    )
+    message = SimpleNamespace(
+        mentions=[],
+        reference=SimpleNamespace(message_id=99, resolved=None),
+        channel=FakeChannel(),
+    )
+
+    assert asyncio.run(handler._is_direct_mention_or_reply(message)) is True

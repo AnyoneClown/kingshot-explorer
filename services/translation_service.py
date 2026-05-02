@@ -35,6 +35,8 @@ class ITranslationService(ABC):
 class TranslationService(ITranslationService):
     """Service responsible for translation and chat operations using NVIDIA NIM."""
 
+    _FORCED_REPLY_FALLBACK = "I saw your message, but I need a little more context to answer."
+
     def __init__(self, client: AsyncOpenAI, model: str, max_chat_response_chars: int = 500):
         self._client = client
         self._model = model
@@ -178,7 +180,10 @@ class TranslationService(ITranslationService):
     ) -> Optional[str]:
         cleaned_message = self._clean_text(message)
         if not cleaned_message:
-            return None
+            if force_reply:
+                cleaned_message = "(direct mention or reply with no additional text)"
+            else:
+                return None
 
         history_lines = []
         for entry in conversation_context:
@@ -261,18 +266,18 @@ class TranslationService(ITranslationService):
             payload = self._extract_json_payload(response_text)
             if not payload:
                 logger.info("Contextual reply skipped: model response did not contain a JSON payload")
-                return None
+                return self._FORCED_REPLY_FALLBACK if force_reply else None
 
-            if not payload.get("should_reply"):
+            if not force_reply and not payload.get("should_reply"):
                 logger.info("Contextual reply skipped: model decided not to reply")
                 return None
 
             reply = str(payload.get("reply", "")).strip()
             if not reply:
                 logger.info("Contextual reply skipped: model returned an empty reply")
-                return None
+                return self._FORCED_REPLY_FALLBACK if force_reply else None
 
             return reply[: self._max_chat_response_chars].rstrip()
         except Exception as exc:
             logger.error("Contextual reply generation failed: %s", exc, exc_info=True)
-            return None
+            return self._FORCED_REPLY_FALLBACK if force_reply else None
