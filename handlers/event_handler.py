@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from services.event_scheduler_service import IEventSchedulerService
+from services.event_scheduler_service import IEventSchedulerService, ScheduledEvent
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +29,25 @@ class EventHandler:
         """Register all event scheduling commands with the bot."""
 
         @self._bot.tree.command(
-            name="schedule", description="Schedule an @everyone ping 10 minutes before the specified time"
+            name="schedule", description="Schedule a one-time or recurring @everyone reminder"
         )
         @app_commands.describe(
-            date="Event date (YYYY-MM-DD)", time="Event time (HH:MM in UTC)", message="Event message"
+            date="Event date (YYYY-MM-DD)",
+            time="Event time (HH:MM in UTC)",
+            message="Reminder message",
+            repeat_every_days="Optional: repeat every N days, for example 2 means once every 2 days",
+            reminder_minutes="How many minutes before the event to send the reminder (default: 10)",
         )
-        async def schedule_event(interaction: discord.Interaction, date: str, time: str, message: str):
-            """Schedule an @everyone ping 10 minutes before the specified time."""
-            await self._handle_schedule_event(interaction, date, time, message)
+        async def schedule_event(
+            interaction: discord.Interaction,
+            date: str,
+            time: str,
+            message: str,
+            repeat_every_days: Optional[int] = None,
+            reminder_minutes: int = 10,
+        ):
+            """Schedule an @everyone ping before the specified time."""
+            await self._handle_schedule_event(interaction, date, time, message, repeat_every_days, reminder_minutes)
 
         @self._bot.tree.command(name="events", description="List all scheduled events for this channel")
         async def list_events(interaction: discord.Interaction):
@@ -58,15 +69,15 @@ class EventHandler:
         @tasks.loop(minutes=1)
         async def check_scheduled_events():
             """Check for scheduled events and ping roles when it's time."""
-            due_events = self._scheduler_service.check_and_get_due_events()
+            due_events = await self._scheduler_service.check_and_get_due_events()
 
             for channel_id, events in due_events.items():
                 channel = self._bot.get_channel(channel_id)
                 if not channel:
                     continue
 
-                for event_time, role_names, message in events:
-                    await self._send_event_notification(channel, role_names, message)
+                for event in events:
+                    await self._send_event_notification(channel, event.role_names, event.message)
 
         self._scheduler_loop = check_scheduled_events
         check_scheduled_events.start()
@@ -75,7 +86,15 @@ class EventHandler:
         """Return whether the scheduler loop is currently active."""
         return bool(self._scheduler_loop and self._scheduler_loop.is_running())
 
-    async def _handle_schedule_event(self, interaction: discord.Interaction, date: str, time: str, message: str):
+    async def _handle_schedule_event(
+        self,
+        interaction: discord.Interaction,
+        date: str,
+        time: str,
+        message: str,
+        repeat_every_days: Optional[int],
+        reminder_minutes: int,
+    ):
         """Handle scheduling a new event."""
         await interaction.response.defer(thinking=True)
 
@@ -88,6 +107,26 @@ class EventHandler:
                     embed=self._build_status_embed(
                         title="⚠️ Message Required",
                         description="Please provide a reminder message so members know what the event is for.",
+                        color=discord.Color.orange(),
+                    )
+                )
+                return
+
+            if reminder_minutes < 1 or reminder_minutes > 1440:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="⚠️ Invalid Reminder Lead Time",
+                        description="Reminder lead time must be between 1 minute and 1440 minutes (24 hours).",
+                        color=discord.Color.orange(),
+                    )
+                )
+                return
+
+            if repeat_every_days is not None and (repeat_every_days < 1 or repeat_every_days > 365):
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="⚠️ Invalid Repeat Interval",
+                        description="Repeat interval must be between 1 and 365 days. Example: `2` for once every 2 days.",
                         color=discord.Color.orange(),
                     )
                 )
@@ -108,36 +147,41 @@ class EventHandler:
                 )
                 return
 
-            notification_time = event_time - timedelta(minutes=10)
+            notification_time = event_time - timedelta(minutes=reminder_minutes)
 
             if notification_time <= now_utc:
                 await interaction.followup.send(
                     embed=self._build_status_embed(
                         title="⏱️ Event Too Soon",
-                        description="Event time must be at least 10 minutes from now.",
+                        description=f"Event time must be at least {reminder_minutes} minute(s) from now.",
                         color=discord.Color.orange(),
                     )
                 )
                 return
 
-            success = self._scheduler_service.schedule_event(
-                interaction.channel.id, notification_time, ["everyone"], cleaned_message
+            success = await self._scheduler_service.schedule_event(
+                interaction.channel.id,
+                notification_time,
+                ["everyone"],
+                cleaned_message,
+                repeat_every_days=repeat_every_days,
             )
 
             if success:
                 embed = self._build_status_embed(
                     title="✅ Event Scheduled",
-                    description="Your reminder is set and will ping @everyone 10 minutes before the event.",
+                    description=self._schedule_success_description(reminder_minutes, repeat_every_days),
                     color=discord.Color.green(),
                 )
-                embed.add_field(name="Event Time (UTC)", value=self._format_discord_timestamp(event_time), inline=False)
+                embed.add_field(name="First Event", value=self._format_discord_timestamp(event_time), inline=False)
                 embed.add_field(
-                    name="Reminder Time (UTC)",
+                    name="First Reminder",
                     value=self._format_discord_timestamp(notification_time),
-                    inline=False,
+                    inline=True,
                 )
+                embed.add_field(name="Repeat", value=self._format_repeat(repeat_every_days), inline=True)
                 embed.add_field(name="Message", value=cleaned_message[:900], inline=False)
-                embed.set_footer(text="Tip: Use /events to review scheduled reminders")
+                embed.set_footer(text="Use /events to review reminders or /cancel with the listed number")
 
                 await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             else:
@@ -152,7 +196,10 @@ class EventHandler:
             await interaction.followup.send(
                 embed=self._build_status_embed(
                     title="🧭 Invalid Date/Time Format",
-                    description="Use `YYYY-MM-DD` for date and `HH:MM` for UTC time. Example: `2026-04-01` and `18:30`.",
+                    description=(
+                        "Use `YYYY-MM-DD` for date and `HH:MM` for UTC time.\n"
+                        "Example: `/schedule date:2026-04-01 time:18:30 message:Alliance prep repeat_every_days:2`"
+                    ),
                     color=discord.Color.orange(),
                 )
             )
@@ -170,7 +217,7 @@ class EventHandler:
         """Handle listing all scheduled events for a channel."""
         await interaction.response.defer(thinking=True)
 
-        events = self._scheduler_service.get_events_for_channel(interaction.channel.id)
+        events = await self._scheduler_service.get_events_for_channel(interaction.channel.id)
 
         if not events:
             await interaction.followup.send(
@@ -190,12 +237,8 @@ class EventHandler:
 
         max_items = 15
         event_lines = []
-        for idx, (event_time, role_names, message) in enumerate(events[:max_items], 1):
-            message_preview = (message[:100] + "...") if len(message) > 100 else message
-            event_lines.append(
-                f"**{idx}.** {self._format_discord_timestamp(event_time)}\n"
-                f"Message: {message_preview}"
-            )
+        for idx, event in enumerate(events[:max_items], 1):
+            event_lines.append(self._format_event_list_item(idx, event))
 
         if len(events) > max_items:
             event_lines.append(f"... and {len(events) - max_items} more event(s)")
@@ -222,7 +265,7 @@ class EventHandler:
 
             index = event_number - 1
 
-            if self._scheduler_service.cancel_event(interaction.channel.id, index):
+            if await self._scheduler_service.cancel_event(interaction.channel.id, index):
                 await interaction.followup.send(
                     embed=self._build_status_embed(
                         title="✅ Event Cancelled",
@@ -294,3 +337,31 @@ class EventHandler:
         """Format a datetime for absolute + relative Discord display."""
         unix_ts = int(value.timestamp())
         return f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+
+    @staticmethod
+    def _format_repeat(repeat_every_days: Optional[int]) -> str:
+        """Format recurrence for Discord embeds."""
+        if repeat_every_days is None:
+            return "Does not repeat"
+        if repeat_every_days == 1:
+            return "Every day"
+        return f"Every {repeat_every_days} days"
+
+    def _format_event_list_item(self, idx: int, event: ScheduledEvent) -> str:
+        """Format a scheduled event for the /events list."""
+        message_preview = (event.message[:100] + "...") if len(event.message) > 100 else event.message
+        return (
+            f"**{idx}.** Next reminder: {self._format_discord_timestamp(event.event_time)}\n"
+            f"Repeat: {self._format_repeat(event.repeat_every_days)}\n"
+            f"Message: {message_preview}"
+        )
+
+    def _schedule_success_description(self, reminder_minutes: int, repeat_every_days: Optional[int]) -> str:
+        """Build the success text for scheduled reminders."""
+        repeat_text = self._format_repeat(repeat_every_days).lower()
+        if repeat_every_days is None:
+            return f"Your reminder is set and will ping @everyone {reminder_minutes} minute(s) before the event."
+        return (
+            f"Your reminder is set and will ping @everyone {reminder_minutes} minute(s) before the event, "
+            f"then repeat {repeat_text}."
+        )

@@ -65,7 +65,7 @@ class TranslatorBot:
             model=config.nvidia_model,
             max_chat_response_chars=config.max_chat_response_chars,
         )
-        self.event_scheduler_service = EventSchedulerService()
+        self.event_scheduler_service = EventSchedulerService(self.db_manager)
         self.player_info_service = PlayerInfoService()
         self.gift_code_service = GiftCodeService()
         self.kvk_service = KVKService()

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -151,3 +151,27 @@ class GiftCode(Base):
 
     def __repr__(self) -> str:
         return f"<GiftCode(id={self.id}, code={self.code})>"
+
+
+class ScheduledReminder(Base):
+    """Persisted Discord reminder schedule."""
+
+    __tablename__ = "scheduled_reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    reminder_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    role_names_json: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    repeat_every_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<ScheduledReminder(id={self.id}, channel_id={self.channel_id}, reminder_time={self.reminder_time})>"
