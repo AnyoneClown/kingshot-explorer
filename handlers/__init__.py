@@ -3,6 +3,7 @@
 from .database_handler import DatabaseHandler
 from .event_handler import EventHandler
 from .gift_code_handler import GiftCodeHandler
+from .kingshot_rag_handler import KingshotRAGHandler
 from .kvk_handler import KVKHandler
 from .player_info_handler import PlayerInfoHandler
 from .status_handler import StatusHandler
@@ -13,6 +14,7 @@ __all__ = [
     "EventHandler",
     "PlayerInfoHandler",
     "GiftCodeHandler",
+    "KingshotRAGHandler",
     "KVKHandler",
     "DatabaseHandler",
     "StatusHandler",

@@ -1,10 +1,24 @@
 """Database models for the bot."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import UserDefinedType
+
+
+class Vector(UserDefinedType):
+    """Minimal CockroachDB VECTOR type for SQLAlchemy metadata."""
+
+    cache_ok = True
+
+    def __init__(self, dimensions: int):
+        self.dimensions = dimensions
+
+    def get_col_spec(self, **kw) -> str:
+        return f"VECTOR({self.dimensions})"
 
 
 class Base(DeclarativeBase):
@@ -175,3 +189,61 @@ class ScheduledReminder(Base):
 
     def __repr__(self) -> str:
         return f"<ScheduledReminder(id={self.id}, channel_id={self.channel_id}, reminder_time={self.reminder_time})>"
+
+
+class KingshotEntity(Base):
+    """Structured Kingshot knowledge entity."""
+
+    __tablename__ = "kingshot_entities"
+
+    id: Mapped[Any] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    entity_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    slug: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    chunks: Mapped[List["KingshotChunk"]] = relationship(
+        "KingshotChunk",
+        back_populates="entity",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:
+        return f"<KingshotEntity(slug={self.slug}, entity_type={self.entity_type})>"
+
+
+class KingshotChunk(Base):
+    """Embedded searchable Kingshot knowledge chunk."""
+
+    __tablename__ = "kingshot_chunks"
+
+    id: Mapped[Any] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    entity_id: Mapped[Any] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kingshot_entities.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Any] = mapped_column(Vector(2048), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSONB, nullable=False, server_default="{}")
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    entity: Mapped["KingshotEntity"] = relationship("KingshotEntity", back_populates="chunks")
+
+    def __repr__(self) -> str:
+        return f"<KingshotChunk(id={self.id}, entity_id={self.entity_id})>"

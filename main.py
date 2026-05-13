@@ -18,12 +18,13 @@ from handlers import (
     DatabaseHandler,
     EventHandler,
     GiftCodeHandler,
+    KingshotRAGHandler,
     KVKHandler,
     PlayerInfoHandler,
     StatusHandler,
     TranslationHandler,
 )
-from services import EventSchedulerService, GiftCodeService, KVKService, PlayerInfoService, TranslationService
+from services import EventSchedulerService, GiftCodeService, KingshotRAGService, KVKService, PlayerInfoService, TranslationService
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,12 @@ class TranslatorBot:
         self.player_info_service = PlayerInfoService()
         self.gift_code_service = GiftCodeService()
         self.kvk_service = KVKService()
+        self.kingshot_rag_service = KingshotRAGService(
+            self.db_manager,
+            self.nvidia_client,
+            embedding_model=config.nvidia_embedding_model,
+            chat_model=config.nvidia_model,
+        )
         logger.info("All services initialized")
 
         # Initialize handlers
@@ -78,6 +85,7 @@ class TranslatorBot:
         self.player_info_handler = PlayerInfoHandler(self.player_info_service, self.bot)
         self.gift_code_handler = GiftCodeHandler(self.gift_code_service, self.player_info_service, self.bot, config)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
+        self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)
         self.status_handler = StatusHandler(
             self.bot,
@@ -163,6 +171,7 @@ class TranslatorBot:
         self.player_info_handler.register_commands()
         self.gift_code_handler.register_commands()
         self.kvk_handler.register_commands()
+        self.kingshot_rag_handler.register_commands()
         self.database_handler.register_commands()
         self.database_handler.register_events()
         self.status_handler.register_commands()

@@ -17,6 +17,7 @@ class BotConfig:
     translator_role_name: str = "Translator"
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_model: str = "openai/gpt-oss-120b"
+    nvidia_embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2"
     random_reply_chance: float = 0.08
     random_reply_cooldown_seconds: int = 180
     chat_history_limit: int = 25
@@ -86,6 +87,10 @@ class BotConfig:
             translator_role_name=os.getenv("TRANSLATOR_ROLE", "Translator"),
             nvidia_base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
             nvidia_model=os.getenv("NVIDIA_MODEL", "openai/gpt-oss-120b"),
+            nvidia_embedding_model=os.getenv(
+                "NVIDIA_EMBEDDING_MODEL",
+                "nvidia/llama-nemotron-embed-1b-v2",
+            ),
             random_reply_chance=float(os.getenv("RANDOM_REPLY_CHANCE", "0.08")),
             random_reply_cooldown_seconds=int(os.getenv("RANDOM_REPLY_COOLDOWN_SECONDS", "180")),
             chat_history_limit=int(os.getenv("CHAT_HISTORY_LIMIT", "25")),
