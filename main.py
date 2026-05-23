@@ -18,13 +18,23 @@ from handlers import (
     DatabaseHandler,
     EventHandler,
     GiftCodeHandler,
+    GuildConfigHandler,
     KingshotRAGHandler,
     KVKHandler,
     PlayerInfoHandler,
     StatusHandler,
     TranslationHandler,
 )
-from services import EventSchedulerService, GiftCodeService, KingshotRAGService, KVKService, PlayerInfoService, TranslationService
+from services import (
+    EventSchedulerService,
+    GiftCodeService,
+    GuildConfigurationService,
+    KingshotRAGService,
+    KVKService,
+    PlayerInfoService,
+    TranslationService,
+    VoiceMessageService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +79,9 @@ class TranslatorBot:
         self.event_scheduler_service = EventSchedulerService(self.db_manager)
         self.player_info_service = PlayerInfoService()
         self.gift_code_service = GiftCodeService()
+        self.guild_configuration_service = GuildConfigurationService(
+            default_use_voice_replies=config.enable_voice_replies,
+        )
         self.kvk_service = KVKService()
         self.kingshot_rag_service = KingshotRAGService(
             self.db_manager,
@@ -76,14 +89,35 @@ class TranslatorBot:
             embedding_model=config.nvidia_embedding_model,
             chat_model=config.nvidia_model,
         )
+        self.voice_message_service = (
+            VoiceMessageService.from_nvidia(
+                api_key=config.nvidia_api_key,
+                server=config.nvidia_tts_server,
+                use_ssl=config.nvidia_tts_use_ssl,
+                function_id=config.nvidia_tts_function_id,
+                default_voice=config.nvidia_tts_default_voice,
+                default_language_code=config.nvidia_tts_default_language_code,
+                audio_encoding=config.nvidia_tts_audio_encoding,
+                sample_rate_hz=config.nvidia_tts_sample_rate_hz,
+                max_text_chars=config.nvidia_tts_max_text_chars,
+            )
+            if config.enable_voice_replies
+            else None
+        )
         logger.info("All services initialized")
 
         # Initialize handlers
         logger.info("Initializing handlers...")
-        self.translation_handler = TranslationHandler(self.translation_service, self.bot, config)
+        self.translation_handler = TranslationHandler(
+            self.translation_service,
+            self.bot,
+            config,
+            voice_message_service=self.voice_message_service,
+        )
         self.event_handler = EventHandler(self.event_scheduler_service, self.bot)
         self.player_info_handler = PlayerInfoHandler(self.player_info_service, self.bot)
         self.gift_code_handler = GiftCodeHandler(self.gift_code_service, self.player_info_service, self.bot, config)
+        self.guild_config_handler = GuildConfigHandler(self.bot, self.guild_configuration_service)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
         self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)
@@ -170,6 +204,7 @@ class TranslatorBot:
         self.event_handler.register_commands()
         self.player_info_handler.register_commands()
         self.gift_code_handler.register_commands()
+        self.guild_config_handler.register_commands()
         self.kvk_handler.register_commands()
         self.kingshot_rag_handler.register_commands()
         self.database_handler.register_commands()

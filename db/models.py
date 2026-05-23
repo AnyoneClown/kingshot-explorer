@@ -191,6 +191,25 @@ class ScheduledReminder(Base):
         return f"<ScheduledReminder(id={self.id}, channel_id={self.channel_id}, reminder_time={self.reminder_time})>"
 
 
+class GuildConfiguration(Base):
+    """Persisted bot configuration for a Discord guild."""
+
+    __tablename__ = "guild_configurations"
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Discord guild ID
+    use_voice_replies: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<GuildConfiguration(guild_id={self.guild_id}, use_voice_replies={self.use_voice_replies})>"
+
+
 class KingshotEntity(Base):
     """Structured Kingshot knowledge entity."""
 

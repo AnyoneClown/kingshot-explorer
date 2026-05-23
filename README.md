@@ -53,6 +53,11 @@ COCKROACHDB_URL=cockroachdb+asyncpg://postgres:password@host:26257/database-name
 NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_MODEL=openai/gpt-oss-120b
+ENABLE_VOICE_REPLIES=true
+NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
+NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
+NVIDIA_TTS_DEFAULT_VOICE=Magpie-Multilingual.EN-US.Aria
+NVIDIA_TTS_AUDIO_ENCODING=LINEAR_PCM
 COMMAND_PREFIX=!
 TRANSLATOR_ROLE=Translator
 AUTO_REDEEM_CHANNELS=123456789012345678,876543210987654321
@@ -91,6 +96,8 @@ Gift code related commands include:
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
+- `/configure` is an admin-only ephemeral guild configuration panel.
+
 ## Project Layout
 
 ```text
@@ -107,6 +114,7 @@ main.py      Application entrypoint
 - OCR functionality has been removed from this project.
 - Keep AUTO_REDEEM_CHANNELS empty if you do not want announcement messages.
 - The bot will always answer when directly mentioned or replied to, and it can also reply randomly based on recent channel history.
+- Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
 
 ## License
 

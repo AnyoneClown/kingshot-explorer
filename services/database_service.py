@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import GiftCode, GiftCodeRedemption, RegisteredPlayer, TranslationLog, User
+from db.models import GiftCode, GiftCodeRedemption, GuildConfiguration, RegisteredPlayer, TranslationLog, User
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,12 @@ class DatabaseService:
             User object or None if not found
         """
         result = await session.execute(select(User).where(User.id == user_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_guild_configuration(session: AsyncSession, guild_id: int) -> Optional[GuildConfiguration]:
+        """Get persisted bot configuration for a guild."""
+        result = await session.execute(select(GuildConfiguration).where(GuildConfiguration.guild_id == guild_id))
         return result.scalar_one_or_none()
 
     @staticmethod

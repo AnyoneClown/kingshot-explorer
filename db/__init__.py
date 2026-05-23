@@ -1,6 +1,15 @@
 """Database package initialization."""
 
-from db.models import Base, KingshotChunk, KingshotEntity, RegisteredPlayer, ScheduledReminder, TranslationLog, User
+from db.models import (
+    Base,
+    GuildConfiguration,
+    KingshotChunk,
+    KingshotEntity,
+    RegisteredPlayer,
+    ScheduledReminder,
+    TranslationLog,
+    User,
+)
 from db.session import DatabaseManager, get_db, init_db
 
 __all__ = [
@@ -9,6 +18,7 @@ __all__ = [
     "TranslationLog",
     "RegisteredPlayer",
     "ScheduledReminder",
+    "GuildConfiguration",
     "KingshotEntity",
     "KingshotChunk",
     "DatabaseManager",

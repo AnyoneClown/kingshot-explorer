@@ -1,6 +1,7 @@
 import logging
 import random
 import time
+from io import BytesIO
 from typing import Dict, List
 
 import discord
@@ -10,6 +11,7 @@ from db import get_db
 from handlers.ui import EmbedColors, build_status_embed
 from services.database_service import DatabaseService
 from services.translation_service import ITranslationService
+from services.voice_message_service import VoiceMessageService
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +19,13 @@ logger = logging.getLogger(__name__)
 class TranslationHandler:
     """Handles translation-related Discord commands and events."""
 
-    def __init__(self, translation_service: ITranslationService, bot: commands.Bot, config=None):
+    def __init__(
+        self,
+        translation_service: ITranslationService,
+        bot: commands.Bot,
+        config=None,
+        voice_message_service: VoiceMessageService | None = None,
+    ):
         """
         Initialize translation handler.
 
@@ -29,6 +37,7 @@ class TranslationHandler:
         self._translation_service = translation_service
         self._bot = bot
         self._config = config
+        self._voice_message_service = voice_message_service
         self._last_chat_reply_at: Dict[int, float] = {}
 
     def register_commands(self):
@@ -125,7 +134,14 @@ class TranslationHandler:
                     color=EmbedColors.INFO,
                     footer="DS Translator",
                 )
-                await ctx.reply(embed=embed)
+                await self._reply_with_optional_voice(
+                    ctx.reply,
+                    embed=embed,
+                    guild_id=ctx.guild.id if ctx.guild else None,
+                    voice_text=translated_text,
+                    language_hint=target_language,
+                    filename_stem="translation",
+                )
 
                 # Track in database
                 try:
@@ -232,7 +248,14 @@ class TranslationHandler:
                     color=EmbedColors.INFO,
                     footer="DS Translator",
                 )
-                await ctx.reply(embed=embed)
+                await self._reply_with_optional_voice(
+                    ctx.reply,
+                    embed=embed,
+                    guild_id=ctx.guild.id if ctx.guild else None,
+                    voice_text=translated_text,
+                    language_hint=source_language,
+                    filename_stem="translation",
+                )
 
                 # Track in database
                 try:
@@ -328,7 +351,14 @@ class TranslationHandler:
                 translated_text = result.get("text")
                 source_language = result.get("language")
                 if translated_text:
-                    await message.reply(self._as_quote_block(self._truncate_for_discord(translated_text, 1500)))
+                    await self._reply_with_optional_voice(
+                        message.reply,
+                        content=self._as_quote_block(self._truncate_for_discord(translated_text, 1500)),
+                        guild_id=message.guild.id if message.guild else None,
+                        voice_text=translated_text,
+                        language_hint=source_language,
+                        filename_stem="translation",
+                    )
 
                 # Track in database
                 try:
@@ -390,14 +420,99 @@ class TranslationHandler:
                 )
                 return
 
-            await message.reply(
-                self._truncate_for_discord(reply_text, self._config.max_chat_response_chars if self._config else 500),
+            await self._reply_with_optional_voice(
+                message.reply,
+                content=self._truncate_for_discord(
+                    reply_text,
+                    self._config.max_chat_response_chars if self._config else 500,
+                ),
                 mention_author=False,
+                guild_id=message.guild.id if message.guild else None,
+                voice_text=reply_text,
+                filename_stem="chat-reply",
             )
 
             self._last_chat_reply_at[message.channel.id] = time.monotonic()
         except Exception as e:
             logger.error(f"Contextual chat error: {e}", exc_info=True)
+
+    async def _reply_with_optional_voice(
+        self,
+        reply_callable,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        mention_author: bool | None = None,
+        guild_id: int | None = None,
+        voice_text: str | None = None,
+        language_hint: str | None = None,
+        filename_stem: str = "reply",
+    ):
+        reply_kwargs = {}
+        if content is not None:
+            reply_kwargs["content"] = content
+        if embed is not None:
+            reply_kwargs["embed"] = embed
+        if mention_author is not None:
+            reply_kwargs["mention_author"] = mention_author
+
+        voice_file = await self._build_voice_file(
+            voice_text,
+            guild_id=guild_id,
+            language_hint=language_hint,
+            filename_stem=filename_stem,
+        )
+        if voice_file is not None:
+            reply_kwargs["file"] = voice_file
+
+        await reply_callable(**reply_kwargs)
+
+    async def _build_voice_file(
+        self,
+        text: str | None,
+        *,
+        guild_id: int | None = None,
+        language_hint: str | None = None,
+        filename_stem: str = "reply",
+    ) -> discord.File | None:
+        if not self._voice_message_service or not text:
+            return None
+
+        if not await self._voice_replies_enabled_for_guild(guild_id):
+            return None
+
+        try:
+            audio = await self._voice_message_service.generate_audio(
+                text,
+                language_hint=language_hint,
+                filename_stem=filename_stem,
+            )
+        except Exception as exc:
+            logger.error("Voice message generation failed: %s", exc, exc_info=True)
+            return None
+
+        if audio is None:
+            return None
+
+        return discord.File(BytesIO(audio.data), filename=audio.filename)
+
+    async def _voice_replies_enabled_for_guild(self, guild_id: int | None) -> bool:
+        default_enabled = getattr(self._config, "enable_voice_replies", True)
+        if guild_id is None:
+            return default_enabled
+
+        try:
+            db = get_db()
+            async with db.session() as session:
+                guild_config = await DatabaseService.get_guild_configuration(session, guild_id)
+        except Exception as exc:
+            logger.error("Guild configuration lookup failed for guild %s: %s", guild_id, exc, exc_info=True)
+            return default_enabled
+
+        if guild_config is None:
+            return default_enabled
+
+        return guild_config.use_voice_replies
 
     def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
         """Return True if the bot should try generating a chat reply."""
