@@ -10,6 +10,7 @@ from discord.ext import commands
 from db import get_db
 from handlers.ui import EmbedColors, build_status_embed
 from services.database_service import DatabaseService
+from services.chatbot_service import IChatbotService
 from services.translation_service import ITranslationService
 from services.voice_message_service import VoiceMessageService
 
@@ -22,6 +23,7 @@ class TranslationHandler:
     def __init__(
         self,
         translation_service: ITranslationService,
+        chatbot_service: IChatbotService,
         bot: commands.Bot,
         config=None,
         voice_message_service: VoiceMessageService | None = None,
@@ -31,10 +33,12 @@ class TranslationHandler:
 
         Args:
             translation_service: Service for handling translations
+            chatbot_service: Service for contextual conversational replies
             bot: Discord bot instance
             config: Bot configuration containing banned players list
         """
         self._translation_service = translation_service
+        self._chatbot_service = chatbot_service
         self._bot = bot
         self._config = config
         self._voice_message_service = voice_message_service
@@ -404,7 +408,7 @@ class TranslationHandler:
             history = await self._collect_conversation_context(message)
             reply_context = await self._collect_reply_context(message)
             async with message.channel.typing():
-                reply_text = await self._translation_service.generate_contextual_reply(
+                reply_text = await self._chatbot_service.generate_contextual_reply(
                     message.content,
                     history,
                     force_reply=direct_trigger,

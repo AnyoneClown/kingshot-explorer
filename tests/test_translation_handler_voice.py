@@ -12,6 +12,8 @@ class FakeTranslationService:
     async def translate_to_english(self, text):
         return {"language": "Spanish", "text": "Hello everyone"}
 
+
+class FakeChatbotService:
     async def generate_contextual_reply(self, *args, **kwargs):
         return "Voice-enabled reply"
 
@@ -101,6 +103,7 @@ def test_translate_to_language_attaches_voice_file():
     voice_service = FakeVoiceService()
     handler = TranslationHandler(
         translation_service=FakeTranslationService(),
+        chatbot_service=FakeChatbotService(),
         voice_message_service=voice_service,
         bot=SimpleNamespace(user=None),
         config=SimpleNamespace(banned_players=set()),
@@ -132,6 +135,7 @@ def test_translate_to_language_skips_voice_when_guild_config_disables_it():
         voice_service = FakeVoiceService()
         handler = TranslationHandler(
             translation_service=FakeTranslationService(),
+            chatbot_service=FakeChatbotService(),
             voice_message_service=voice_service,
             bot=SimpleNamespace(user=None),
             config=SimpleNamespace(banned_players=set(), enable_voice_replies=True),
@@ -146,3 +150,26 @@ def test_translate_to_language_skips_voice_when_guild_config_disables_it():
         assert "file" not in reply_kwargs
     finally:
         translation_handler_module.get_db = original_get_db
+
+
+def test_direct_reply_detection_fetches_unresolved_reference():
+    bot_user = SimpleNamespace(id=42)
+    referenced_message = SimpleNamespace(author=SimpleNamespace(id=42))
+
+    class FakeChannel:
+        async def fetch_message(self, message_id):
+            assert message_id == 99
+            return referenced_message
+
+    handler = TranslationHandler(
+        translation_service=FakeTranslationService(),
+        chatbot_service=FakeChatbotService(),
+        bot=SimpleNamespace(user=bot_user),
+    )
+    message = SimpleNamespace(
+        mentions=[],
+        reference=SimpleNamespace(message_id=99, resolved=None),
+        channel=FakeChannel(),
+    )
+
+    assert asyncio.run(handler._is_direct_mention_or_reply(message)) is True

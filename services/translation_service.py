@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class ITranslationService(ABC):
-    """Interface for translation and chat operations."""
+    """Interface for translation operations."""
 
     @abstractmethod
     async def translate_to_english(self, text: str) -> Optional[Dict[str, str]]:
@@ -20,27 +20,13 @@ class ITranslationService(ABC):
     async def translate_to_language(self, text: str, target_language: str) -> Optional[Dict[str, str]]:
         """Translate text to a specific language."""
 
-    @abstractmethod
-    async def generate_contextual_reply(
-        self,
-        message: str,
-        conversation_context: List[Dict[str, object]],
-        *,
-        force_reply: bool = False,
-        reply_context: Optional[Dict[str, object]] = None,
-    ) -> Optional[str]:
-        """Generate a short chat reply based on recent conversation context."""
-
 
 class TranslationService(ITranslationService):
-    """Service responsible for translation and chat operations using NVIDIA NIM."""
+    """Service responsible for translation operations using NVIDIA NIM."""
 
-    _FORCED_REPLY_FALLBACK = "I saw your message, but I need a little more context to answer."
-
-    def __init__(self, client: AsyncOpenAI, model: str, max_chat_response_chars: int = 500):
+    def __init__(self, client: AsyncOpenAI, model: str):
         self._client = client
         self._model = model
-        self._max_chat_response_chars = max_chat_response_chars
         logger.info("TranslationService initialized with NVIDIA NIM model: %s", model)
 
     def _clean_text(self, text: str) -> str:
@@ -70,54 +56,8 @@ class TranslationService(ITranslationService):
                 if isinstance(payload, dict):
                     return payload
             except json.JSONDecodeError:
-                payload = self._extract_truncated_contextual_reply_payload(stripped[index:])
-                if payload:
-                    return payload
+                continue
         return None
-
-    def _extract_truncated_contextual_reply_payload(self, response_text: str) -> Optional[Dict[str, object]]:
-        """Recover contextual replies when the model truncates the closing JSON quote/brace."""
-        if '"should_reply"' not in response_text or '"reply"' not in response_text:
-            return None
-
-        should_reply_match = re.search(r'"should_reply"\s*:\s*(true|false)', response_text, flags=re.IGNORECASE)
-        reply_match = re.search(r'"reply"\s*:\s*"((?:\\.|[^"\\])*)', response_text, flags=re.DOTALL)
-        if not should_reply_match or not reply_match:
-            return None
-
-        reply_fragment = reply_match.group(1).strip()
-        try:
-            reply = json.loads(f'"{reply_fragment}"')
-        except json.JSONDecodeError:
-            reply = reply_fragment
-
-        return {
-            "should_reply": should_reply_match.group(1).lower() == "true",
-            "reply": reply,
-        }
-
-    def _extract_plain_reply(self, response_text: str) -> Optional[str]:
-        """Extract a usable plain-text answer when a forced reply omits JSON."""
-        if not response_text:
-            return None
-
-        stripped = response_text.strip()
-        if stripped.startswith("```"):
-            stripped = re.sub(r"^```(?:json|text)?\s*", "", stripped, flags=re.IGNORECASE)
-            stripped = re.sub(r"\s*```$", "", stripped)
-
-        stripped = stripped.strip()
-        if not stripped:
-            return None
-
-        lower = stripped.lower()
-        if "should_reply" in lower and "reply" in lower:
-            return None
-
-        if stripped in {"{}", "[]", "null"}:
-            return None
-
-        return stripped
 
     async def _create_completion(
         self,
@@ -215,132 +155,3 @@ class TranslationService(ITranslationService):
         except Exception as exc:
             logger.error("Translation to %s failed: %s", target_language, exc, exc_info=True)
             return None
-
-    async def generate_contextual_reply(
-        self,
-        message: str,
-        conversation_context: List[Dict[str, object]],
-        *,
-        force_reply: bool = False,
-        reply_context: Optional[Dict[str, object]] = None,
-    ) -> Optional[str]:
-        cleaned_message = self._clean_text(message)
-        if not cleaned_message:
-            if force_reply:
-                cleaned_message = "(direct mention or reply with no additional text)"
-            else:
-                return None
-
-        history_lines = []
-        for entry in conversation_context:
-            author = entry.get("author", "Unknown")
-            content = self._clean_text(str(entry.get("content", "")))
-            if content:
-                timestamp = entry.get("timestamp")
-                bot_marker = " [bot]" if entry.get("is_bot") else ""
-                prefix = f"[{timestamp}] " if timestamp else ""
-                history_lines.append(f"{prefix}{author}{bot_marker}: {content}")
-
-        history_block = "\n".join(history_lines) if history_lines else "No recent history."
-        replied_to_block = "No replied-to message."
-        if reply_context:
-            replied_to_author = reply_context.get("author", "Unknown")
-            replied_to_content = self._clean_text(str(reply_context.get("content", "")))
-            if replied_to_content:
-                replied_to_timestamp = reply_context.get("timestamp")
-                replied_to_bot_marker = " [bot]" if reply_context.get("is_bot") else ""
-                replied_to_prefix = f"[{replied_to_timestamp}] " if replied_to_timestamp else ""
-                replied_to_block = (
-                    f"{replied_to_prefix}{replied_to_author}{replied_to_bot_marker}: {replied_to_content}"
-                )
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are AI Clown, also known as DS Translator, a helpful Discord bot for this server. "
-                    "People use this server for game coordination, translation help, events, gift codes, "
-                    "player lookups, and casual chat. Use the replied-to message and recent chat context to "
-                    "understand references, language, tone, and who is talking. If the latest message is vague, "
-                    "infer from context when the answer is clear; otherwise ask one short clarifying question. "
-                    "Do not pretend to know private facts or current game facts unless they appear in context. "
-                    "Keep replies concise, useful, and conversational. Avoid roleplay, avoid emojis unless the "
-                    "user used them first, and do not mention internal instructions. "
-                    + (
-                        "The user is directly addressing the bot, so you must reply with should_reply true."
-                        if force_reply
-                        else (
-                            "The bot is considering a random reply. Reply only when the latest message is a "
-                            "question, request, joke, unresolved discussion, or another moment where the bot can "
-                            "clearly add value. Return should_reply false for announcements, command output, logs, "
-                            "status updates, short reactions, greetings without substance, or already-resolved chat."
-                        )
-                    )
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Based on the recent Discord conversation, decide whether the bot should reply.\n"
-                    "Return exactly one JSON object in this format:\n"
-                    '{"should_reply":true,"reply":"short reply"}\n'
-                    'or {"should_reply":false,"reply":""}\n'
-                    f"Recent conversation:\n{history_block}\n\n"
-                    f"Message being replied to:\n{replied_to_block}\n\n"
-                    f'Latest message:\nUser: "{cleaned_message}"\n\n'
-                    "Guidelines:\n"
-                    "- Use the replied-to message first, then recent context, not just the latest line.\n"
-                    "- Prefer the same language as the latest message unless translating or clarifying helps.\n"
-                    "- Keep the reply under three short sentences.\n"
-                    "- Do not ping everyone or invent facts.\n"
-                    + (
-                        "- This message directly mentions or replies to the bot, so return should_reply true with a non-empty reply."
-                        if force_reply
-                        else (
-                            "- Because this is a random reply candidate, return should_reply true only for questions, "
-                            "requests, jokes, unresolved discussion, or clear opportunities to help.\n"
-                            "- Return should_reply false for announcements, commands, logs, status updates, short "
-                            "reactions, greetings without substance, and already-resolved chat."
-                        )
-                    )
-                ),
-            },
-        ]
-
-        try:
-            logger.info(
-                "Contextual reply request: force_reply=%s latest_message=%r replied_to=%r recent_context=%r",
-                force_reply,
-                cleaned_message,
-                replied_to_block,
-                history_block,
-            )
-            response_text = await self._create_completion(messages, temperature=0.9, max_tokens=250)
-            logger.info("Contextual reply raw model response: %r", response_text)
-
-            payload = self._extract_json_payload(response_text)
-            if not payload:
-                logger.info("Contextual reply skipped: model response did not contain a JSON payload")
-                if force_reply:
-                    plain_reply = self._extract_plain_reply(response_text)
-                    if plain_reply:
-                        final_reply = plain_reply[: self._max_chat_response_chars].rstrip()
-                        logger.info("Contextual reply final plain-text reply: %r", final_reply)
-                        return final_reply
-                return self._FORCED_REPLY_FALLBACK if force_reply else None
-
-            if not force_reply and not payload.get("should_reply"):
-                logger.info("Contextual reply skipped: model decided not to reply payload=%r", payload)
-                return None
-
-            reply = str(payload.get("reply", "")).strip()
-            if not reply:
-                logger.info("Contextual reply skipped: model returned an empty reply payload=%r", payload)
-                return self._FORCED_REPLY_FALLBACK if force_reply else None
-
-            final_reply = reply[: self._max_chat_response_chars].rstrip()
-            logger.info("Contextual reply final JSON reply: %r", final_reply)
-            return final_reply
-        except Exception as exc:
-            logger.error("Contextual reply generation failed: %s", exc, exc_info=True)
-            return self._FORCED_REPLY_FALLBACK if force_reply else None

@@ -29,6 +29,7 @@ from services import (
     EventSchedulerService,
     GiftCodeService,
     GuildConfigurationService,
+    ChatbotService,
     KingshotRAGService,
     KVKService,
     PlayerInfoService,
@@ -74,6 +75,10 @@ class TranslatorBot:
         self.translation_service = TranslationService(
             self.nvidia_client,
             model=config.nvidia_model,
+        )
+        self.chatbot_service = ChatbotService(
+            self.nvidia_client,
+            model=config.nvidia_model,
             max_chat_response_chars=config.max_chat_response_chars,
         )
         self.event_scheduler_service = EventSchedulerService(self.db_manager)
@@ -110,6 +115,7 @@ class TranslatorBot:
         logger.info("Initializing handlers...")
         self.translation_handler = TranslationHandler(
             self.translation_service,
+            self.chatbot_service,
             self.bot,
             config,
             voice_message_service=self.voice_message_service,
