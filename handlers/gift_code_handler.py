@@ -1,6 +1,7 @@
 import asyncio
+import socket
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import discord
@@ -8,10 +9,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from config.bot_config import BotConfig
-from db import get_db
-from services.database_service import DatabaseService
 from services.gift_code_service import IGiftCodeService
 from services.player_info_service import IPlayerInfoService
+from services.interaction_tracking_service import InteractionTrackingService
+from services.player_registry_service import PlayerRegistryService
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,8 @@ class GiftCodeHandler:
         player_info_service: IPlayerInfoService,
         bot: commands.Bot,
         config: BotConfig,
+        interaction_tracking_service: InteractionTrackingService | None = None,
+        player_registry_service: PlayerRegistryService | None = None,
     ):
         """
         Initialize gift code handler.
@@ -117,8 +120,19 @@ class GiftCodeHandler:
         self._player_info_service = player_info_service
         self._bot = bot
         self._config = config
+        self._tracking_service = interaction_tracking_service or InteractionTrackingService()
+        self._player_registry_service = player_registry_service or PlayerRegistryService()
         self._polling_loop = None
+        self._poll_backoff_until: datetime | None = None
+        self._poll_backoff_delta = timedelta(minutes=2)
         logger.info("GiftCodeHandler initialized")
+
+    def _can_poll(self) -> bool:
+        return self._poll_backoff_until is None or datetime.now(timezone.utc) >= self._poll_backoff_until
+
+    def _mark_poll_backoff(self, error: Exception) -> None:
+        self._poll_backoff_until = datetime.now(timezone.utc) + self._poll_backoff_delta
+        logger.warning("Gift code polling will retry after %s because of networking error: %s", self._poll_backoff_delta, error)
 
     def register_commands(self):
         """Register all gift code commands with the bot."""
@@ -173,6 +187,10 @@ class GiftCodeHandler:
             """Check for new gift codes and redeem them for all users."""
             logger.info("Polling for new gift codes...")
 
+            if not self._can_poll():
+                logger.debug("Skipping gift-code polling due temporary network error backoff window")
+                return
+
             try:
                 # Fetch available codes from 3rd party API
                 response = await self._gift_code_service.get_available_gift_codes()
@@ -184,178 +202,174 @@ class GiftCodeHandler:
                 if not codes:
                     return
 
-                db = get_db()
-                async with db.session() as session:
-                    # Check which codes are new
-                    new_codes_found = []
+                # Check which codes are new
+                new_codes_found = []
 
-                    for row in codes:
-                        code_id = row.get("id")
-                        code_str = row.get("code")
+                for row in codes:
+                    code_id = row.get("id")
+                    code_str = row.get("code")
 
-                        if not code_id or not code_str:
-                            continue
+                    if not code_id or not code_str:
+                        continue
 
-                        # Parse dates
-                        created_at_api = row.get("createdAt")
-                        expires_at = row.get("expiresAt")
+                    # Parse dates
+                    created_at_api = row.get("createdAt")
+                    expires_at = row.get("expiresAt")
 
-                        try:
-                            # Parse ISO format datetime strings
-                            dt_created = (
-                                datetime.fromisoformat(created_at_api.replace("Z", "+00:00"))
-                                if created_at_api
-                                else datetime.now(timezone.utc)
-                            )
-                            dt_expires = (
-                                datetime.fromisoformat(expires_at.replace("Z", "+00:00")) if expires_at else None
-                            )
-
-                            is_new, _ = await DatabaseService.add_or_update_gift_code(
-                                session, code_id, code_str, dt_created, dt_expires
-                            )
-
-                            if is_new:
-                                new_codes_found.append(code_str)
-
-                        except ValueError as e:
-                            logger.error(f"Error parsing date for gift code {code_str}: {e}")
-
-                    # If we found new codes, redeem them!
-                    if new_codes_found:
-                        logger.info(f"Found {len(new_codes_found)} new gift codes. Starting auto-redemption...")
-
-                        # Ensure the bot user exists in the database to satisfy the foreign key constraint
-                        bot_user_id = self._bot.user.id if self._bot.user else 0
-                        bot_username = self._bot.user.name if self._bot.user else "System Bot"
-                        bot_discriminator = (
-                            getattr(self._bot.user, "discriminator", "0000") if self._bot.user else "0000"
+                    try:
+                        # Parse ISO format datetime strings
+                        dt_created = (
+                            datetime.fromisoformat(created_at_api.replace("Z", "+00:00"))
+                            if created_at_api
+                            else datetime.now(timezone.utc)
                         )
-                        bot_display_name = (
-                            getattr(self._bot.user, "display_name", "System Bot") if self._bot.user else "System Bot"
+                        dt_expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) if expires_at else None
+
+                        is_new, _ = await self._gift_code_service.add_or_update_gift_code(
+                            code_id=code_id,
+                            code=code_str,
+                            created_at_api=dt_created,
+                            expires_at=dt_expires,
                         )
 
-                        await DatabaseService.get_or_create_user(
-                            session,
-                            bot_user_id,
-                            bot_username,
-                            bot_discriminator,
-                            bot_display_name,
+                        if is_new:
+                            new_codes_found.append(code_str)
+
+                    except ValueError as e:
+                        logger.error(f"Error parsing date for gift code {code_str}: {e}")
+
+                # If we found new codes, redeem them!
+                if new_codes_found:
+                    logger.info(f"Found {len(new_codes_found)} new gift codes. Starting auto-redemption...")
+
+                    # Ensure the bot user exists in the database to satisfy the foreign key constraint
+                    bot_user = self._bot.user
+                    bot_user_id = bot_user.id if bot_user else 0
+                    bot_username = bot_user.name if bot_user else "System Bot"
+                    bot_discriminator = getattr(bot_user, "discriminator", "0000") if bot_user else "0000"
+                    bot_display_name = getattr(bot_user, "display_name", "System Bot") if bot_user else "System Bot"
+
+                    await self._tracking_service.track_user(
+                        session=None,
+                        user_id=bot_user_id,
+                        username=bot_username,
+                        discriminator=bot_discriminator,
+                        display_name=bot_display_name,
+                    )
+
+                    # Get all enabled players
+                    registered_players = await self._player_registry_service.get_registered_players(enabled_only=True)
+
+                    if not registered_players:
+                        logger.info("No registered players to auto-redeem for.")
+                        return
+
+                    # Redeem each code for each player
+                    for new_code in new_codes_found:
+                        logger.info(
+                            f"Auto-redeeming code '{new_code}' for {len(registered_players)} players..."
                         )
 
-                        # Get all enabled players
-                        registered_players = await DatabaseService.get_registered_players(session, enabled_only=True)
+                        # Fetch already redeemed set specific to this code to minimize lookups
+                        already_redeemed = await self._gift_code_service.get_redeemed_players(None, new_code)
 
-                        if not registered_players:
-                            logger.info("No registered players to auto-redeem for.")
-                            return
+                        # Track results for this specific code
+                        success_count = 0
+                        already_redeemed_count = 0
+                        api_rejected_count = 0
+                        invalid_id_count = 0
 
-                        # Redeem each code for each player
-                        for new_code in new_codes_found:
-                            logger.info(f"Auto-redeeming code '{new_code}' for {len(registered_players)} players...")
+                        for player in registered_players:
+                            if player.player_id in already_redeemed:
+                                already_redeemed_count += 1
+                                continue
 
-                            # Fetch already redeemed set specific to this code to minimize lookups
-                            already_redeemed = await self._gift_code_service.get_redeemed_players(session, new_code)
+                            try:
+                                player_id_int = int(player.player_id)
 
-                            # Track results for this specific code
-                            success_count = 0
-                            already_redeemed_count = 0
-                            api_rejected_count = 0
-                            invalid_id_count = 0
+                                # Add jitter to avoid rating limits
+                                await asyncio.sleep(1.0)
 
-                            for player in registered_players:
-                                if player.player_id in already_redeemed:
+                                result = await self._redeem_with_retries(
+                                    player_id_int=player_id_int,
+                                    gift_code=new_code,
+                                    player_id_for_logs=player.player_id,
+                                )
+
+                                # Track detailed status category
+                                status_category = self._categorize_redemption_status(result)
+                                if status_category == self.STATUS_SUCCESS:
+                                    success_count += 1
+                                elif status_category == self.STATUS_ALREADY_REDEEMED:
                                     already_redeemed_count += 1
-                                    continue
-
-                                try:
-                                    player_id_int = int(player.player_id)
-
-                                    # Add jitter to avoid rating limits
-                                    await asyncio.sleep(1.0)
-
-                                    result = await self._redeem_with_retries(
-                                        session=session,
-                                        player_id_int=player_id_int,
-                                        gift_code=new_code,
-                                        player_id_for_logs=player.player_id,
-                                    )
-
-                                    # Track detailed status category
-                                    status_category = self._categorize_redemption_status(result)
-                                    if status_category == self.STATUS_SUCCESS:
-                                        success_count += 1
-                                    elif status_category == self.STATUS_ALREADY_REDEEMED:
-                                        already_redeemed_count += 1
-                                    elif status_category == self.STATUS_INVALID_ID:
-                                        invalid_id_count += 1
-                                    else:
-                                        api_rejected_count += 1
-
-                                    # We need a system bot user ID since there is no interaction context
-                                    # We use the bot's user ID
-                                    bot_user_id = self._bot.user.id if self._bot.user else 0
-
-                                    await self._sync_player_metadata_from_redemption_result(
-                                        session=session,
-                                        player_id=player.player_id,
-                                        redemption_result=result,
-                                        added_by_user_id=bot_user_id,
-                                    )
-
-                                    await DatabaseService.log_gift_code_redemption(
-                                        session,
-                                        user_id=bot_user_id,
-                                        player_id=player.player_id,
-                                        gift_code=new_code,
-                                        success=result.get("success", False),
-                                        response_message=result.get("message"),
-                                        error_code=result.get("error_code"),
-                                    )
-
-                                except ValueError:
-                                    logger.error(f"Invalid player ID format during auto-redeem: {player.player_id}")
+                                elif status_category == self.STATUS_INVALID_ID:
                                     invalid_id_count += 1
-                                except Exception as e:
-                                    logger.error(f"Error auto-redeeming {new_code} for {player.player_id}: {e}")
+                                else:
                                     api_rejected_count += 1
 
-                            # Send Discord announcement if channels are configured
-                            if self._config.auto_redeem_channels:
-                                embed = discord.Embed(
-                                    title="🎁 New Gift Code Found!",
-                                    description="Auto-redemption triggered for newly discovered gift code.",
-                                    color=discord.Color.brand_green(),
+                                # We need a system bot user ID since there is no interaction context
+                                # We use the bot's user ID
+                                await self._sync_player_metadata_from_redemption_result(
+                                    player_id=player.player_id,
+                                    redemption_result=result,
+                                    added_by_user_id=bot_user_id,
                                 )
-                                embed.add_field(name="Gift Code", value=f"`{new_code}`", inline=False)
-                                embed.add_field(
-                                    name="Auto-Redeem Status",
-                                    value=(
-                                        f"✅ **Success**: {success_count}\n"
-                                        f"🔄 **Already Claimed**: {already_redeemed_count}\n"
-                                        f"🚫 **API Rejected**: {api_rejected_count}\n"
-                                        f"🆔 **Invalid ID**: {invalid_id_count}\n"
-                                        f"👥 **Total Players**: {len(registered_players)}"
-                                    ),
-                                    inline=False,
-                                )
-                                embed.set_footer(text="Check in-game mail for successfully redeemed codes!")
 
-                                for channel_id in self._config.auto_redeem_channels:
-                                    channel = self._bot.get_channel(channel_id)
-                                    if channel and isinstance(channel, discord.TextChannel):
-                                        try:
-                                            await channel.send(embed=embed)
-                                            logger.info(f"Announced gift code {new_code} in channel {channel_id}")
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to send gift code announcement to channel {channel_id}: {e}"
-                                            )
-                                    else:
-                                        logger.warning(
-                                            f"Configured auto-redeem channel {channel_id} not found or is not a text channel"
+                                await self._tracking_service.log_gift_code_redemption(
+                                    user_id=bot_user_id,
+                                    player_id=player.player_id,
+                                    gift_code=new_code,
+                                    success=result.get("success", False),
+                                    response_message=result.get("message"),
+                                    error_code=result.get("error_code"),
+                                )
+
+                            except ValueError:
+                                logger.error(f"Invalid player ID format during auto-redeem: {player.player_id}")
+                                invalid_id_count += 1
+                            except Exception as e:
+                                logger.error(f"Error auto-redeeming {new_code} for {player.player_id}: {e}")
+                                api_rejected_count += 1
+
+                        # Send Discord announcement if channels are configured
+                        if self._config.auto_redeem_channels:
+                            embed = discord.Embed(
+                                title="🎁 New Gift Code Found!",
+                                description="Auto-redemption triggered for newly discovered gift code.",
+                                color=discord.Color.brand_green(),
+                            )
+                            embed.add_field(name="Gift Code", value=f"`{new_code}`", inline=False)
+                            embed.add_field(
+                                name="Auto-Redeem Status",
+                                value=(
+                                    f"✅ **Success**: {success_count}\n"
+                                    f"🔄 **Already Claimed**: {already_redeemed_count}\n"
+                                    f"🚫 **API Rejected**: {api_rejected_count}\n"
+                                    f"🆔 **Invalid ID**: {invalid_id_count}\n"
+                                    f"👥 **Total Players**: {len(registered_players)}"
+                                ),
+                                inline=False,
+                            )
+                            embed.set_footer(text="Check in-game mail for successfully redeemed codes!")
+
+                            for channel_id in self._config.auto_redeem_channels:
+                                channel = self._bot.get_channel(channel_id)
+                                if channel and isinstance(channel, discord.TextChannel):
+                                    try:
+                                        await channel.send(embed=embed)
+                                        logger.info(f"Announced gift code {new_code} in channel {channel_id}")
+                                    except Exception as e:
+                                        logger.error(
+                                            f"Failed to send gift code announcement to channel {channel_id}: {e}"
                                         )
+                                else:
+                                    logger.warning(
+                                        f"Configured auto-redeem channel {channel_id} not found or is not a text channel"
+                                    )
 
+            except socket.gaierror as e:
+                self._mark_poll_backoff(e)
+                logger.error(f"Error in poll_gift_codes background task: {e}")
             except Exception as e:
                 logger.error(f"Error in poll_gift_codes background task: {e}")
 
@@ -454,103 +468,97 @@ class GiftCodeHandler:
 
         # Get all registered players
         try:
-            db = get_db()
-            async with db.session() as session:
-                await DatabaseService.get_or_create_user(
-                    session,
-                    interaction.user.id,
-                    interaction.user.name,
-                    interaction.user.discriminator,
-                    interaction.user.display_name,
-                )
+            await self._tracking_service.track_user(
+                session=None,
+                user_id=interaction.user.id,
+                username=interaction.user.name,
+                discriminator=interaction.user.discriminator,
+                display_name=interaction.user.display_name,
+            )
 
-                registered_players = await DatabaseService.get_registered_players(session, enabled_only=True)
+            registered_players = await self._player_registry_service.get_registered_players(enabled_only=True)
 
-                if not registered_players:
-                    await interaction.followup.send(
-                        embed=self._build_status_embed(
-                            title="📭 No Enabled Players",
-                            description="Use `/addplayer <player_id>` to enable at least one player before redeeming.",
-                            color=discord.Color.orange(),
-                        )
+            if not registered_players:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="📭 No Enabled Players",
+                        description="Use `/addplayer <player_id>` to enable at least one player before redeeming.",
+                        color=discord.Color.orange(),
                     )
-                    return
+                )
+                return
 
-                # Redeem for each player
-                results = []
-                for player in registered_players:
-                    try:
-                        player_id_int = int(player.player_id)
+            results = []
+            for player in registered_players:
+                try:
+                    player_id_int = int(player.player_id)
 
-                        # Add jitter/delay to prevent 429 Too Many Requests from bulk redemption
-                        if len(results) > 0:
-                            await asyncio.sleep(1.0)
+                    # Add jitter/delay to prevent 429 Too Many Requests from bulk redemption
+                    if len(results) > 0:
+                        await asyncio.sleep(1.0)
 
-                        result = await self._redeem_with_retries(
-                            session=session,
-                            player_id_int=player_id_int,
-                            gift_code=gift_code,
-                            player_id_for_logs=player.player_id,
-                        )
+                    result = await self._redeem_with_retries(
+                        player_id_int=player_id_int,
+                        gift_code=gift_code,
+                        player_id_for_logs=player.player_id,
+                    )
 
-                        await self._sync_player_metadata_from_redemption_result(
-                            session=session,
-                            player_id=player.player_id,
-                            redemption_result=result,
-                            added_by_user_id=interaction.user.id,
-                        )
+                    await self._sync_player_metadata_from_redemption_result(
+                        player_id=player.player_id,
+                        redemption_result=result,
+                        added_by_user_id=interaction.user.id,
+                    )
 
-                        # Log to database
-                        await DatabaseService.log_gift_code_redemption(
-                            session,
-                            user_id=interaction.user.id,
-                            player_id=player.player_id,
-                            gift_code=gift_code,
-                            success=result.get("success", False),
-                            response_message=result.get("message"),
-                            error_code=result.get("error_code"),
-                            guild_id=interaction.guild.id if interaction.guild else None,
-                            channel_id=interaction.channel.id,
-                        )
+                    # Log to database
+                    await self._tracking_service.log_gift_code_redemption(
+                        user_id=interaction.user.id,
+                        player_id=player.player_id,
+                        gift_code=gift_code,
+                        success=result.get("success", False),
+                        response_message=result.get("message"),
+                        error_code=result.get("error_code"),
+                        guild_id=interaction.guild.id if interaction.guild else None,
+                        channel_id=interaction.channel.id,
+                    )
 
-                        results.append(
-                            {
-                                "player_id": player.player_id,
-                                "player_name": (result.get("player_profile") or {}).get("name") or player.player_name,
-                                "success": result.get("success", False),
-                                "message": result.get("message", "Unknown error"),
-                                "error_code": result.get("error_code"),
-                                "already_redeemed": result.get("already_redeemed", False),
-                                "status_category": self._categorize_redemption_status(result),
-                            }
-                        )
-                    except ValueError:
-                        logger.error(f"Invalid player ID format: {player.player_id}")
-                        results.append(
-                            {
-                                "player_id": player.player_id,
-                                "player_name": player.player_name,
-                                "success": False,
-                                "message": "Invalid player ID format",
-                                "error_code": "INVALID_ID",
-                                "status_category": self.STATUS_INVALID_ID,
-                            }
-                        )
-                    except Exception as e:
-                        logger.error(f"Error redeeming for player {player.player_id}: {e}")
-                        results.append(
-                            {
-                                "player_id": player.player_id,
-                                "player_name": player.player_name,
-                                "success": False,
-                                "message": "Unexpected error occurred",
-                                "error_code": "UNKNOWN_ERROR",
-                                "status_category": self.STATUS_API_REJECTED,
-                            }
-                        )
+                    results.append(
+                        {
+                            "player_id": player.player_id,
+                            "player_name": (result.get("player_profile") or {}).get("name") or player.player_name,
+                            "success": result.get("success", False),
+                            "message": result.get("message", "Unknown error"),
+                            "error_code": result.get("error_code"),
+                            "already_redeemed": result.get("already_redeemed", False),
+                            "status_category": self._categorize_redemption_status(result),
+                        }
+                    )
+                except ValueError:
+                    logger.error(f"Invalid player ID format: {player.player_id}")
+                    results.append(
+                        {
+                            "player_id": player.player_id,
+                            "player_name": player.player_name,
+                            "success": False,
+                            "message": "Invalid player ID format",
+                            "error_code": "INVALID_ID",
+                            "status_category": self.STATUS_INVALID_ID,
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Error redeeming for player {player.player_id}: {e}")
+                    results.append(
+                        {
+                            "player_id": player.player_id,
+                            "player_name": player.player_name,
+                            "success": False,
+                            "message": "Unexpected error occurred",
+                            "error_code": "UNKNOWN_ERROR",
+                            "status_category": self.STATUS_API_REJECTED,
+                        }
+                    )
 
-                # Format and send results
-                await self._send_redemption_results_slash(interaction, gift_code, results)
+            # Format and send results
+            await self._send_redemption_results_slash(interaction, gift_code, results)
 
         except Exception as e:
             logger.error(f"Error in bulk redemption: {e}", exc_info=True)
@@ -664,7 +672,6 @@ class GiftCodeHandler:
 
     async def _redeem_with_retries(
         self,
-        session,
         player_id_int: int,
         gift_code: str,
         player_id_for_logs: str,
@@ -679,7 +686,7 @@ class GiftCodeHandler:
 
         for attempt in range(1, max_attempts + 1):
             try:
-                last_result = await self._gift_code_service.redeem_gift_code(session, player_id_int, gift_code)
+                last_result = await self._gift_code_service.redeem_gift_code(None, player_id_int, gift_code)
             except Exception as exc:
                 logger.error(
                     "Redeem attempt %s/%s crashed for player %s and code '%s': %s",
@@ -770,23 +777,14 @@ class GiftCodeHandler:
             else None
         )
 
-        db = get_db()
-        async with db.session() as session:
-            await DatabaseService.update_registered_player_metadata(
-                session=session,
-                player_id=resolved_player_id,
-                player_name=resolved_name,
-                kingdom=resolved_kingdom,
-                castle_level=resolved_castle_level,
-            )
+        await self._tracking_service.sync_player_metadata(
+            player_id=resolved_player_id,
+            player_name=resolved_name,
+            kingdom=resolved_kingdom,
+            castle_level=resolved_castle_level,
+        )
 
-    async def _sync_player_metadata_from_redemption_result(
-        self,
-        session,
-        player_id: str,
-        redemption_result: Dict,
-        added_by_user_id: int,
-    ) -> None:
+    async def _sync_player_metadata_from_redemption_result(self, player_id: str, redemption_result: Dict, added_by_user_id: int) -> None:
         """Refresh player metadata from redeem response and upsert when needed."""
         player_profile = redemption_result.get("player_profile")
         if not isinstance(player_profile, dict):
@@ -799,8 +797,7 @@ class GiftCodeHandler:
             str(player_profile.get("level")) if player_profile.get("level") is not None else None
         )
 
-        await DatabaseService.update_registered_player_metadata(
-            session=session,
+        await self._tracking_service.sync_player_metadata(
             player_id=resolved_player_id,
             player_name=resolved_name,
             kingdom=resolved_kingdom,
@@ -810,8 +807,7 @@ class GiftCodeHandler:
 
         # If an old/non-canonical player ID exists in the table, keep it refreshed too.
         if resolved_player_id != str(player_id):
-            await DatabaseService.update_registered_player_metadata(
-                session=session,
+            await self._tracking_service.sync_player_metadata(
                 player_id=str(player_id),
                 player_name=resolved_name,
                 kingdom=resolved_kingdom,
@@ -825,6 +821,7 @@ class GiftCodeHandler:
         try:
             # Parse multiple comma-separated IDs
             import re
+
             raw_ids = [pid.strip() for pid in re.split(r'[,\s]+', player_ids) if pid.strip()]
             if not raw_ids:
                 await interaction.followup.send(
@@ -836,15 +833,13 @@ class GiftCodeHandler:
                 )
                 return
 
-            db = get_db()
-            async with db.session() as session:
-                await DatabaseService.get_or_create_user(
-                    session,
-                    interaction.user.id,
-                    interaction.user.name,
-                    interaction.user.discriminator,
-                    interaction.user.display_name,
-                )
+            await self._tracking_service.track_user(
+                session=None,
+                user_id=interaction.user.id,
+                username=interaction.user.name,
+                discriminator=interaction.user.discriminator,
+                display_name=interaction.user.display_name,
+            )
 
             added_players = []
             not_found_players = []
@@ -859,30 +854,27 @@ class GiftCodeHandler:
 
                 await self._sync_player_metadata_from_lookup(pid, player_info)
 
-                db = get_db()
-                async with db.session() as session:
-                    # Use API-provided name only
-                    resolved_player_id = str(player_info.get("playerId") or pid)
-                    resolved_name = player_info.get("name")
-                    resolved_kingdom = str(player_info.get("kingdom")) if player_info.get("kingdom") is not None else None
-                    resolved_castle_level = (
-                        str(player_info.get("levelRenderedDetailed") or player_info.get("level"))
-                        if (player_info.get("levelRenderedDetailed") or player_info.get("level") is not None)
-                        else None
-                    )
+                # Use API-provided name only
+                resolved_player_id = str(player_info.get("playerId") or pid)
+                resolved_name = player_info.get("name")
+                resolved_kingdom = str(player_info.get("kingdom")) if player_info.get("kingdom") is not None else None
+                resolved_castle_level = (
+                    str(player_info.get("levelRenderedDetailed") or player_info.get("level"))
+                    if (player_info.get("levelRenderedDetailed") or player_info.get("level") is not None)
+                    else None
+                )
 
-                    await DatabaseService.add_registered_player(
-                        session,
-                        player_id=resolved_player_id,
-                        added_by_user_id=interaction.user.id,
-                        player_name=resolved_name,
-                        kingdom=resolved_kingdom,
-                        castle_level=resolved_castle_level,
-                        enabled=True,
-                    )
-                    
-                    added_players.append(f"`{resolved_player_id}`" + (f" ({resolved_name})" if resolved_name else ""))
-                    logger.info(f"Player {resolved_player_id} added by {interaction.user.id}")
+                await self._player_registry_service.add_registered_player(
+                    player_id=resolved_player_id,
+                    added_by_user_id=interaction.user.id,
+                    player_name=resolved_name,
+                    kingdom=resolved_kingdom,
+                    castle_level=resolved_castle_level,
+                    enabled=True,
+                )
+
+                added_players.append(f"`{resolved_player_id}`" + (f" ({resolved_name})" if resolved_name else ""))
+                logger.info(f"Player {resolved_player_id} added by {interaction.user.id}")
 
             # Build final response embed
             if not added_players and not_found_players:
@@ -930,56 +922,54 @@ class GiftCodeHandler:
         await interaction.response.defer(thinking=True)
 
         try:
-            db = get_db()
-            async with db.session() as session:
-                # Fetch player to check ownership
-                player = await DatabaseService.get_registered_player(session, player_id)
+            # Fetch player to check ownership
+            player = await self._player_registry_service.get_registered_player(player_id)
 
-                if not player:
-                    await interaction.followup.send(
-                        embed=self._build_status_embed(
-                            title="❌ Player Not Found",
-                            description=f"Player `{player_id}` is not in the player list.",
-                            color=discord.Color.red(),
-                        )
+            if not player:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="❌ Player Not Found",
+                        description=f"Player `{player_id}` is not in the player list.",
+                        color=discord.Color.red(),
                     )
-                    return
+                )
+                return
 
-                # Determine admin status (guild context only)
-                is_admin = False
-                if interaction.guild and interaction.user.guild_permissions:
-                    is_admin = bool(interaction.user.guild_permissions.administrator)
+            # Determine admin status (guild context only)
+            is_admin = False
+            if interaction.guild and interaction.user.guild_permissions:
+                is_admin = bool(interaction.user.guild_permissions.administrator)
 
-                # Check ownership or admin rights
-                if player.added_by_user_id != interaction.user.id and not is_admin:
-                    await interaction.followup.send(
-                        embed=self._build_status_embed(
-                            title="⛔ Permission Denied",
-                            description="You can only remove players you added, unless you are a server admin.",
-                            color=discord.Color.orange(),
-                        )
+            # Check ownership or admin rights
+            if player.added_by_user_id != interaction.user.id and not is_admin:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="⛔ Permission Denied",
+                        description="You can only remove players you added, unless you are a server admin.",
+                        color=discord.Color.orange(),
                     )
-                    return
+                )
+                return
 
-                # Proceed with removal
-                removed = await DatabaseService.remove_registered_player(session, player_id)
+            # Proceed with removal
+            removed = await self._player_registry_service.remove_registered_player(player_id)
 
-                if removed:
-                    embed = discord.Embed(
-                        title="✅ Player Removed",
-                        description=f"Player `{player_id}` has been removed from the gift code redemption list.",
-                        color=discord.Color.green(),
+            if removed:
+                embed = discord.Embed(
+                    title="✅ Player Removed",
+                    description=f"Player `{player_id}` has been removed from the gift code redemption list.",
+                    color=discord.Color.green(),
+                )
+                await interaction.followup.send(embed=embed)
+                logger.info(f"Player {player_id} removed by {interaction.user.id} (admin={is_admin})")
+            else:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="❌ Player Not Found",
+                        description=f"Player `{player_id}` is not in the player list.",
+                        color=discord.Color.red(),
                     )
-                    await interaction.followup.send(embed=embed)
-                    logger.info(f"Player {player_id} removed by {interaction.user.id} (admin={is_admin})")
-                else:
-                    await interaction.followup.send(
-                        embed=self._build_status_embed(
-                            title="❌ Player Not Found",
-                            description=f"Player `{player_id}` is not in the player list.",
-                            color=discord.Color.red(),
-                        )
-                    )
+                )
 
         except Exception as e:
             logger.error(f"Error removing player {player_id}: {e}", exc_info=True)
@@ -996,35 +986,33 @@ class GiftCodeHandler:
         await interaction.response.defer(thinking=True)
 
         try:
-            db = get_db()
-            async with db.session() as session:
-                all_players = await DatabaseService.get_registered_players(session, enabled_only=False)
+            all_players = await self._player_registry_service.get_registered_players(enabled_only=False)
 
-                if not all_players:
-                    await interaction.followup.send(
-                        embed=self._build_status_embed(
-                            title="📋 No Players Found",
-                            description="No player profiles are available yet.",
-                            color=discord.Color.blue(),
-                        )
+            if not all_players:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="📋 No Players Found",
+                        description="No player profiles are available yet.",
+                        color=discord.Color.blue(),
                     )
-                    return
-
-                enabled_players = [p for p in all_players if p.enabled]
-                disabled_players = [p for p in all_players if not p.enabled]
-                ordered_players = enabled_players + disabled_players
-                player_lines = self._build_player_lines(ordered_players)
-                pages = self._chunk_lines(player_lines, page_size=20)
-
-                view = PlayerListPaginationView(
-                    pages=pages,
-                    total_players=len(all_players),
-                    enabled_count=len(enabled_players),
-                    disabled_count=len(disabled_players),
-                    author_id=interaction.user.id,
                 )
-                message = await interaction.followup.send(embed=view.build_embed(), view=view)
-                view.message = message
+                return
+
+            enabled_players = [p for p in all_players if p.enabled]
+            disabled_players = [p for p in all_players if not p.enabled]
+            ordered_players = enabled_players + disabled_players
+            player_lines = self._build_player_lines(ordered_players)
+            pages = self._chunk_lines(player_lines, page_size=20)
+
+            view = PlayerListPaginationView(
+                pages=pages,
+                total_players=len(all_players),
+                enabled_count=len(enabled_players),
+                disabled_count=len(disabled_players),
+                author_id=interaction.user.id,
+            )
+            message = await interaction.followup.send(embed=view.build_embed(), view=view)
+            view.message = message
 
         except Exception as e:
             logger.error(f"Error listing players: {e}", exc_info=True)
@@ -1041,29 +1029,27 @@ class GiftCodeHandler:
         await interaction.response.defer(thinking=True)
 
         try:
-            db = get_db()
-            async with db.session() as session:
-                new_status = await DatabaseService.toggle_registered_player(session, player_id)
+            new_status = await self._player_registry_service.toggle_registered_player(player_id)
 
-                if new_status is not None:
-                    status_emoji = "✅" if new_status else "⛔"
-                    status_text = "enabled" if new_status else "disabled"
+            if new_status is not None:
+                status_emoji = "✅" if new_status else "⛔"
+                status_text = "enabled" if new_status else "disabled"
 
-                    embed = discord.Embed(
-                        title=f"{status_emoji} Player Status Updated",
-                        description=f"Player `{player_id}` has been **{status_text}** for gift code redemption.",
-                        color=(discord.Color.green() if new_status else discord.Color.orange()),
+                embed = discord.Embed(
+                    title=f"{status_emoji} Player Status Updated",
+                    description=f"Player `{player_id}` has been **{status_text}** for gift code redemption.",
+                    color=(discord.Color.green() if new_status else discord.Color.orange()),
+                )
+                await interaction.followup.send(embed=embed)
+                logger.info(f"Player {player_id} toggled to {status_text} by {interaction.user.id}")
+            else:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="❌ Player Not Found",
+                        description=f"Player `{player_id}` is not in the player list.",
+                        color=discord.Color.red(),
                     )
-                    await interaction.followup.send(embed=embed)
-                    logger.info(f"Player {player_id} toggled to {status_text} by {interaction.user.id}")
-                else:
-                    await interaction.followup.send(
-                        embed=self._build_status_embed(
-                            title="❌ Player Not Found",
-                            description=f"Player `{player_id}` is not in the player list.",
-                            color=discord.Color.red(),
-                        )
-                    )
+                )
 
         except Exception as e:
             logger.error(f"Error toggling player {player_id}: {e}", exc_info=True)

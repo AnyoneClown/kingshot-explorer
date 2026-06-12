@@ -7,10 +7,10 @@ from typing import Dict, List
 import discord
 from discord.ext import commands
 
-from db import get_db
 from handlers.ui import EmbedColors, build_status_embed
-from services.database_service import DatabaseService
 from services.chatbot_service import IChatbotService
+from services.guild_configuration_service import GuildConfigurationService
+from services.interaction_tracking_service import InteractionTrackingService
 from services.translation_service import ITranslationService
 from services.voice_message_service import VoiceMessageService
 
@@ -27,6 +27,8 @@ class TranslationHandler:
         bot: commands.Bot,
         config=None,
         voice_message_service: VoiceMessageService | None = None,
+        interaction_tracking_service: InteractionTrackingService | None = None,
+        guild_configuration_service: GuildConfigurationService | None = None,
     ):
         """
         Initialize translation handler.
@@ -43,6 +45,8 @@ class TranslationHandler:
         self._config = config
         self._voice_message_service = voice_message_service
         self._last_chat_reply_at: Dict[int, float] = {}
+        self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
+        self._guild_configuration_service = guild_configuration_service
 
     def register_commands(self):
         """Register all translation commands with the bot."""
@@ -119,47 +123,37 @@ class TranslationHandler:
             async with ctx.typing():
                 result = await self._translation_service.translate_to_language(text_to_translate, target_language)
 
-            if result:
-                translated_text = result.get("text")
-                if not translated_text:
-                    await ctx.reply(
-                        embed=build_status_embed(
-                            title="Translation Failed",
-                            description="The AI service responded, but no translated text was returned.",
-                            color=EmbedColors.ERROR,
+                if result:
+                    translated_text = result.get("text")
+                    if not translated_text:
+                        await ctx.reply(
+                            embed=build_status_embed(
+                                title="Translation Failed",
+                                description="The AI service responded, but no translated text was returned.",
+                                color=EmbedColors.ERROR,
+                            )
                         )
+                        return
+
+                    quoted_text = self._as_quote_block(self._truncate_for_discord(translated_text, 1500))
+                    embed = build_status_embed(
+                        title=f"Translated to {target_language}",
+                        description=quoted_text,
+                        color=EmbedColors.INFO,
+                        footer="DS Translator",
                     )
-                    return
+                    await self._reply_with_optional_voice(
+                        ctx.reply,
+                        embed=embed,
+                        guild_id=ctx.guild.id if ctx.guild else None,
+                        voice_text=translated_text,
+                        language_hint=target_language,
+                        filename_stem="translation",
+                    )
 
-                quoted_text = self._as_quote_block(self._truncate_for_discord(translated_text, 1500))
-                embed = build_status_embed(
-                    title=f"Translated to {target_language}",
-                    description=quoted_text,
-                    color=EmbedColors.INFO,
-                    footer="DS Translator",
-                )
-                await self._reply_with_optional_voice(
-                    ctx.reply,
-                    embed=embed,
-                    guild_id=ctx.guild.id if ctx.guild else None,
-                    voice_text=translated_text,
-                    language_hint=target_language,
-                    filename_stem="translation",
-                )
-
-                # Track in database
-                try:
-                    db = get_db()
-                    async with db.session() as session:
-                        await DatabaseService.get_or_create_user(
-                            session,
-                            ctx.author.id,
-                            ctx.author.name,
-                            ctx.author.discriminator,
-                            ctx.author.display_name,
-                        )
-                        await DatabaseService.log_translation(
-                            session,
+                    # Track in database
+                    try:
+                        await self._interaction_tracking_service.track_translation(
                             user_id=ctx.author.id,
                             original_text=text_to_translate,
                             translated_text=translated_text,
@@ -168,20 +162,23 @@ class TranslationHandler:
                             translation_type="command",
                             guild_id=ctx.guild.id if ctx.guild else None,
                             channel_id=ctx.channel.id,
+                            username=ctx.author.name,
+                            discriminator=ctx.author.discriminator,
+                            display_name=ctx.author.display_name,
                         )
-                except Exception as db_error:
-                    logger.error(f"Database tracking error: {db_error}", exc_info=True)
-            else:
-                await ctx.reply(
-                    embed=build_status_embed(
-                        title="Translation Failed",
-                        description=(
-                            f"I couldn't translate that to `{target_language}`. "
-                            "Try a common language name like `Spanish`, `French`, or `English`."
-                        ),
-                        color=EmbedColors.ERROR,
+                    except Exception as db_error:
+                        logger.error(f"Database tracking error: {db_error}", exc_info=True)
+                else:
+                    await ctx.reply(
+                        embed=build_status_embed(
+                            title="Translation Failed",
+                            description=(
+                                f"I couldn't translate that to `{target_language}`. "
+                                "Try a common language name like `Spanish`, `French`, or `English`."
+                            ),
+                            color=EmbedColors.ERROR,
+                        )
                     )
-                )
         except Exception as e:
             logger.error(f"Error in translate command: {e}")
             await ctx.reply(
@@ -263,26 +260,19 @@ class TranslationHandler:
 
                 # Track in database
                 try:
-                    db = get_db()
-                    async with db.session() as session:
-                        await DatabaseService.get_or_create_user(
-                            session,
-                            ctx.author.id,
-                            ctx.author.name,
-                            ctx.author.discriminator,
-                            ctx.author.display_name,
-                        )
-                        await DatabaseService.log_translation(
-                            session,
-                            user_id=ctx.author.id,
-                            original_text=text_to_translate,
-                            translated_text=translated_text,
-                            target_language="en",
-                            source_language=source_language,
-                            translation_type="command",
-                            guild_id=ctx.guild.id if ctx.guild else None,
-                            channel_id=ctx.channel.id,
-                        )
+                    await self._interaction_tracking_service.track_translation(
+                        user_id=ctx.author.id,
+                        original_text=text_to_translate,
+                        translated_text=translated_text,
+                        target_language="en",
+                        source_language=source_language,
+                        translation_type="command",
+                        guild_id=ctx.guild.id if ctx.guild else None,
+                        channel_id=ctx.channel.id,
+                        username=ctx.author.name,
+                        discriminator=ctx.author.discriminator,
+                        display_name=ctx.author.display_name,
+                    )
                 except Exception as db_error:
                     logger.error(f"Database tracking error: {db_error}", exc_info=True)
             elif result:
@@ -350,44 +340,39 @@ class TranslationHandler:
 
         try:
             result = await self._translation_service.translate_to_english(message.content)
-
+            translated_text = None
+            source_language = None
             if result and result.get("language") != "English":
                 translated_text = result.get("text")
                 source_language = result.get("language")
-                if translated_text:
-                    await self._reply_with_optional_voice(
-                        message.reply,
-                        content=self._as_quote_block(self._truncate_for_discord(translated_text, 1500)),
-                        guild_id=message.guild.id if message.guild else None,
-                        voice_text=translated_text,
-                        language_hint=source_language,
-                        filename_stem="translation",
-                    )
 
-                # Track in database
-                try:
-                    db = get_db()
-                    async with db.session() as session:
-                        await DatabaseService.get_or_create_user(
-                            session,
-                            message.author.id,
-                            message.author.name,
-                            message.author.discriminator,
-                            message.author.display_name,
-                        )
-                        await DatabaseService.log_translation(
-                            session,
-                            user_id=message.author.id,
-                            original_text=message.content,
-                            translated_text=translated_text,
-                            target_language="en",
-                            source_language=source_language,
-                            translation_type="auto",
-                            guild_id=message.guild.id if message.guild else None,
-                            channel_id=message.channel.id,
-                        )
-                except Exception as db_error:
-                    logger.error(f"Database tracking error: {db_error}", exc_info=True)
+            if translated_text:
+                await self._reply_with_optional_voice(
+                    message.reply,
+                    content=self._as_quote_block(self._truncate_for_discord(translated_text, 1500)),
+                    guild_id=message.guild.id if message.guild else None,
+                    voice_text=translated_text,
+                    language_hint=source_language,
+                    filename_stem="translation",
+                )
+
+            # Track in database
+            try:
+                await self._interaction_tracking_service.track_translation(
+                    user_id=message.author.id,
+                    original_text=message.content,
+                    translated_text=translated_text or "",
+                    target_language="en",
+                    source_language=source_language or "en",
+                    translation_type="auto",
+                    guild_id=message.guild.id if message.guild else None,
+                    channel_id=message.channel.id,
+                    username=message.author.name,
+                    discriminator=message.author.discriminator,
+                    display_name=message.author.display_name,
+                )
+            except Exception as db_error:
+                logger.error(f"Database tracking error: {db_error}", exc_info=True)
         except Exception as e:
             logger.error(f"Auto-translation error: {e}", exc_info=True)
             # Don't send error messages for auto-translation to avoid spam
@@ -505,18 +490,21 @@ class TranslationHandler:
         if guild_id is None:
             return default_enabled
 
-        try:
-            db = get_db()
-            async with db.session() as session:
-                guild_config = await DatabaseService.get_guild_configuration(session, guild_id)
-        except Exception as exc:
-            logger.error("Guild configuration lookup failed for guild %s: %s", guild_id, exc, exc_info=True)
-            return default_enabled
+        if self._guild_configuration_service is not None:
+            try:
+                guild_config = await self._guild_configuration_service.get_or_create_for_guild(guild_id)
+                if guild_config is not None:
+                    return bool(guild_config.use_voice_replies)
+            except Exception as exc:
+                logger.error(
+                    "Guild configuration lookup failed for guild %s: %s",
+                    guild_id,
+                    exc,
+                    exc_info=True,
+                )
+                return default_enabled
 
-        if guild_config is None:
-            return default_enabled
-
-        return guild_config.use_voice_replies
+        return default_enabled
 
     def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
         """Return True if the bot should try generating a chat reply."""

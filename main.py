@@ -29,11 +29,14 @@ from services import (
     EventSchedulerService,
     GiftCodeService,
     GuildConfigurationService,
+    InteractionTrackingService,
     ChatbotService,
     KingshotRAGService,
     KVKService,
     PlayerInfoService,
+    PlayerRegistryService,
     TranslationService,
+    DatabaseHealthService,
     VoiceMessageService,
 )
 
@@ -83,9 +86,13 @@ class TranslatorBot:
         )
         self.event_scheduler_service = EventSchedulerService(self.db_manager)
         self.player_info_service = PlayerInfoService()
-        self.gift_code_service = GiftCodeService()
+        self.gift_code_service = GiftCodeService(self.db_manager)
+        self.interaction_tracking_service = InteractionTrackingService(self.db_manager)
+        self.player_registry_service = PlayerRegistryService(self.db_manager)
+        self.database_health_service = DatabaseHealthService(self.db_manager)
         self.guild_configuration_service = GuildConfigurationService(
             default_use_voice_replies=config.enable_voice_replies,
+            db_manager=self.db_manager,
         )
         self.kvk_service = KVKService()
         self.kingshot_rag_service = KingshotRAGService(
@@ -119,10 +126,23 @@ class TranslatorBot:
             self.bot,
             config,
             voice_message_service=self.voice_message_service,
+            interaction_tracking_service=self.interaction_tracking_service,
+            guild_configuration_service=self.guild_configuration_service,
         )
         self.event_handler = EventHandler(self.event_scheduler_service, self.bot)
-        self.player_info_handler = PlayerInfoHandler(self.player_info_service, self.bot)
-        self.gift_code_handler = GiftCodeHandler(self.gift_code_service, self.player_info_service, self.bot, config)
+        self.player_info_handler = PlayerInfoHandler(
+            self.player_info_service,
+            self.bot,
+            interaction_tracking_service=self.interaction_tracking_service,
+        )
+        self.gift_code_handler = GiftCodeHandler(
+            self.gift_code_service,
+            self.player_info_service,
+            self.bot,
+            config,
+            interaction_tracking_service=self.interaction_tracking_service,
+            player_registry_service=self.player_registry_service,
+        )
         self.guild_config_handler = GuildConfigHandler(self.bot, self.guild_configuration_service)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
         self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
@@ -132,6 +152,7 @@ class TranslatorBot:
             config,
             event_handler=self.event_handler,
             gift_code_handler=self.gift_code_handler,
+            database_health_service=self.database_health_service,
             started_at=self.started_at,
         )
         logger.info("All handlers initialized")

@@ -4,9 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from db import get_db
-from services.database_service import DatabaseService
 from services.player_info_service import IPlayerInfoService
+from services.interaction_tracking_service import InteractionTrackingService
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +13,12 @@ logger = logging.getLogger(__name__)
 class PlayerInfoHandler:
     """Handles player info Discord commands."""
 
-    def __init__(self, player_info_service: IPlayerInfoService, bot: commands.Bot):
+    def __init__(
+        self,
+        player_info_service: IPlayerInfoService,
+        bot: commands.Bot,
+        interaction_tracking_service: InteractionTrackingService | None = None,
+    ):
         """
         Initialize player info handler.
 
@@ -24,6 +28,7 @@ class PlayerInfoHandler:
         """
         self._player_info_service = player_info_service
         self._bot = bot
+        self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
         logger.info("PlayerInfoHandler initialized")
 
     def register_commands(self):
@@ -69,23 +74,14 @@ class PlayerInfoHandler:
 
                 # Track failed lookup in database
                 try:
-                    db = get_db()
-                    async with db.session() as session:
-                        await DatabaseService.get_or_create_user(
-                            session,
-                            interaction.user.id,
-                            interaction.user.name,
-                            interaction.user.discriminator,
-                            interaction.user.display_name,
-                        )
-                        await DatabaseService.log_player_lookup(
-                            session,
-                            user_id=interaction.user.id,
-                            player_id=player_id,
-                            success=False,
-                            guild_id=interaction.guild_id,
-                            channel_id=interaction.channel_id,
-                        )
+                    await self._interaction_tracking_service.track_player_lookup(
+                        user_id=interaction.user.id,
+                        player_id=player_id,
+                        success=False,
+                        username=interaction.user.name,
+                        discriminator=interaction.user.discriminator,
+                        display_name=interaction.user.display_name,
+                    )
                 except Exception as db_error:
                     logger.error(f"Database tracking error: {db_error}", exc_info=True)
 
@@ -125,52 +121,37 @@ class PlayerInfoHandler:
             await interaction.followup.send(embed=embed)
             logger.info(f"Successfully displayed stats for {player_name} (ID: {player_id}) to {user_info}")
 
-            # Sync player profile in the unified player table
             try:
-                db = get_db()
-                async with db.session() as session:
-                    # Get or create user
-                    await DatabaseService.get_or_create_user(
-                        session,
-                        interaction.user.id,
-                        interaction.user.name,
-                        interaction.user.discriminator,
-                        interaction.user.display_name,
-                    )
-                    resolved_player_id = str(player_data.get("playerId") or player_id)
-                    resolved_kingdom = (
-                        str(player_data.get("kingdom")) if player_data.get("kingdom") is not None else None
-                    )
-                    resolved_castle_level = (
-                        str(player_data.get("levelRenderedDetailed") or player_data.get("level"))
-                        if (player_data.get("levelRenderedDetailed") or player_data.get("level") is not None)
-                        else None
-                    )
+                resolved_player_id = str(player_data.get("playerId") or player_id)
+                resolved_kingdom = str(player_data.get("kingdom")) if player_data.get("kingdom") is not None else None
+                resolved_castle_level = (
+                    str(player_data.get("levelRenderedDetailed") or player_data.get("level"))
+                    if (player_data.get("levelRenderedDetailed") or player_data.get("level") is not None)
+                    else None
+                )
 
-                    # Upsert canonical player ID from API response.
-                    await DatabaseService.log_player_lookup(
-                        session,
-                        user_id=interaction.user.id,
-                        player_id=resolved_player_id,
+                await self._interaction_tracking_service.track_player_lookup(
+                    user_id=interaction.user.id,
+                    player_id=resolved_player_id,
+                    player_name=player_name,
+                    kingdom=resolved_kingdom,
+                    castle_level=resolved_castle_level,
+                    success=True,
+                    username=interaction.user.name,
+                    discriminator=interaction.user.discriminator,
+                    display_name=interaction.user.display_name,
+                )
+
+                # Update legacy non-canonical records only if they already exist.
+                if resolved_player_id != str(player_id):
+                    await self._interaction_tracking_service.sync_player_metadata(
+                        player_id=str(player_id),
                         player_name=player_name,
                         kingdom=resolved_kingdom,
                         castle_level=resolved_castle_level,
-                        success=True,
-                        guild_id=interaction.guild_id,
-                        channel_id=interaction.channel_id,
                     )
 
-                    # Update legacy non-canonical records only if they already exist.
-                    if resolved_player_id != str(player_id):
-                        await DatabaseService.update_registered_player_metadata(
-                            session,
-                            player_id=str(player_id),
-                            player_name=player_name,
-                            kingdom=resolved_kingdom,
-                            castle_level=resolved_castle_level,
-                        )
-
-                    logger.debug(f"Tracked player stats request by user {interaction.user.id}")
+                logger.debug(f"Tracked player stats request by user {interaction.user.id}")
             except Exception as db_error:
                 logger.error(f"Database tracking error: {db_error}", exc_info=True)
 

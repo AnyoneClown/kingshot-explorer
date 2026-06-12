@@ -3,10 +3,9 @@ from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
-from sqlalchemy import text
 
 from config.bot_config import BotConfig
-from db import get_db
+from services.database_health_service import DatabaseHealthService
 from handlers.ui import EmbedColors, build_status_embed, status_value
 
 logger = logging.getLogger(__name__)
@@ -19,6 +18,7 @@ class StatusHandler:
         self,
         bot: commands.Bot,
         config: BotConfig,
+        database_health_service: DatabaseHealthService | None = None,
         *,
         event_handler,
         gift_code_handler,
@@ -29,6 +29,7 @@ class StatusHandler:
         self._event_handler = event_handler
         self._gift_code_handler = gift_code_handler
         self._started_at = started_at
+        self._database_health_service = database_health_service or DatabaseHealthService()
         logger.info("StatusHandler initialized")
 
     def register_commands(self):
@@ -70,14 +71,7 @@ class StatusHandler:
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _check_database(self) -> tuple[bool, str]:
-        try:
-            db = get_db()
-            async with db.session() as session:
-                await session.execute(text("SELECT 1"))
-            return True, "Reachable"
-        except Exception as exc:
-            logger.warning("Database health check failed: %s", exc, exc_info=True)
-            return False, "Health check failed"
+        return await self._database_health_service.check_database()
 
     @staticmethod
     def _format_duration(total_seconds: int) -> str:

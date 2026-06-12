@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 """Database service for managing users and statistics."""
 
 import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import GiftCode, GiftCodeRedemption, GuildConfiguration, RegisteredPlayer, TranslationLog, User
+from repositories.discord_repositories import (
+    GiftCodeRedemptionRepository,
+    GiftCodeRepository,
+    GuildConfigurationRepository,
+    RegisteredPlayerRepository,
+    TranslationLogRepository,
+    UserRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,31 +44,12 @@ class DatabaseService:
         Returns:
             User object
         """
-        # Try to get existing user
-        result = await session.execute(select(User).where(User.id == user_id))
-        user = result.scalar_one_or_none()
-
-        if user:
-            # Update last seen and other info if changed
-            user.last_seen = datetime.utcnow()
-            user.username = username
-            user.discriminator = discriminator
-            if display_name:
-                user.display_name = display_name
-            logger.debug(f"Updated existing user: {user_id}")
-        else:
-            # Create new user
-            user = User(
-                id=user_id,
-                username=username,
-                discriminator=discriminator,
-                display_name=display_name,
-            )
-            session.add(user)
-            logger.info(f"Created new user: {user_id} ({username})")
-
-        await session.flush()
-        return user
+        return await UserRepository(session).upsert(
+            user_id=user_id,
+            username=username,
+            discriminator=discriminator,
+            display_name=display_name,
+        )
 
     @staticmethod
     async def log_translation(
@@ -91,7 +80,7 @@ class DatabaseService:
         Returns:
             TranslationLog object
         """
-        log = TranslationLog(
+        return await TranslationLogRepository(session).create(
             user_id=user_id,
             original_text=original_text,
             translated_text=translated_text,
@@ -101,10 +90,6 @@ class DatabaseService:
             guild_id=guild_id,
             channel_id=channel_id,
         )
-        session.add(log)
-        await session.flush()
-        logger.info(f"Logged translation for user {user_id}: {target_language} ({translation_type})")
-        return log
 
     @staticmethod
     async def get_user(session: AsyncSession, user_id: int) -> Optional[User]:
@@ -118,14 +103,12 @@ class DatabaseService:
         Returns:
             User object or None if not found
         """
-        result = await session.execute(select(User).where(User.id == user_id))
-        return result.scalar_one_or_none()
+        return await UserRepository(session).get_by_id(user_id)
 
     @staticmethod
     async def get_guild_configuration(session: AsyncSession, guild_id: int) -> Optional[GuildConfiguration]:
         """Get persisted bot configuration for a guild."""
-        result = await session.execute(select(GuildConfiguration).where(GuildConfiguration.guild_id == guild_id))
-        return result.scalar_one_or_none()
+        return await GuildConfigurationRepository(session).get(guild_id)
 
     @staticmethod
     async def _upsert_player_profile(
@@ -139,38 +122,15 @@ class DatabaseService:
         overwrite_owner: bool = False,
     ) -> Optional[RegisteredPlayer]:
         """Create or update a player profile in the unified player table."""
-        result = await session.execute(select(RegisteredPlayer).where(RegisteredPlayer.player_id == player_id))
-        player = result.scalar_one_or_none()
-
-        if player:
-            if player_name:
-                player.player_name = player_name
-            if kingdom is not None:
-                player.kingdom = kingdom
-            if castle_level is not None:
-                player.castle_level = castle_level
-            if enabled is not None:
-                player.enabled = enabled
-            if overwrite_owner and added_by_user_id is not None:
-                player.added_by_user_id = added_by_user_id
-
-            await session.flush()
-            return player
-
-        if added_by_user_id is None:
-            return None
-
-        player = RegisteredPlayer(
+        return await RegisteredPlayerRepository(session).upsert_profile(
             player_id=player_id,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
-            enabled=(enabled if enabled is not None else False),
+            enabled=enabled,
             added_by_user_id=added_by_user_id,
+            overwrite_owner=overwrite_owner,
         )
-        session.add(player)
-        await session.flush()
-        return player
 
     @staticmethod
     async def log_player_lookup(
@@ -209,16 +169,17 @@ class DatabaseService:
             logger.info(f"Player lookup failed for {player_id}; no player profile upsert performed")
             return None
 
-        player = await DatabaseService._upsert_player_profile(
-            session=session,
+        player = await RegisteredPlayerRepository(session).upsert_profile(
             player_id=player_id,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
             added_by_user_id=user_id,
         )
-        if player:
-            logger.info(f"Synced player lookup by user {user_id}: player {player_id}")
+        if not player:
+            return None
+
+        logger.info("Synced player lookup by user %s: player %s", user_id, player_id)
         return player
 
     @staticmethod
@@ -250,7 +211,7 @@ class DatabaseService:
         Returns:
             GiftCodeRedemption object
         """
-        log = GiftCodeRedemption(
+        return await GiftCodeRedemptionRepository(session).create(
             user_id=user_id,
             player_id=player_id,
             gift_code=gift_code,
@@ -260,13 +221,6 @@ class DatabaseService:
             guild_id=guild_id,
             channel_id=channel_id,
         )
-        session.add(log)
-        await session.flush()
-        logger.info(
-            f"Logged gift code redemption by user {user_id}: "
-            f"player {player_id}, code '{gift_code}' (success={success})"
-        )
-        return log
 
     @staticmethod
     async def add_registered_player(
@@ -293,20 +247,16 @@ class DatabaseService:
         Returns:
             RegisteredPlayer object
         """
-        player = await DatabaseService._upsert_player_profile(
-            session=session,
+        player = await RegisteredPlayerRepository(session).add_or_update(
             player_id=player_id,
+            added_by_user_id=added_by_user_id,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
             enabled=enabled,
-            added_by_user_id=added_by_user_id,
-            overwrite_owner=True,
         )
-        if player is None:
-            raise ValueError("Unable to upsert registered player")
 
-        logger.info(f"Upserted registered player {player_id} (enabled={enabled})")
+        logger.info("Upserted registered player %s (enabled=%s)", player_id, enabled)
         return player
 
     @staticmethod
@@ -324,15 +274,7 @@ class DatabaseService:
         Returns:
             List of RegisteredPlayer objects
         """
-        query = select(RegisteredPlayer)
-        if enabled_only:
-            query = query.where(RegisteredPlayer.enabled.is_(True))
-        query = query.order_by(RegisteredPlayer.player_id)
-
-        result = await session.execute(query)
-        players = result.scalars().all()
-        logger.info(f"Retrieved {len(players)} registered players (enabled_only={enabled_only})")
-        return list(players)
+        return await RegisteredPlayerRepository(session).list(enabled_only=enabled_only)
 
     @staticmethod
     async def get_registered_player(
@@ -349,8 +291,7 @@ class DatabaseService:
         Returns:
             RegisteredPlayer or None
         """
-        result = await session.execute(select(RegisteredPlayer).where(RegisteredPlayer.player_id == player_id))
-        return result.scalar_one_or_none()
+        return await RegisteredPlayerRepository(session).get(player_id)
 
     @staticmethod
     async def remove_registered_player(
@@ -367,17 +308,7 @@ class DatabaseService:
         Returns:
             True if player was removed, False if not found
         """
-        result = await session.execute(select(RegisteredPlayer).where(RegisteredPlayer.player_id == player_id))
-        player = result.scalar_one_or_none()
-
-        if player:
-            await session.delete(player)
-            await session.flush()
-            logger.info(f"Removed registered player {player_id}")
-            return True
-        else:
-            logger.warning(f"Attempted to remove non-existent player {player_id}")
-            return False
+        return await RegisteredPlayerRepository(session).remove(player_id)
 
     @staticmethod
     async def toggle_registered_player(
@@ -394,17 +325,7 @@ class DatabaseService:
         Returns:
             New enabled status, or None if player not found
         """
-        result = await session.execute(select(RegisteredPlayer).where(RegisteredPlayer.player_id == player_id))
-        player = result.scalar_one_or_none()
-
-        if player:
-            player.enabled = not player.enabled
-            await session.flush()
-            logger.info(f"Toggled registered player {player_id} to enabled={player.enabled}")
-            return player.enabled
-        else:
-            logger.warning(f"Attempted to toggle non-existent player {player_id}")
-            return None
+        return await RegisteredPlayerRepository(session).toggle(player_id)
 
     @staticmethod
     async def update_registered_player_metadata(
@@ -416,19 +337,13 @@ class DatabaseService:
         added_by_user_id: Optional[int] = None,
     ) -> bool:
         """Update metadata for a player, creating a disabled profile if user context is provided."""
-        player = await DatabaseService._upsert_player_profile(
-            session=session,
+        return await RegisteredPlayerRepository(session).sync_metadata(
             player_id=player_id,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
             added_by_user_id=added_by_user_id,
         )
-        if not player:
-            return False
-
-        logger.debug("Refreshed metadata for player %s", player_id)
-        return True
 
     @staticmethod
     async def add_or_update_gift_code(
@@ -451,23 +366,12 @@ class DatabaseService:
         Returns:
             Tuple of (is_new, GiftCode)
         """
-        result = await session.execute(select(GiftCode).where(GiftCode.id == code_id))
-        existing_code = result.scalar_one_or_none()
-
-        if existing_code:
-            existing_code.expires_at = expires_at
-            logger.debug(f"Updated existing gift code {code} (ID: {code_id})")
-            return False, existing_code
-        else:
-            new_code = GiftCode(
-                id=code_id,
-                code=code,
-                expires_at=expires_at,
-                created_at_api=created_at_api,
-            )
-            session.add(new_code)
-            logger.info(f"Added new tracked gift code: {code} (ID: {code_id})")
-            return True, new_code
+        return await GiftCodeRepository(session).add_or_update(
+            code_id=code_id,
+            code=code,
+            created_at_api=created_at_api,
+            expires_at=expires_at,
+        )
 
     @staticmethod
     async def get_all_gift_codes(session: AsyncSession) -> list[GiftCode]:
@@ -480,5 +384,4 @@ class DatabaseService:
         Returns:
             List of GiftCode objects
         """
-        result = await session.execute(select(GiftCode).order_by(GiftCode.created_at_api.desc()))
-        return list(result.scalars().all())
+        return await GiftCodeRepository(session).list_all()
