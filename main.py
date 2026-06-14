@@ -19,7 +19,6 @@ from handlers import (
     EventHandler,
     GiftCodeHandler,
     GuildConfigHandler,
-    KingshotDataHandler,
     KingshotRAGHandler,
     KVKHandler,
     PlayerInfoHandler,
@@ -158,7 +157,6 @@ class TranslatorBot:
         )
         self.guild_config_handler = GuildConfigHandler(self.bot, self.guild_configuration_service)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
-        self.kingshot_data_handler = KingshotDataHandler(self.kingshot_data_service, self.bot)
         self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)
         self.status_handler = StatusHandler(
@@ -247,7 +245,6 @@ class TranslatorBot:
         self.gift_code_handler.register_commands()
         self.guild_config_handler.register_commands()
         self.kvk_handler.register_commands()
-        self.kingshot_data_handler.register_commands()
         self.kingshot_rag_handler.register_commands()
         self.database_handler.register_commands()
         self.database_handler.register_events()

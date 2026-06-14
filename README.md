@@ -102,15 +102,6 @@ Gift code related commands include:
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
-KingShot Data commands include:
-
-- /ks_arena
-- /ks_alliance
-- /ks_alliance_full
-- /ks_kingdom_board
-- /ks_global_board
-- /ks_board_search
-
 - `/configure` is an admin-only ephemeral guild configuration panel.
 
 ## Project Layout

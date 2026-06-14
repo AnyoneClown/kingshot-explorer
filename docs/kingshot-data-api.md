@@ -166,9 +166,6 @@ curl -H "X-API-Key: $KS_DATA_API_KEY" \
 Current project usage:
 
 - `/stats` uses the default KingShot API for the profile image, then enriches fields from `GET /v1/players/by-fid/{fid}`.
-- `/ks_arena` accepts `fid`, resolves `uid`, then calls `/v1/arena/{uid}`.
-- `/ks_board_search` accepts `fid`, resolves `uid`, then calls `/v1/leaderboards/search`.
-- `/ks_kingdom_board` and `/ks_global_board` use `resolve=true`.
 - `/addalliance` uses `/v1/alliances/{aid}?kid={kid}` and only imports members that include `fid`.
 
 ## Client Etiquette
