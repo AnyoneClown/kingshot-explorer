@@ -2,7 +2,7 @@ import asyncio
 import socket
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -13,6 +13,7 @@ from services.gift_code_service import IGiftCodeService
 from services.player_info_service import IPlayerInfoService
 from services.interaction_tracking_service import InteractionTrackingService
 from services.player_registry_service import PlayerRegistryService
+from services.kingshot_data_service import KingshotDataService
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ class GiftCodeHandler:
         config: BotConfig,
         interaction_tracking_service: InteractionTrackingService | None = None,
         player_registry_service: PlayerRegistryService | None = None,
+        kingshot_data_service: KingshotDataService | None = None,
     ):
         """
         Initialize gift code handler.
@@ -122,6 +124,7 @@ class GiftCodeHandler:
         self._config = config
         self._tracking_service = interaction_tracking_service or InteractionTrackingService()
         self._player_registry_service = player_registry_service or PlayerRegistryService()
+        self._kingshot_data_service = kingshot_data_service
         self._polling_loop = None
         self._poll_backoff_until: datetime | None = None
         self._poll_backoff_delta = timedelta(minutes=2)
@@ -148,6 +151,15 @@ class GiftCodeHandler:
         async def add_player(interaction: discord.Interaction, player_ids: str):
             """Add a player to gift code list using API name."""
             await self._handle_add_player_slash(interaction, player_ids)
+
+        @self._bot.tree.command(name="addalliance", description="Add all alliance members to gift code redemption list")
+        @app_commands.describe(
+            aid="Alliance ID",
+            kid="Kingdom ID",
+        )
+        async def add_alliance(interaction: discord.Interaction, aid: str, kid: int):
+            """Add alliance roster members to the gift code list."""
+            await self._handle_add_alliance_slash(interaction, aid.strip(), kid)
 
         @self._bot.tree.command(name="removeplayer", description="Remove a player from gift code redemption list")
         @app_commands.describe(player_id="The player ID to remove")
@@ -763,6 +775,68 @@ class GiftCodeHandler:
         """Split lines into fixed-size pages."""
         return [lines[idx : idx + page_size] for idx in range(0, len(lines), page_size)]
 
+    @classmethod
+    def _extract_alliance_members(cls, payload: Any) -> List[Dict[str, Any]]:
+        """Extract alliance member dictionaries from known API response shapes."""
+        if isinstance(payload, list):
+            return [member for member in payload if isinstance(member, dict)]
+        if not isinstance(payload, dict):
+            return []
+
+        for key in ("members", "roster", "memberList", "players"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [member for member in value if isinstance(member, dict)]
+            if isinstance(value, dict):
+                nested = cls._extract_alliance_members(value)
+                if nested:
+                    return nested
+
+        for key in ("alliance", "data", "result", "payload"):
+            nested = cls._extract_alliance_members(payload.get(key))
+            if nested:
+                return nested
+
+        return []
+
+    @staticmethod
+    def _extract_member_fid(member: Dict[str, Any]) -> Optional[str]:
+        for key in ("fid", "player_fid", "playerFid", "governorId", "governor_id", "playerId"):
+            value = member.get(key)
+            if value not in (None, "", 0, "0"):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_member_name(member: Dict[str, Any]) -> Optional[str]:
+        for key in ("name", "nickname", "playerName", "player_name"):
+            value = member.get(key)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_member_castle_level(member: Dict[str, Any]) -> Optional[str]:
+        for key in ("castleLevel", "castle", "stove_lv", "level", "lv"):
+            value = member.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
+    @classmethod
+    def _extract_alliance_name(cls, payload: Any) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("name", "allianceName", "alliance_name", "tag", "abbr"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        for key in ("alliance", "data", "result", "payload"):
+            value = cls._extract_alliance_name(payload.get(key))
+            if value:
+                return value
+        return None
+
     async def _sync_player_metadata_from_lookup(self, player_id: str, player_info: Optional[Dict]) -> None:
         """Refresh registered player metadata when a player lookup succeeds."""
         if not player_info:
@@ -913,6 +987,124 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Could Not Add Players",
                     description="An error occurred while adding the players. Please check logs.",
+                    color=discord.Color.red(),
+                )
+            )
+
+    async def _handle_add_alliance_slash(self, interaction: discord.Interaction, aid: str, kid: int):
+        """Handle adding all fid-bearing alliance roster members to the redemption list."""
+        await interaction.response.defer(thinking=True)
+
+        if not aid or kid <= 0:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Invalid Input",
+                    description="`aid` and positive `kid` are required.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        if self._kingshot_data_service is None:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ KingShot Data API Not Configured",
+                    description="Alliance import requires the KingShot Data API service.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        try:
+            await self._tracking_service.track_user(
+                session=None,
+                user_id=interaction.user.id,
+                username=interaction.user.name,
+                discriminator=interaction.user.discriminator,
+                display_name=interaction.user.display_name,
+            )
+
+            result = await self._kingshot_data_service.get_alliance(aid=aid, kid=kid)
+            if not result.get("success"):
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="❌ Could Not Fetch Alliance",
+                        description=result.get("error_message", "KingShot Data API request failed."),
+                        color=discord.Color.red(),
+                    )
+                )
+                return
+
+            payload = result.get("data")
+            members = self._extract_alliance_members(payload)
+            if not members:
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="No Alliance Members Found",
+                        description="The alliance response did not include a readable member roster.",
+                        color=discord.Color.orange(),
+                    )
+                )
+                return
+
+            added_players: List[str] = []
+            skipped_members: List[str] = []
+            seen_fids: set[str] = set()
+
+            for member in members:
+                fid = self._extract_member_fid(member)
+                member_name = self._extract_member_name(member)
+                castle_level = self._extract_member_castle_level(member)
+
+                if not fid:
+                    skipped_members.append(member_name or str(member.get("uid") or member.get("id") or "unknown"))
+                    continue
+                if fid in seen_fids:
+                    continue
+                seen_fids.add(fid)
+
+                await self._player_registry_service.add_registered_player(
+                    player_id=fid,
+                    added_by_user_id=interaction.user.id,
+                    player_name=member_name,
+                    kingdom=str(kid),
+                    castle_level=castle_level,
+                    enabled=True,
+                )
+                added_players.append(f"`{fid}`" + (f" ({member_name})" if member_name else ""))
+
+            alliance_name = self._extract_alliance_name(payload) or f"Alliance {aid}"
+            embed = discord.Embed(
+                title=f"✅ Added {len(added_players)} Alliance Member(s)",
+                description=f"Roster imported from **{alliance_name}** in kingdom `{kid}`.",
+                color=discord.Color.green() if added_players else discord.Color.orange(),
+            )
+
+            for idx, chunk in enumerate(self._chunk_lines(added_players, 10), start=1):
+                embed.add_field(name=f"Added Players ({idx})", value="\n".join(chunk), inline=False)
+
+            if skipped_members:
+                skipped_preview = ", ".join(f"`{value}`" for value in skipped_members[:20])
+                if len(skipped_members) > 20:
+                    skipped_preview += f", ...and {len(skipped_members) - 20} more"
+                embed.add_field(
+                    name="Skipped",
+                    value=(
+                        f"{len(skipped_members)} member(s) did not include `fid` yet, "
+                        f"so they cannot be added for gift redemption.\n{skipped_preview}"
+                    ),
+                    inline=False,
+                )
+
+            embed.set_footer(text="Requires alliance roster members to include Governor ID (fid)")
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error("Error adding alliance %s in kingdom %s: %s", aid, kid, e, exc_info=True)
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Could Not Add Alliance",
+                    description="An error occurred while importing the alliance roster. Please check logs.",
                     color=discord.Color.red(),
                 )
             )

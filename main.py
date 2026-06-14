@@ -150,6 +150,7 @@ class TranslatorBot:
             config,
             interaction_tracking_service=self.interaction_tracking_service,
             player_registry_service=self.player_registry_service,
+            kingshot_data_service=self.kingshot_data_service,
         )
         self.guild_config_handler = GuildConfigHandler(self.bot, self.guild_configuration_service)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)

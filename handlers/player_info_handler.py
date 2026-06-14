@@ -213,21 +213,27 @@ class PlayerInfoHandler:
         if not ks_data:
             return "N/A"
         vip = ks_data.get("vip")
-        return str(vip) if vip is not None else "Hidden"
+        if vip in (None, 0, "0"):
+            return "Hidden"
+        return str(vip)
 
     @staticmethod
     def _format_alliance(ks_data: dict[str, Any] | None) -> str:
         if not ks_data or not isinstance(ks_data.get("alliance"), dict):
             return "N/A"
         alliance = ks_data["alliance"]
+        aid = alliance.get("aid")
         abbr = alliance.get("abbr")
         name = alliance.get("name")
+        aid_text = f" (`{aid}`)" if aid is not None else ""
         if abbr and name:
-            return f"`[{abbr}]` {name}"
+            return f"`[{abbr}]` {name}{aid_text}"
         if abbr:
-            return f"`[{abbr}]`"
+            return f"`[{abbr}]`{aid_text}"
         if name:
-            return str(name)
+            return f"{name}{aid_text}"
+        if aid is not None:
+            return f"ID `{aid}`"
         return "N/A"
 
     @classmethod
