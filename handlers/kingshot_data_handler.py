@@ -164,14 +164,15 @@ class KingshotDataHandler:
             board_type=board_type,
             kid=kid,
             limit=normalized_limit,
+            resolve=True,
         )
         await self._send_result(
             interaction=interaction,
             endpoint_name="Kingdom Board",
             display_name=f"Kingdom Board {self._board_label(board_type)}",
-            endpoint=f"/v1/leaderboards/kingdom/{board_type}?kid={kid}&limit={normalized_limit}",
+            endpoint=f"/v1/leaderboards/kingdom/{board_type}?kid={kid}&limit={normalized_limit}&resolve=true",
             result=result,
-            request_params={"type": str(board_type), "kid": str(kid), "limit": str(normalized_limit)},
+            request_params={"type": str(board_type), "kid": str(kid), "limit": str(normalized_limit), "resolve": "true"},
             formatter=self._format_kingdom_board,
         )
 
@@ -188,14 +189,14 @@ class KingshotDataHandler:
             return
         normalized_limit = self._normalize_limit(limit)
         await interaction.response.defer(thinking=True)
-        result = await self._service.get_global_board(board_type=board_type, limit=normalized_limit)
+        result = await self._service.get_global_board(board_type=board_type, limit=normalized_limit, resolve=True)
         await self._send_result(
             interaction=interaction,
             endpoint_name="Global Board",
             display_name=f"Global Board {self._board_label(board_type)}",
-            endpoint=f"/v1/leaderboards/global/{board_type}?limit={normalized_limit}",
+            endpoint=f"/v1/leaderboards/global/{board_type}?limit={normalized_limit}&resolve=true",
             result=result,
-            request_params={"type": str(board_type), "limit": str(normalized_limit)},
+            request_params={"type": str(board_type), "limit": str(normalized_limit), "resolve": "true"},
             formatter=self._format_global_board,
         )
 
@@ -384,7 +385,7 @@ class KingshotDataHandler:
         self._format_board_payload(embed, data, scope="Global")
 
     def _format_board_payload(self, embed: discord.Embed, data: Any, scope: str) -> None:
-        entries = self._extract_entry_list(data)
+        entries = self._sort_board_entries(self._extract_entry_list(data))
         meta = self._ensure_dict(data)
         board_type = self._first(meta, ["type", "boardType", "board"])
         kid = self._first(meta, ["kid", "kingdom", "kingdomId"])
@@ -640,6 +641,23 @@ class KingshotDataHandler:
         if len(entries) > 15:
             lines.append(f"`...` {len(entries) - 15} more entries")
         return cls._truncate("\n".join(lines), 1000) if lines else "No readable leaderboard rows."
+
+    @classmethod
+    def _sort_board_entries(cls, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            entries,
+            key=lambda entry: (
+                cls._sort_number(cls._first(entry, ["rank", "position", "place", "idx"]), default=10**12),
+                -cls._sort_number(cls._first(entry, ["score", "value", "power", "points", "rankValue"]), default=0),
+            ),
+        )
+
+    @staticmethod
+    def _sort_number(value: Any, *, default: int) -> int:
+        try:
+            return int(float(str(value).replace(",", "")))
+        except (TypeError, ValueError):
+            return default
 
     @staticmethod
     def _board_label(board_type: int) -> str:

@@ -76,20 +76,31 @@ class KingshotDataService:
         """Fetch player profile by Governor ID (fid)."""
         return await self._request("GET", f"/v1/players/by-fid/{fid}")
 
-    async def get_kingdom_board(self, board_type: int | str, kid: int | str, limit: int = 100) -> Dict[str, Any]:
+    async def get_kingdom_board(
+        self,
+        board_type: int | str,
+        kid: int | str,
+        limit: int = 100,
+        resolve: bool = False,
+    ) -> Dict[str, Any]:
         """Fetch kingdom leaderboard for a board type."""
         return await self._request(
             "GET",
             f"/v1/leaderboards/kingdom/{board_type}",
-            params={"kid": str(kid), "limit": str(limit)},
+            params={"kid": str(kid), "limit": str(limit), "resolve": str(resolve).lower()},
         )
 
-    async def get_global_board(self, board_type: int | str, limit: int = 100) -> Dict[str, Any]:
+    async def get_global_board(
+        self,
+        board_type: int | str,
+        limit: int = 100,
+        resolve: bool = False,
+    ) -> Dict[str, Any]:
         """Fetch global leaderboard for a board type."""
         return await self._request(
             "GET",
             f"/v1/leaderboards/global/{board_type}",
-            params={"limit": str(limit)},
+            params={"limit": str(limit), "resolve": str(resolve).lower()},
         )
 
     async def search_leaderboard(self, board_type: int | str, uid: str, kid: int | str) -> Dict[str, Any]:
