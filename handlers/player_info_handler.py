@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 class PlayerInfoHandler:
     """Handles player info Discord commands."""
 
+    SCOUT_BOARD_TYPE_POWER = 8
+    SCOUT_DEFAULT_LIMIT = 5
+    SCOUT_MAX_LIMIT = 15
+
     def __init__(
         self,
         player_info_service: IPlayerInfoService,
@@ -37,12 +41,26 @@ class PlayerInfoHandler:
 
     def register_commands(self):
         """Register all player info commands with the bot."""
+        default_scout_limit = self.SCOUT_DEFAULT_LIMIT
 
         @self._bot.tree.command(name="stats", description="Fetch and display player statistics")
         @app_commands.describe(player_id="Governor ID / player ID to look up")
         async def get_player_stats(interaction: discord.Interaction, player_id: str):
             """Fetch and display player statistics."""
             await self._handle_player_stats_slash(interaction, player_id)
+
+        @self._bot.tree.command(name="scout", description="Scout top power players in a kingdom")
+        @app_commands.describe(
+            kingdom_number="Kingdom number to scout",
+            limit="Number of leaderboard players to scout, default 5, max 15",
+        )
+        async def scout_kingdom(
+            interaction: discord.Interaction,
+            kingdom_number: int,
+            limit: int = default_scout_limit,
+        ):
+            """Scout top power players in a kingdom."""
+            await self._handle_scout_slash(interaction, kingdom_number, limit)
 
     async def _handle_player_stats_slash(self, interaction: discord.Interaction, player_id: str):
         """
@@ -181,6 +199,111 @@ class PlayerInfoHandler:
                 )
             )
 
+    async def _handle_scout_slash(self, interaction: discord.Interaction, kingdom_number: int, limit: int):
+        """Handle the scout command."""
+        await interaction.response.defer(thinking=True)
+
+        user_info = f"{interaction.user.name}#{interaction.user.discriminator} (ID: {interaction.user.id})"
+        guild_info = f"{interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
+
+        if kingdom_number <= 0:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ Invalid Kingdom Number",
+                    description="Kingdom number must be a positive integer.",
+                    color=discord.Color.orange(),
+                )
+            )
+            return
+
+        if limit < 1:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ Invalid Limit",
+                    description="Limit must be at least 1.",
+                    color=discord.Color.orange(),
+                )
+            )
+            return
+
+        limit = min(limit, self.SCOUT_MAX_LIMIT)
+
+        if self._kingshot_data_service is None:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ KingShot Data API Not Configured",
+                    description="Scout requires the KingShot Data API service.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        logger.info(
+            "Scout command for kingdom %s limit %s requested by %s in %s",
+            kingdom_number,
+            limit,
+            user_info,
+            guild_info,
+        )
+
+        try:
+            board_result = await self._kingshot_data_service.get_kingdom_board(
+                self.SCOUT_BOARD_TYPE_POWER,
+                kingdom_number,
+                limit=limit,
+                resolve=True,
+            )
+            if not board_result.get("success"):
+                embed = discord.Embed(
+                    title=f"❌ Could Not Scout Kingdom {kingdom_number}",
+                    description=board_result.get("error_message", "KingShot Data API request failed."),
+                    color=discord.Color.red(),
+                )
+                embed.set_footer(text="Try again in a moment or verify the kingdom number")
+                await interaction.followup.send(embed=embed)
+                return
+
+            board_data = board_result.get("data")
+            entries = self._extract_leaderboard_entries(board_data)
+            if not entries:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title=f"🔎 Scout Report - Kingdom {kingdom_number}",
+                        description="No power leaderboard entries were returned for this kingdom.",
+                        color=discord.Color.orange(),
+                    )
+                )
+                return
+
+            profiles_by_fid: dict[str, dict[str, Any] | None] = {}
+            for entry in entries:
+                fid = self._extract_entry_fid(entry)
+                if fid is None:
+                    continue
+                profiles_by_fid[str(fid)] = await self._get_kingshot_data_player(str(fid))
+
+            embeds = []
+            for entry in entries:
+                fid = self._extract_entry_fid(entry)
+                profile = profiles_by_fid.get(str(fid)) if fid is not None else None
+                embeds.append(self._build_scout_player_embed(entry, profile, kingdom_number))
+
+            await interaction.followup.send(
+                content=f"🔎 Scout report for Kingdom {kingdom_number} • Top {len(embeds)} from leaderboard type 8",
+                embeds=embeds,
+            )
+            logger.info("Successfully sent scout report for kingdom %s", kingdom_number)
+
+        except Exception as e:
+            logger.error("Error handling scout command for kingdom %s: %s", kingdom_number, e, exc_info=True)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Unexpected Error",
+                    description="An error occurred while scouting the kingdom. Please try again later.",
+                    color=discord.Color.red(),
+                )
+            )
+
     async def _get_kingshot_data_player(self, player_id: str) -> dict[str, Any] | None:
         if self._kingshot_data_service is None:
             return None
@@ -198,6 +321,81 @@ class PlayerInfoHandler:
         if isinstance(data, dict) and not data.get("error"):
             return data
         return None
+
+    @staticmethod
+    def _extract_leaderboard_entries(board_data: Any) -> list[dict[str, Any]]:
+        if isinstance(board_data, dict) and isinstance(board_data.get("entries"), list):
+            return [entry for entry in board_data["entries"] if isinstance(entry, dict)]
+        if isinstance(board_data, list):
+            return [entry for entry in board_data if isinstance(entry, dict)]
+        return []
+
+    @staticmethod
+    def _extract_entry_fid(entry: dict[str, Any]) -> Any:
+        for key in ("fid", "player_fid", "playerId", "player_id"):
+            if entry.get(key) not in (None, ""):
+                return entry[key]
+        player = entry.get("player")
+        if isinstance(player, dict):
+            for key in ("fid", "playerId", "player_id"):
+                if player.get(key) not in (None, ""):
+                    return player[key]
+        return None
+
+    @classmethod
+    def _build_scout_player_embed(
+        cls,
+        entry: dict[str, Any],
+        profile: dict[str, Any] | None,
+        kingdom_number: int,
+    ) -> discord.Embed:
+        data = profile or entry
+        fid = cls._extract_entry_fid(entry) or data.get("fid")
+        player_name = data.get("name") or entry.get("name") or f"Player {fid or '?'}"
+        player_data = cls._build_player_data_from_kingshot(data, entry, kingdom_number)
+        rank = entry.get("rank", "?")
+
+        embed = discord.Embed(
+            title=f"📊 #{rank} {player_name}",
+            description=cls._format_kingshot_profile_summary(player_data),
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name="Player ID", value=f"`{player_data.get('playerId', fid or 'N/A')}`", inline=True)
+        embed.add_field(name="Kingdom", value=str(player_data.get("kingdom", "N/A")), inline=True)
+        embed.add_field(name="Castle Level", value=str(player_data.get("level") or "N/A"), inline=True)
+        embed.add_field(name="Power", value=cls._format_power(data), inline=True)
+        embed.add_field(name="VIP Level", value=cls._format_vip(data), inline=True)
+        embed.add_field(name="Alliance", value=cls._format_alliance(data), inline=True)
+        embed.add_field(name="Links", value=cls._format_data_links(str(fid or ""), player_data, data), inline=False)
+        embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
+        return embed
+
+    @staticmethod
+    def _build_player_data_from_kingshot(
+        data: dict[str, Any],
+        entry: dict[str, Any],
+        kingdom_number: int,
+    ) -> dict[str, Any]:
+        fid = data.get("fid") or entry.get("fid") or entry.get("playerId")
+        return {
+            "name": data.get("name") or entry.get("name"),
+            "playerId": str(fid) if fid is not None else "N/A",
+            "level": data.get("stove_lv") or data.get("castle_level") or data.get("lv"),
+            "kingdom": data.get("kid") or entry.get("kid") or kingdom_number,
+        }
+
+    @staticmethod
+    def _format_kingshot_profile_summary(player_data: dict[str, Any]) -> str:
+        lines = []
+        if player_data.get("name"):
+            lines.append(f"👤 **Name:** {player_data['name']}")
+        if player_data.get("playerId"):
+            lines.append(f"🆔 **ID:** {player_data['playerId']}")
+        if player_data.get("level"):
+            lines.append(f"🏰 **Castle Level:** Level {player_data['level']}")
+        if player_data.get("kingdom"):
+            lines.append(f"🌍 **Kingdom:** {player_data['kingdom']}")
+        return "\n".join(lines) or "No data available"
 
     @classmethod
     def _format_power(cls, ks_data: dict[str, Any] | None) -> str:

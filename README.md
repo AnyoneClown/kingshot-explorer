@@ -103,6 +103,7 @@ Gift code related commands include:
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
 - `/configure` is an admin-only ephemeral guild configuration panel.
+- `/scout` fetches players from KingShot leaderboard type 8 for a kingdom and returns stats-style embeds enriched by Governor ID. It defaults to 5 players and caps the limit at 15.
 
 ## Project Layout
 
