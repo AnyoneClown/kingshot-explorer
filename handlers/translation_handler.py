@@ -386,7 +386,7 @@ class TranslationHandler:
         if not message.content.strip() and not direct_trigger:
             return
 
-        if not self._should_attempt_reply(message, direct_trigger=direct_trigger):
+        if not await self._should_attempt_reply(message, direct_trigger=direct_trigger):
             return
 
         try:
@@ -506,7 +506,7 @@ class TranslationHandler:
 
         return default_enabled
 
-    def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
+    async def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
         """Return True if the bot should try generating a chat reply."""
         if direct_trigger is None:
             direct_trigger = self._has_direct_mention_or_resolved_reply(message)
@@ -515,6 +515,9 @@ class TranslationHandler:
             return True
 
         if not self._config:
+            return False
+
+        if not await self._random_replies_enabled_for_guild(message.guild.id if message.guild else None):
             return False
 
         if self._config.random_reply_chance <= 0:
@@ -529,6 +532,27 @@ class TranslationHandler:
                 return False
 
         return random.random() < self._config.random_reply_chance
+
+    async def _random_replies_enabled_for_guild(self, guild_id: int | None) -> bool:
+        default_enabled = bool(getattr(self._config, "random_reply_chance", 0) > 0)
+        if guild_id is None:
+            return default_enabled
+
+        if self._guild_configuration_service is not None:
+            try:
+                guild_config = await self._guild_configuration_service.get_or_create_for_guild(guild_id)
+                if guild_config is not None:
+                    return bool(guild_config.use_random_replies)
+            except Exception as exc:
+                logger.error(
+                    "Guild configuration lookup failed for random replies in guild %s: %s",
+                    guild_id,
+                    exc,
+                    exc_info=True,
+                )
+                return default_enabled
+
+        return default_enabled
 
     def _has_direct_mention_or_resolved_reply(self, message: discord.Message) -> bool:
         """Detect direct triggers that do not require an API fetch."""

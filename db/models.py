@@ -197,7 +197,8 @@ class GuildConfiguration(Base):
     __tablename__ = "guild_configurations"
 
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Discord guild ID
-    use_voice_replies: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    use_voice_replies: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    use_random_replies: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -207,7 +208,11 @@ class GuildConfiguration(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<GuildConfiguration(guild_id={self.guild_id}, use_voice_replies={self.use_voice_replies})>"
+        return (
+            f"<GuildConfiguration(guild_id={self.guild_id}, "
+            f"use_voice_replies={self.use_voice_replies}, "
+            f"use_random_replies={self.use_random_replies})>"
+        )
 
 
 class KingshotEntity(Base):

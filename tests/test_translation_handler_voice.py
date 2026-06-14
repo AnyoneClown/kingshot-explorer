@@ -1,7 +1,6 @@
 import asyncio
 from types import SimpleNamespace
 
-import handlers.translation_handler as translation_handler_module
 from handlers.translation_handler import TranslationHandler
 
 
@@ -72,31 +71,16 @@ class FakeContext:
         self.replies.append({"args": args, "kwargs": kwargs})
 
 
-class FakeSessionContext:
-    def __init__(self, session):
-        self._session = session
+class FakeGuildConfigService:
+    def __init__(self, use_voice_replies=True, use_random_replies=True):
+        self.guild_config = SimpleNamespace(
+            use_voice_replies=use_voice_replies,
+            use_random_replies=use_random_replies,
+        )
 
-    async def __aenter__(self):
-        return self._session
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class FakeDBManager:
-    def __init__(self, session):
-        self._session = session
-
-    def session(self):
-        return FakeSessionContext(self._session)
-
-
-class FakeGuildConfigSession:
-    def __init__(self, guild_config):
-        self.guild_config = guild_config
-
-    async def execute(self, statement):
-        return SimpleNamespace(scalar_one_or_none=lambda: self.guild_config)
+    async def get_or_create_for_guild(self, guild_id):
+        assert guild_id == 456
+        return self.guild_config
 
 
 def test_translate_to_language_attaches_voice_file():
@@ -127,29 +111,23 @@ def test_translate_to_language_attaches_voice_file():
 
 
 def test_translate_to_language_skips_voice_when_guild_config_disables_it():
-    original_get_db = translation_handler_module.get_db
-    translation_handler_module.get_db = lambda: FakeDBManager(
-        FakeGuildConfigSession(SimpleNamespace(use_voice_replies=False))
+    voice_service = FakeVoiceService()
+    handler = TranslationHandler(
+        translation_service=FakeTranslationService(),
+        chatbot_service=FakeChatbotService(),
+        voice_message_service=voice_service,
+        bot=SimpleNamespace(user=None),
+        config=SimpleNamespace(banned_players=set(), enable_voice_replies=True),
+        guild_configuration_service=FakeGuildConfigService(use_voice_replies=False),
     )
-    try:
-        voice_service = FakeVoiceService()
-        handler = TranslationHandler(
-            translation_service=FakeTranslationService(),
-            chatbot_service=FakeChatbotService(),
-            voice_message_service=voice_service,
-            bot=SimpleNamespace(user=None),
-            config=SimpleNamespace(banned_players=set(), enable_voice_replies=True),
-        )
-        ctx = FakeContext(FakeMessage("Hello everyone"))
+    ctx = FakeContext(FakeMessage("Hello everyone"))
 
-        asyncio.run(handler._handle_translate_to_language(ctx, "Spanish"))
+    asyncio.run(handler._handle_translate_to_language(ctx, "Spanish"))
 
-        assert voice_service.calls == []
-        reply_kwargs = ctx.replies[0]["kwargs"]
-        assert reply_kwargs["embed"].title == "Translated to Spanish"
-        assert "file" not in reply_kwargs
-    finally:
-        translation_handler_module.get_db = original_get_db
+    assert voice_service.calls == []
+    reply_kwargs = ctx.replies[0]["kwargs"]
+    assert reply_kwargs["embed"].title == "Translated to Spanish"
+    assert "file" not in reply_kwargs
 
 
 def test_direct_reply_detection_fetches_unresolved_reference():
@@ -173,3 +151,27 @@ def test_direct_reply_detection_fetches_unresolved_reference():
     )
 
     assert asyncio.run(handler._is_direct_mention_or_reply(message)) is True
+
+
+def test_random_replies_can_be_disabled_per_guild_without_blocking_direct_triggers():
+    handler = TranslationHandler(
+        translation_service=FakeTranslationService(),
+        chatbot_service=FakeChatbotService(),
+        bot=SimpleNamespace(user=SimpleNamespace(id=42)),
+        config=SimpleNamespace(
+            banned_players=set(),
+            random_reply_chance=1,
+            random_reply_cooldown_seconds=0,
+        ),
+        guild_configuration_service=FakeGuildConfigService(use_random_replies=False),
+    )
+    message = SimpleNamespace(
+        content="Should the bot randomly answer this?",
+        guild=SimpleNamespace(id=456),
+        channel=SimpleNamespace(id=789),
+        mentions=[],
+        reference=None,
+    )
+
+    assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=False)) is False
+    assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=True)) is True

@@ -102,6 +102,7 @@ class GuildConfigurationRepository:
         self,
         guild_id: int,
         default_use_voice_replies: bool,
+        default_use_random_replies: bool = False,
     ) -> GuildConfiguration:
         guild_config = await self.get(guild_id)
         if guild_config is not None:
@@ -110,14 +111,33 @@ class GuildConfigurationRepository:
         guild_config = GuildConfiguration(
             guild_id=guild_id,
             use_voice_replies=default_use_voice_replies,
+            use_random_replies=default_use_random_replies,
         )
         self._session.add(guild_config)
         await self._session.flush()
         return guild_config
 
-    async def set_voice_replies(self, guild_id: int, use_voice_replies: bool, default_use_voice_replies: bool):
-        guild_config = await self.get_or_create(guild_id, default_use_voice_replies)
+    async def set_voice_replies(
+        self,
+        guild_id: int,
+        use_voice_replies: bool,
+        default_use_voice_replies: bool,
+        default_use_random_replies: bool = False,
+    ):
+        guild_config = await self.get_or_create(guild_id, default_use_voice_replies, default_use_random_replies)
         guild_config.use_voice_replies = use_voice_replies
+        await self._session.flush()
+        return guild_config
+
+    async def set_random_replies(
+        self,
+        guild_id: int,
+        use_random_replies: bool,
+        default_use_voice_replies: bool,
+        default_use_random_replies: bool = False,
+    ):
+        guild_config = await self.get_or_create(guild_id, default_use_voice_replies, default_use_random_replies)
+        guild_config.use_random_replies = use_random_replies
         await self._session.flush()
         return guild_config
 

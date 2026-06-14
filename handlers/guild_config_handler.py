@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import discord
 from discord import app_commands
@@ -36,12 +35,15 @@ class GuildConfigView(discord.ui.View):
     async def build_embed(self) -> discord.Embed:
         guild_config = await self._guild_config_service.get_or_create_for_guild(self._guild_id)
         self._sync_voice_button(guild_config.use_voice_replies)
+        self._sync_random_replies_button(guild_config.use_random_replies)
         voice_status = "Enabled" if guild_config.use_voice_replies else "Disabled"
+        random_replies_status = "Enabled" if guild_config.use_random_replies else "Disabled"
         return build_status_embed(
             title="Bot Configuration",
             description=(
                 f"Server: **{self._guild_name}**\n"
                 f"Voice replies: **{voice_status}**\n"
+                f"AI random replies: **{random_replies_status}**\n"
                 "Use the buttons below to update guild-wide bot behavior."
             ),
             color=EmbedColors.NEUTRAL,
@@ -52,6 +54,10 @@ class GuildConfigView(discord.ui.View):
         self.toggle_voice_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger
         self.toggle_voice_button.label = f"Voice Replies: {'On' if enabled else 'Off'}"
 
+    def _sync_random_replies_button(self, enabled: bool) -> None:
+        self.toggle_random_replies_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger
+        self.toggle_random_replies_button.label = f"AI Replies: {'On' if enabled else 'Off'}"
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self._author_id:
             await interaction.response.send_message("Only the command user can control this panel.", ephemeral=True)
@@ -60,18 +66,32 @@ class GuildConfigView(discord.ui.View):
 
     @discord.ui.button(label="Voice Replies", style=discord.ButtonStyle.secondary, row=0)
     async def toggle_voice_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         guild_config = await self._guild_config_service.get_or_create_for_guild(self._guild_id)
         updated = await self._guild_config_service.set_use_voice_replies_for_guild(
             self._guild_id,
             not guild_config.use_voice_replies,
         )
         self._sync_voice_button(updated.use_voice_replies)
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+        await interaction.edit_original_response(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="AI Replies", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_random_replies_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        del button
+        await interaction.response.defer()
+        guild_config = await self._guild_config_service.get_or_create_for_guild(self._guild_id)
+        updated = await self._guild_config_service.set_use_random_replies_for_guild(
+            self._guild_id,
+            not guild_config.use_random_replies,
+        )
+        self._sync_random_replies_button(updated.use_random_replies)
+        await interaction.edit_original_response(embed=await self.build_embed(), view=self)
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=0)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         del button
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+        await interaction.response.defer()
+        await interaction.edit_original_response(embed=await self.build_embed(), view=self)
 
 
 class GuildConfigHandler:
@@ -81,9 +101,11 @@ class GuildConfigHandler:
         self,
         bot: commands.Bot,
         guild_config_service: GuildConfigurationService,
+        admin_user_ids: set[int] | None = None,
     ):
         self._bot = bot
         self._guild_config_service = guild_config_service
+        self._admin_user_ids = admin_user_ids or set()
         logger.info("GuildConfigHandler initialized")
 
     def register_commands(self):
@@ -96,21 +118,24 @@ class GuildConfigHandler:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
 
-        if not interaction.user.guild_permissions.administrator:
+        if not self._is_bot_admin(interaction):
             await interaction.response.send_message(
-                "Only server administrators can configure the bot.",
+                "Only configured bot admins can configure the bot.",
                 ephemeral=True,
             )
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
         view = GuildConfigView(
             guild_id=interaction.guild.id,
             author_id=interaction.user.id,
             guild_name=interaction.guild.name,
             guild_config_service=self._guild_config_service,
         )
-        await interaction.response.send_message(
+        await interaction.edit_original_response(
             embed=await view.build_embed(),
             view=view,
-            ephemeral=True,
         )
+
+    def _is_bot_admin(self, interaction: discord.Interaction) -> bool:
+        return int(interaction.user.id) in self._admin_user_ids

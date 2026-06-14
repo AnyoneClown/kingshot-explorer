@@ -54,7 +54,7 @@ COCKROACHDB_URL=cockroachdb+asyncpg://postgres:password@host:26257/database-name
 NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_MODEL=openai/gpt-oss-120b
-ENABLE_VOICE_REPLIES=true
+ENABLE_VOICE_REPLIES=false
 NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
 NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
 NVIDIA_TTS_DEFAULT_VOICE=Magpie-Multilingual.EN-US.Aria
@@ -65,7 +65,7 @@ KS_DATA_TIMEOUT_SECONDS=30
 COMMAND_PREFIX=!
 TRANSLATOR_ROLE=Translator
 AUTO_REDEEM_CHANNELS=123456789012345678,876543210987654321
-RANDOM_REPLY_CHANCE=0.08
+RANDOM_REPLY_CHANCE=0
 RANDOM_REPLY_COOLDOWN_SECONDS=180
 CHAT_HISTORY_LIMIT=25
 MAX_CHAT_RESPONSE_CHARS=500
@@ -102,7 +102,7 @@ Gift code related commands include:
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
-- `/configure` is an admin-only ephemeral guild configuration panel.
+- `/configure` is an ephemeral guild configuration panel available only to bot admins listed in `ADMIN_USER_ID` or `ADMIN_USER_IDS`. It can toggle voice replies and random AI chat replies.
 - `/scout` fetches players from KingShot leaderboard type 8 for a kingdom and returns stats-style embeds enriched by Governor ID. It defaults to 5 players and caps the limit at 15.
 
 ## Project Layout
@@ -120,7 +120,7 @@ main.py      Application entrypoint
 
 - OCR functionality has been removed from this project.
 - Keep AUTO_REDEEM_CHANNELS empty if you do not want announcement messages.
-- The bot will always answer when directly mentioned or replied to, and it can also reply randomly based on recent channel history.
+- The bot will always answer when directly mentioned or replied to, and `/configure` can turn random AI replies on or off for a server.
 - Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
 
 ## License

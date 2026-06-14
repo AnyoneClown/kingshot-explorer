@@ -92,7 +92,8 @@ class TranslatorBot:
         self.player_registry_service = PlayerRegistryService(self.db_manager)
         self.database_health_service = DatabaseHealthService(self.db_manager)
         self.guild_configuration_service = GuildConfigurationService(
-            default_use_voice_replies=config.enable_voice_replies,
+            default_use_voice_replies=False,
+            default_use_random_replies=False,
             db_manager=self.db_manager,
         )
         self.kvk_service = KVKService()
@@ -155,7 +156,11 @@ class TranslatorBot:
             player_registry_service=self.player_registry_service,
             kingshot_data_service=self.kingshot_data_service,
         )
-        self.guild_config_handler = GuildConfigHandler(self.bot, self.guild_configuration_service)
+        self.guild_config_handler = GuildConfigHandler(
+            self.bot,
+            self.guild_configuration_service,
+            admin_user_ids=config.admin_user_ids,
+        )
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
         self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)

@@ -18,7 +18,7 @@ class BotConfig:
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_model: str = "openai/gpt-oss-120b"
     nvidia_embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2"
-    enable_voice_replies: bool = True
+    enable_voice_replies: bool = False
     nvidia_tts_server: str = "grpc.nvcf.nvidia.com:443"
     nvidia_tts_use_ssl: bool = True
     nvidia_tts_function_id: str = "877104f7-e885-42b9-8de8-f6e4c6303969"
@@ -27,7 +27,7 @@ class BotConfig:
     nvidia_tts_audio_encoding: str = "LINEAR_PCM"
     nvidia_tts_sample_rate_hz: int = 44100
     nvidia_tts_max_text_chars: int = 350
-    random_reply_chance: float = 0.08
+    random_reply_chance: float = 0.0
     random_reply_cooldown_seconds: int = 180
     chat_history_limit: int = 25
     max_chat_response_chars: int = 500
@@ -128,7 +128,7 @@ class BotConfig:
                 "NVIDIA_EMBEDDING_MODEL",
                 "nvidia/llama-nemotron-embed-1b-v2",
             ),
-            enable_voice_replies=parse_bool(os.getenv("ENABLE_VOICE_REPLIES"), True),
+            enable_voice_replies=parse_bool(os.getenv("ENABLE_VOICE_REPLIES"), False),
             nvidia_tts_server=os.getenv("NVIDIA_TTS_SERVER", "grpc.nvcf.nvidia.com:443"),
             nvidia_tts_use_ssl=parse_bool(os.getenv("NVIDIA_TTS_USE_SSL"), True),
             nvidia_tts_function_id=os.getenv(
@@ -143,7 +143,7 @@ class BotConfig:
             nvidia_tts_audio_encoding=os.getenv("NVIDIA_TTS_AUDIO_ENCODING", "LINEAR_PCM"),
             nvidia_tts_sample_rate_hz=int(os.getenv("NVIDIA_TTS_SAMPLE_RATE_HZ", "44100")),
             nvidia_tts_max_text_chars=int(os.getenv("NVIDIA_TTS_MAX_TEXT_CHARS", "350")),
-            random_reply_chance=float(os.getenv("RANDOM_REPLY_CHANCE", "0.08")),
+            random_reply_chance=float(os.getenv("RANDOM_REPLY_CHANCE", "0")),
             random_reply_cooldown_seconds=int(os.getenv("RANDOM_REPLY_COOLDOWN_SECONDS", "180")),
             chat_history_limit=int(os.getenv("CHAT_HISTORY_LIMIT", "25")),
             max_chat_response_chars=int(os.getenv("MAX_CHAT_RESPONSE_CHARS", "500")),

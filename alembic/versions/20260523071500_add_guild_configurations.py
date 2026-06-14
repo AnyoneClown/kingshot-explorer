@@ -27,7 +27,7 @@ def upgrade() -> None:
         op.create_table(
             "guild_configurations",
             sa.Column("guild_id", sa.BigInteger(), nullable=False),
-            sa.Column("use_voice_replies", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+            sa.Column("use_voice_replies", sa.Boolean(), nullable=False, server_default=sa.text("false")),
             sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
             sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
             sa.PrimaryKeyConstraint("guild_id"),
