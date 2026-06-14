@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 class EventHandler:
     """Handles event scheduling Discord commands."""
 
-    def __init__(self, scheduler_service: IEventSchedulerService, bot: commands.Bot):
+    def __init__(
+        self,
+        scheduler_service: IEventSchedulerService,
+        bot: commands.Bot,
+        admin_user_ids: set[int] | None = None,
+    ):
         """
         Initialize event handler.
 
@@ -23,7 +28,22 @@ class EventHandler:
         """
         self._scheduler_service = scheduler_service
         self._bot = bot
+        self._admin_user_ids = admin_user_ids or set()
         self._scheduler_loop = None
+
+    def _is_bot_admin(self, interaction: discord.Interaction) -> bool:
+        return int(interaction.user.id) in self._admin_user_ids
+
+    async def _send_admin_only_response(self, interaction: discord.Interaction) -> None:
+        embed = self._build_status_embed(
+            title="⛔ Admin Only",
+            description="Only configured bot admins can use this command.",
+            color=discord.Color.orange(),
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     def register_commands(self):
         """Register all event scheduling commands with the bot."""
@@ -96,6 +116,10 @@ class EventHandler:
         reminder_minutes: int,
     ):
         """Handle scheduling a new event."""
+        if not self._is_bot_admin(interaction):
+            await self._send_admin_only_response(interaction)
+            return
+
         await interaction.response.defer(thinking=True)
 
         try:
@@ -250,6 +274,10 @@ class EventHandler:
 
     async def _handle_cancel_event(self, interaction: discord.Interaction, event_number: int):
         """Handle cancelling a scheduled event."""
+        if not self._is_bot_admin(interaction):
+            await self._send_admin_only_response(interaction)
+            return
+
         await interaction.response.defer(thinking=True)
 
         try:

@@ -137,6 +137,20 @@ class GiftCodeHandler:
         self._poll_backoff_until = datetime.now(timezone.utc) + self._poll_backoff_delta
         logger.warning("Gift code polling will retry after %s because of networking error: %s", self._poll_backoff_delta, error)
 
+    def _is_bot_admin(self, interaction: discord.Interaction) -> bool:
+        return int(interaction.user.id) in self._config.admin_user_ids
+
+    async def _send_admin_only_response(self, interaction: discord.Interaction) -> None:
+        embed = self._build_status_embed(
+            title="⛔ Admin Only",
+            description="Only configured bot admins can use this command.",
+            color=discord.Color.orange(),
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
     def register_commands(self):
         """Register all gift code commands with the bot."""
 
@@ -181,12 +195,6 @@ class GiftCodeHandler:
         async def list_giftcodes(interaction: discord.Interaction):
             """List available gift codes from the API."""
             await self._handle_list_gift_codes_slash(interaction)
-
-        @self._bot.tree.command(name="toggleplayer", description="Enable/disable a player for gift code redemption")
-        @app_commands.describe(player_id="The player ID to toggle")
-        async def toggle_player(interaction: discord.Interaction, player_id: str):
-            """Enable/disable a player for gift code redemption."""
-            await self._handle_toggle_player_slash(interaction, player_id)
 
     def start_polling_task(self):
         """Start the background task that checks for new gift codes."""
@@ -471,7 +479,11 @@ class GiftCodeHandler:
             interaction: Discord interaction
             gift_code: The gift code to redeem
         """
-        await interaction.response.defer(thinking=True)
+        if not self._is_bot_admin(interaction):
+            await self._send_admin_only_response(interaction)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
         user_info = f"{interaction.user.name}#{interaction.user.discriminator} (ID: {interaction.user.id})"
         guild_info = f"{interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
@@ -1175,7 +1187,7 @@ class GiftCodeHandler:
 
     async def _handle_list_players_slash(self, interaction: discord.Interaction):
         """Handle listing all registered players."""
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
         try:
             all_players = await self._player_registry_service.get_registered_players(enabled_only=False)
@@ -1186,7 +1198,8 @@ class GiftCodeHandler:
                         title="📋 No Players Found",
                         description="No player profiles are available yet.",
                         color=discord.Color.blue(),
-                    )
+                    ),
+                    ephemeral=True,
                 )
                 return
 
@@ -1203,7 +1216,7 @@ class GiftCodeHandler:
                 disabled_count=len(disabled_players),
                 author_id=interaction.user.id,
             )
-            message = await interaction.followup.send(embed=view.build_embed(), view=view)
+            message = await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
             view.message = message
 
         except Exception as e:
@@ -1213,44 +1226,8 @@ class GiftCodeHandler:
                     title="❌ Could Not List Players",
                     description="An error occurred while retrieving the player list.",
                     color=discord.Color.red(),
-                )
-            )
-
-    async def _handle_toggle_player_slash(self, interaction: discord.Interaction, player_id: str):
-        """Handle toggling a player's enabled status."""
-        await interaction.response.defer(thinking=True)
-
-        try:
-            new_status = await self._player_registry_service.toggle_registered_player(player_id)
-
-            if new_status is not None:
-                status_emoji = "✅" if new_status else "⛔"
-                status_text = "enabled" if new_status else "disabled"
-
-                embed = discord.Embed(
-                    title=f"{status_emoji} Player Status Updated",
-                    description=f"Player `{player_id}` has been **{status_text}** for gift code redemption.",
-                    color=(discord.Color.green() if new_status else discord.Color.orange()),
-                )
-                await interaction.followup.send(embed=embed)
-                logger.info(f"Player {player_id} toggled to {status_text} by {interaction.user.id}")
-            else:
-                await interaction.followup.send(
-                    embed=self._build_status_embed(
-                        title="❌ Player Not Found",
-                        description=f"Player `{player_id}` is not in the player list.",
-                        color=discord.Color.red(),
-                    )
-                )
-
-        except Exception as e:
-            logger.error(f"Error toggling player {player_id}: {e}", exc_info=True)
-            await interaction.followup.send(
-                embed=self._build_status_embed(
-                    title="❌ Could Not Update Player",
-                    description="An error occurred while updating the player status.",
-                    color=discord.Color.red(),
-                )
+                ),
+                ephemeral=True,
             )
 
     @staticmethod

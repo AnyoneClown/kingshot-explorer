@@ -34,11 +34,14 @@ class BotConfig:
     ks_data_api_key: str | None = None
     ks_data_base_url: str = "https://ks.jeab.dev"
     ks_data_timeout_seconds: int = 30
+    admin_user_ids: set = None
     banned_players: set = None
     auto_redeem_channels: set = None
 
     def __post_init__(self):
         """Initialize mutable default values."""
+        if self.admin_user_ids is None:
+            self.admin_user_ids = set()
         if self.banned_players is None:
             self.banned_players = set()
         if self.auto_redeem_channels is None:
@@ -72,6 +75,19 @@ class BotConfig:
         nvidia_api_key = os.getenv("NVIDIA_API_KEY")
         if not nvidia_api_key:
             raise ValueError("NVIDIA_API_KEY not found in environment variables")
+
+        # Parse bot admin users from env. ADMIN_USER_ID is kept for single-admin setups.
+        admin_users_str = ",".join(
+            value for value in [os.getenv("ADMIN_USER_ID", ""), os.getenv("ADMIN_USER_IDS", "")] if value
+        )
+        admin_user_ids = set()
+        if admin_users_str.strip():
+            try:
+                admin_user_ids = set(
+                    int(user_id.strip()) for user_id in admin_users_str.split(",") if user_id.strip()
+                )
+            except ValueError:
+                raise ValueError("ADMIN_USER_ID/ADMIN_USER_IDS must contain Discord user IDs (integers)")
 
         # Parse banned players from environment variable (comma-separated user IDs)
         banned_players_str = os.getenv("BANNED_PLAYERS", "")
@@ -134,6 +150,7 @@ class BotConfig:
             ks_data_api_key=os.getenv("KS_DATA_API_KEY"),
             ks_data_base_url=os.getenv("KS_DATA_API_BASE_URL", "https://ks.jeab.dev"),
             ks_data_timeout_seconds=int(os.getenv("KS_DATA_TIMEOUT_SECONDS", "30")),
+            admin_user_ids=admin_user_ids,
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,
         )

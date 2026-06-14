@@ -136,7 +136,11 @@ class TranslatorBot:
             interaction_tracking_service=self.interaction_tracking_service,
             guild_configuration_service=self.guild_configuration_service,
         )
-        self.event_handler = EventHandler(self.event_scheduler_service, self.bot)
+        self.event_handler = EventHandler(
+            self.event_scheduler_service,
+            self.bot,
+            admin_user_ids=config.admin_user_ids,
+        )
         self.player_info_handler = PlayerInfoHandler(
             self.player_info_service,
             self.bot,

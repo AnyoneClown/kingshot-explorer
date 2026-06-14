@@ -49,6 +49,7 @@ pip install -r requirements.txt
 
 ```env
 DISCORD_TOKEN=your_discord_bot_token_here
+ADMIN_USER_ID=your_discord_user_id
 COCKROACHDB_URL=cockroachdb+asyncpg://postgres:password@host:26257/database-name
 NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
@@ -71,6 +72,8 @@ MAX_CHAT_RESPONSE_CHARS=500
 LOG_LEVEL=INFO
 ```
 
+Use `ADMIN_USER_IDS=123,456` instead of `ADMIN_USER_ID` if multiple Discord users should be allowed to run protected admin commands.
+
 3. Run migrations.
 
 ```bash
@@ -91,11 +94,11 @@ Gift code related commands include:
 
 - /redeem
 - /addplayer
+- /addalliance
 - /removeplayer
 - /listplayers
 - /playerlist (alias)
 - /giftcodes
-- /toggleplayer
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
