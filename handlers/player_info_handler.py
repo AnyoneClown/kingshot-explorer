@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -6,6 +7,7 @@ from discord.ext import commands
 
 from services.player_info_service import IPlayerInfoService
 from services.interaction_tracking_service import InteractionTrackingService
+from services.kingshot_data_service import KingshotDataService
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,7 @@ class PlayerInfoHandler:
         player_info_service: IPlayerInfoService,
         bot: commands.Bot,
         interaction_tracking_service: InteractionTrackingService | None = None,
+        kingshot_data_service: KingshotDataService | None = None,
     ):
         """
         Initialize player info handler.
@@ -29,13 +32,14 @@ class PlayerInfoHandler:
         self._player_info_service = player_info_service
         self._bot = bot
         self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
+        self._kingshot_data_service = kingshot_data_service
         logger.info("PlayerInfoHandler initialized")
 
     def register_commands(self):
         """Register all player info commands with the bot."""
 
         @self._bot.tree.command(name="stats", description="Fetch and display player statistics")
-        @app_commands.describe(player_id="The player ID to look up")
+        @app_commands.describe(player_id="Governor ID / player ID to look up")
         async def get_player_stats(interaction: discord.Interaction, player_id: str):
             """Fetch and display player statistics."""
             await self._handle_player_stats_slash(interaction, player_id)
@@ -58,6 +62,7 @@ class PlayerInfoHandler:
         try:
             # Fetch player info
             player_data = await self._player_info_service.get_player_info(player_id)
+            ks_data = await self._get_kingshot_data_player(player_id)
 
             if player_data is None:
                 logger.warning(f"Player {player_id} not found for request by {user_info}")
@@ -111,12 +116,20 @@ class PlayerInfoHandler:
                 value=str(player_data.get("levelRenderedDetailed") or player_data.get("level") or "N/A"),
                 inline=True,
             )
+            embed.add_field(name="Power", value=self._format_power(ks_data), inline=True)
+            embed.add_field(name="VIP Level", value=self._format_vip(ks_data), inline=True)
+            embed.add_field(name="Alliance", value=self._format_alliance(ks_data), inline=True)
 
             # Add profile photo if available
             if "profilePhoto" in player_data and player_data["profilePhoto"]:
                 embed.set_thumbnail(url=player_data["profilePhoto"])
 
-            embed.set_footer(text="Data from kingshot.net API • Use /addplayer to include this player in auto-redeem")
+            embed.add_field(
+                name="Links",
+                value=self._format_data_links(player_id, player_data, ks_data),
+                inline=False,
+            )
+            embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
 
             await interaction.followup.send(embed=embed)
             logger.info(f"Successfully displayed stats for {player_name} (ID: {player_id}) to {user_info}")
@@ -167,3 +180,86 @@ class PlayerInfoHandler:
                     color=discord.Color.red(),
                 )
             )
+
+    async def _get_kingshot_data_player(self, player_id: str) -> dict[str, Any] | None:
+        if self._kingshot_data_service is None:
+            return None
+
+        result = await self._kingshot_data_service.get_player_by_fid(player_id)
+        if not result.get("success"):
+            logger.warning(
+                "KingShot Data enrichment failed for player %s: %s",
+                player_id,
+                result.get("error_message") or result.get("error_code"),
+            )
+            return None
+
+        data = result.get("data")
+        if isinstance(data, dict) and not data.get("error"):
+            return data
+        return None
+
+    @classmethod
+    def _format_power(cls, ks_data: dict[str, Any] | None) -> str:
+        if not ks_data:
+            return "N/A"
+        power = ks_data.get("power")
+        if power is None and isinstance(ks_data.get("stats"), dict):
+            power = ks_data["stats"].get("8")
+        return cls._format_number(power) if power is not None else "N/A"
+
+    @staticmethod
+    def _format_vip(ks_data: dict[str, Any] | None) -> str:
+        if not ks_data:
+            return "N/A"
+        vip = ks_data.get("vip")
+        return str(vip) if vip is not None else "Hidden"
+
+    @staticmethod
+    def _format_alliance(ks_data: dict[str, Any] | None) -> str:
+        if not ks_data or not isinstance(ks_data.get("alliance"), dict):
+            return "N/A"
+        alliance = ks_data["alliance"]
+        abbr = alliance.get("abbr")
+        name = alliance.get("name")
+        if abbr and name:
+            return f"`[{abbr}]` {name}"
+        if abbr:
+            return f"`[{abbr}]`"
+        if name:
+            return str(name)
+        return "N/A"
+
+    @classmethod
+    def _format_data_links(
+        cls,
+        player_id: str,
+        player_data: dict[str, Any],
+        ks_data: dict[str, Any] | None,
+    ) -> str:
+        player_link = f"[Player details](https://kingshot.jeab.dev/player/{player_id})"
+        alliance_link = cls._format_alliance_link(player_data, ks_data)
+        return f"{player_link}\n{alliance_link}"
+
+    @staticmethod
+    def _format_alliance_link(player_data: dict[str, Any], ks_data: dict[str, Any] | None) -> str:
+        if not ks_data or not isinstance(ks_data.get("alliance"), dict):
+            return "Alliance details: N/A"
+
+        alliance = ks_data["alliance"]
+        aid = alliance.get("aid")
+        kingdom = ks_data.get("kid") or player_data.get("kingdom")
+        if aid is None or kingdom is None:
+            return "Alliance details: N/A"
+
+        return f"[Alliance details](https://kingshot.jeab.dev/alliances/{kingdom}/{aid})"
+
+    @staticmethod
+    def _format_number(value: Any) -> str:
+        try:
+            number = float(str(value).replace(",", ""))
+        except (TypeError, ValueError):
+            return str(value)
+        if number.is_integer():
+            return f"{int(number):,}"
+        return f"{number:,.2f}"

@@ -11,6 +11,7 @@ from .chatbot_service import ChatbotService, IChatbotService
 from .kingshot_rag_service import KingshotChunkInput, KingshotRAGError, KingshotRAGService, KingshotRetrievedChunk
 from .kvk_service import KVKService
 from .player_info_service import PlayerInfoService
+from .kingshot_data_service import KingshotDataService
 from .translation_service import TranslationService
 from .voice_message_service import VoiceMessageAudio, VoiceMessageService
 
@@ -18,6 +19,7 @@ __all__ = [
     "TranslationService",
     "EventSchedulerService",
     "PlayerInfoService",
+    "KingshotDataService",
     "GiftCodeService",
     "GuildConfigurationService",
     "DatabaseHealthService",

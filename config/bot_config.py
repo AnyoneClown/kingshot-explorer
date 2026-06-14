@@ -31,6 +31,9 @@ class BotConfig:
     random_reply_cooldown_seconds: int = 180
     chat_history_limit: int = 25
     max_chat_response_chars: int = 500
+    ks_data_api_key: str | None = None
+    ks_data_base_url: str = "https://ks.jeab.dev"
+    ks_data_timeout_seconds: int = 30
     banned_players: set = None
     auto_redeem_channels: set = None
 
@@ -128,6 +131,9 @@ class BotConfig:
             random_reply_cooldown_seconds=int(os.getenv("RANDOM_REPLY_COOLDOWN_SECONDS", "180")),
             chat_history_limit=int(os.getenv("CHAT_HISTORY_LIMIT", "25")),
             max_chat_response_chars=int(os.getenv("MAX_CHAT_RESPONSE_CHARS", "500")),
+            ks_data_api_key=os.getenv("KS_DATA_API_KEY"),
+            ks_data_base_url=os.getenv("KS_DATA_API_BASE_URL", "https://ks.jeab.dev"),
+            ks_data_timeout_seconds=int(os.getenv("KS_DATA_TIMEOUT_SECONDS", "30")),
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,
         )

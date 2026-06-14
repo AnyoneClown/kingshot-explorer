@@ -58,6 +58,9 @@ NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
 NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
 NVIDIA_TTS_DEFAULT_VOICE=Magpie-Multilingual.EN-US.Aria
 NVIDIA_TTS_AUDIO_ENCODING=LINEAR_PCM
+KS_DATA_API_KEY=your_kingshot_data_api_key
+KS_DATA_API_BASE_URL=https://ks.jeab.dev
+KS_DATA_TIMEOUT_SECONDS=30
 COMMAND_PREFIX=!
 TRANSLATOR_ROLE=Translator
 AUTO_REDEEM_CHANNELS=123456789012345678,876543210987654321
@@ -95,6 +98,15 @@ Gift code related commands include:
 - /toggleplayer
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
+
+KingShot Data commands include:
+
+- /ks_arena
+- /ks_alliance
+- /ks_alliance_full
+- /ks_kingdom_board
+- /ks_global_board
+- /ks_board_search
 
 - `/configure` is an admin-only ephemeral guild configuration panel.
 

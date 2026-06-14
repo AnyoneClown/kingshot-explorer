@@ -7,6 +7,7 @@ from .guild_config_handler import GuildConfigHandler
 from .kingshot_rag_handler import KingshotRAGHandler
 from .kvk_handler import KVKHandler
 from .player_info_handler import PlayerInfoHandler
+from .kingshot_data_handler import KingshotDataHandler
 from .status_handler import StatusHandler
 from .translation_handler import TranslationHandler
 
@@ -14,6 +15,7 @@ __all__ = [
     "TranslationHandler",
     "EventHandler",
     "PlayerInfoHandler",
+    "KingshotDataHandler",
     "GiftCodeHandler",
     "GuildConfigHandler",
     "KingshotRAGHandler",

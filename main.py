@@ -19,6 +19,7 @@ from handlers import (
     EventHandler,
     GiftCodeHandler,
     GuildConfigHandler,
+    KingshotDataHandler,
     KingshotRAGHandler,
     KVKHandler,
     PlayerInfoHandler,
@@ -37,6 +38,7 @@ from services import (
     PlayerRegistryService,
     TranslationService,
     DatabaseHealthService,
+    KingshotDataService,
     VoiceMessageService,
 )
 
@@ -95,6 +97,11 @@ class TranslatorBot:
             db_manager=self.db_manager,
         )
         self.kvk_service = KVKService()
+        self.kingshot_data_service = KingshotDataService(
+            api_key=config.ks_data_api_key,
+            base_url=config.ks_data_base_url,
+            timeout_seconds=config.ks_data_timeout_seconds,
+        )
         self.kingshot_rag_service = KingshotRAGService(
             self.db_manager,
             self.nvidia_client,
@@ -134,6 +141,7 @@ class TranslatorBot:
             self.player_info_service,
             self.bot,
             interaction_tracking_service=self.interaction_tracking_service,
+            kingshot_data_service=self.kingshot_data_service,
         )
         self.gift_code_handler = GiftCodeHandler(
             self.gift_code_service,
@@ -145,6 +153,7 @@ class TranslatorBot:
         )
         self.guild_config_handler = GuildConfigHandler(self.bot, self.guild_configuration_service)
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot)
+        self.kingshot_data_handler = KingshotDataHandler(self.kingshot_data_service, self.bot)
         self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)
         self.status_handler = StatusHandler(
@@ -233,6 +242,7 @@ class TranslatorBot:
         self.gift_code_handler.register_commands()
         self.guild_config_handler.register_commands()
         self.kvk_handler.register_commands()
+        self.kingshot_data_handler.register_commands()
         self.kingshot_rag_handler.register_commands()
         self.database_handler.register_commands()
         self.database_handler.register_events()
