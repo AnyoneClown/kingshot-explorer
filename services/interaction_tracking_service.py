@@ -34,9 +34,10 @@ class InteractionTrackingService:
         async with db.session() as session:
             yield session
 
-    async def track_user(self, *, session, user_id, username, discriminator, display_name):
-        user_repo = UserRepository(session)
-        return await user_repo.upsert(user_id, username, discriminator, display_name)
+    async def track_user(self, *, session=None, user_id, username, discriminator, display_name):
+        async with self._session(session) as db_session:
+            user_repo = UserRepository(db_session)
+            return await user_repo.upsert(user_id, username, discriminator, display_name)
 
     async def track_translation(
         self,

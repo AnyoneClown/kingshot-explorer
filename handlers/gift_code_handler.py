@@ -479,11 +479,21 @@ class GiftCodeHandler:
             interaction: Discord interaction
             gift_code: The gift code to redeem
         """
+        try:
+            await interaction.response.defer(thinking=True, ephemeral=True)
+        except discord.NotFound:
+            logger.warning(
+                "Could not acknowledge /redeem interaction before it expired "
+                "(interaction_id=%s, user_id=%s, created_at=%s)",
+                interaction.id,
+                interaction.user.id,
+                interaction.created_at.isoformat() if interaction.created_at else None,
+            )
+            return
+
         if not self._is_bot_admin(interaction):
             await self._send_admin_only_response(interaction)
             return
-
-        await interaction.response.defer(thinking=True, ephemeral=True)
 
         user_info = f"{interaction.user.name}#{interaction.user.discriminator} (ID: {interaction.user.id})"
         guild_info = f"{interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
