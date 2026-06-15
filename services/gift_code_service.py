@@ -292,6 +292,7 @@ class GiftCodeService(IGiftCodeService):
 
         return {
             "playerId": str(raw_data.get("fid") or fallback_player_id),
+            "playerUid": str(raw_data.get("uid")) if raw_data.get("uid") is not None else None,
             "name": raw_data.get("nickname"),
             "kingdom": raw_data.get("kid"),
             "level": raw_data.get("stove_lv"),

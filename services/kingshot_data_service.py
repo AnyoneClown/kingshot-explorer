@@ -64,6 +64,10 @@ class KingshotDataService:
         """Fetch arena team for internal player uid."""
         return await self._request("GET", f"/v1/arena/{uid}")
 
+    async def get_player(self, uid: str | int) -> Dict[str, Any]:
+        """Fetch player profile by internal player uid."""
+        return await self._request("GET", f"/v1/players/{uid}")
+
     async def get_alliance(self, aid: str | int, kid: int | str) -> Dict[str, Any]:
         """Fetch alliance summary and roster."""
         return await self._request("GET", f"/v1/alliances/{aid}", params={"kid": str(kid)})

@@ -827,6 +827,28 @@ class GiftCodeHandler:
             value = member.get(key)
             if value not in (None, "", 0, "0"):
                 return str(value)
+
+        player = member.get("player")
+        if isinstance(player, dict):
+            for key in ("fid", "player_fid", "playerFid", "governorId", "governor_id", "playerId"):
+                value = player.get(key)
+                if value not in (None, "", 0, "0"):
+                    return str(value)
+        return None
+
+    @staticmethod
+    def _extract_member_uid(member: Dict[str, Any]) -> Optional[str]:
+        for key in ("uid", "player_uid", "playerUid", "internalUid", "internal_uid"):
+            value = member.get(key)
+            if value not in (None, "", 0, "0"):
+                return str(value)
+
+        player = member.get("player")
+        if isinstance(player, dict):
+            for key in ("uid", "player_uid", "playerUid", "internalUid", "internal_uid"):
+                value = player.get(key)
+                if value not in (None, "", 0, "0"):
+                    return str(value)
         return None
 
     @staticmethod
@@ -835,12 +857,80 @@ class GiftCodeHandler:
             value = member.get(key)
             if value:
                 return str(value)
+
+        player = member.get("player")
+        if isinstance(player, dict):
+            for key in ("name", "nickname", "playerName", "player_name"):
+                value = player.get(key)
+                if value:
+                    return str(value)
         return None
 
     @staticmethod
     def _extract_member_castle_level(member: Dict[str, Any]) -> Optional[str]:
         for key in ("castleLevel", "castle", "stove_lv", "level", "lv"):
             value = member.get(key)
+            if value is not None:
+                return str(value)
+
+        player = member.get("player")
+        if isinstance(player, dict):
+            for key in ("castleLevel", "castle", "stove_lv", "level", "lv"):
+                value = player.get(key)
+                if value is not None:
+                    return str(value)
+        return None
+
+    @classmethod
+    def _extract_player_payload(cls, payload: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+
+        if any(key in payload for key in ("fid", "uid", "name", "nickname")):
+            return payload
+
+        for key in ("player", "data", "result", "payload"):
+            nested = cls._extract_player_payload(payload.get(key))
+            if nested:
+                return nested
+        return None
+
+    @staticmethod
+    def _extract_profile_fid(profile: Dict[str, Any]) -> Optional[str]:
+        for key in ("fid", "player_fid", "playerFid", "governorId", "governor_id", "playerId"):
+            value = profile.get(key)
+            if value not in (None, "", 0, "0"):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_profile_uid(profile: Dict[str, Any]) -> Optional[str]:
+        for key in ("uid", "player_uid", "playerUid", "internalUid", "internal_uid"):
+            value = profile.get(key)
+            if value not in (None, "", 0, "0"):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_profile_name(profile: Dict[str, Any]) -> Optional[str]:
+        for key in ("name", "nickname", "playerName", "player_name"):
+            value = profile.get(key)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_profile_kingdom(profile: Dict[str, Any]) -> Optional[str]:
+        for key in ("kid", "kingdom", "serverid", "server_id"):
+            value = profile.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_profile_castle_level(profile: Dict[str, Any]) -> Optional[str]:
+        for key in ("castleLevel", "castle", "stove_lv", "level", "lv"):
+            value = profile.get(key)
             if value is not None:
                 return str(value)
         return None
@@ -865,6 +955,11 @@ class GiftCodeHandler:
             return
 
         resolved_player_id = str(player_info.get("playerId") or player_id)
+        resolved_player_uid = (
+            str(player_info.get("playerUid") or player_info.get("uid"))
+            if (player_info.get("playerUid") or player_info.get("uid")) is not None
+            else None
+        )
         resolved_name = player_info.get("name")
         resolved_kingdom = str(player_info.get("kingdom")) if player_info.get("kingdom") is not None else None
         resolved_castle_level = (
@@ -875,6 +970,7 @@ class GiftCodeHandler:
 
         await self._tracking_service.sync_player_metadata(
             player_id=resolved_player_id,
+            player_uid=resolved_player_uid,
             player_name=resolved_name,
             kingdom=resolved_kingdom,
             castle_level=resolved_castle_level,
@@ -887,6 +983,11 @@ class GiftCodeHandler:
             return
 
         resolved_player_id = str(player_profile.get("playerId") or player_id)
+        resolved_player_uid = (
+            str(player_profile.get("playerUid") or player_profile.get("uid"))
+            if (player_profile.get("playerUid") or player_profile.get("uid")) is not None
+            else None
+        )
         resolved_name = player_profile.get("name")
         resolved_kingdom = str(player_profile.get("kingdom")) if player_profile.get("kingdom") is not None else None
         resolved_castle_level = (
@@ -895,6 +996,7 @@ class GiftCodeHandler:
 
         await self._tracking_service.sync_player_metadata(
             player_id=resolved_player_id,
+            player_uid=resolved_player_uid,
             player_name=resolved_name,
             kingdom=resolved_kingdom,
             castle_level=resolved_castle_level,
@@ -952,6 +1054,11 @@ class GiftCodeHandler:
 
                 # Use API-provided name only
                 resolved_player_id = str(player_info.get("playerId") or pid)
+                resolved_player_uid = (
+                    str(player_info.get("playerUid") or player_info.get("uid"))
+                    if (player_info.get("playerUid") or player_info.get("uid")) is not None
+                    else None
+                )
                 resolved_name = player_info.get("name")
                 resolved_kingdom = str(player_info.get("kingdom")) if player_info.get("kingdom") is not None else None
                 resolved_castle_level = (
@@ -963,6 +1070,7 @@ class GiftCodeHandler:
                 await self._player_registry_service.add_registered_player(
                     player_id=resolved_player_id,
                     added_by_user_id=interaction.user.id,
+                    player_uid=resolved_player_uid,
                     player_name=resolved_name,
                     kingdom=resolved_kingdom,
                     castle_level=resolved_castle_level,
@@ -1072,28 +1180,97 @@ class GiftCodeHandler:
             added_players: List[str] = []
             skipped_members: List[str] = []
             seen_fids: set[str] = set()
+            cached_uid_count = 0
+            resolved_uid_count = 0
+            players_to_add: List[Dict[str, Any]] = []
+            cached_enabled_fids: set[str] = set()
+            member_uids = []
+            for member in members:
+                member_uid = self._extract_member_uid(member)
+                if member_uid and member_uid not in member_uids:
+                    member_uids.append(member_uid)
+
+            cached_players_by_uid = await self._player_registry_service.get_registered_players_by_uids(member_uids)
+            missing_uids = {
+                member_uid
+                for member in members
+                if (member_uid := self._extract_member_uid(member))
+                and not self._extract_member_fid(member)
+                and member_uid not in cached_players_by_uid
+            }
+            resolved_profiles_by_uid: dict[str, Dict[str, Any]] = {}
+            if missing_uids:
+                resolve_semaphore = asyncio.Semaphore(5)
+
+                async def resolve_missing_uid(uid: str) -> tuple[str, Optional[Dict[str, Any]]]:
+                    async with resolve_semaphore:
+                        profile_result = await self._kingshot_data_service.get_player(uid)
+                    if not profile_result.get("success"):
+                        logger.warning(
+                            "Could not resolve alliance member uid %s to fid: %s",
+                            uid,
+                            profile_result.get("error_message", "KingShot Data API request failed."),
+                        )
+                        return uid, None
+                    return uid, self._extract_player_payload(profile_result.get("data"))
+
+                for uid, profile in await asyncio.gather(
+                    *(resolve_missing_uid(uid) for uid in sorted(missing_uids))
+                ):
+                    if profile:
+                        resolved_profiles_by_uid[uid] = profile
 
             for member in members:
+                member_uid = self._extract_member_uid(member)
                 fid = self._extract_member_fid(member)
                 member_name = self._extract_member_name(member)
                 castle_level = self._extract_member_castle_level(member)
+                member_kingdom = str(kid)
+
+                if not fid and member_uid:
+                    cached_player = cached_players_by_uid.get(member_uid)
+                    if cached_player is not None:
+                        fid = cached_player.player_id
+                        member_name = member_name or cached_player.player_name
+                        castle_level = castle_level or cached_player.castle_level
+                        member_kingdom = cached_player.kingdom or member_kingdom
+                        cached_uid_count += 1
+                        if getattr(cached_player, "enabled", False):
+                            cached_enabled_fids.add(fid)
+                    else:
+                        profile = resolved_profiles_by_uid.get(member_uid)
+                        if profile:
+                            fid = self._extract_profile_fid(profile)
+                            member_uid = self._extract_profile_uid(profile) or member_uid
+                            member_name = member_name or self._extract_profile_name(profile)
+                            castle_level = castle_level or self._extract_profile_castle_level(profile)
+                            member_kingdom = self._extract_profile_kingdom(profile) or member_kingdom
+                            if fid:
+                                resolved_uid_count += 1
 
                 if not fid:
-                    skipped_members.append(member_name or str(member.get("uid") or member.get("id") or "unknown"))
+                    skipped_members.append(member_name or str(member_uid or member.get("id") or "unknown"))
                     continue
                 if fid in seen_fids:
                     continue
                 seen_fids.add(fid)
 
-                await self._player_registry_service.add_registered_player(
-                    player_id=fid,
-                    added_by_user_id=interaction.user.id,
-                    player_name=member_name,
-                    kingdom=str(kid),
-                    castle_level=castle_level,
-                    enabled=True,
-                )
+                if fid not in cached_enabled_fids:
+                    players_to_add.append(
+                        {
+                            "player_id": fid,
+                            "added_by_user_id": interaction.user.id,
+                            "player_uid": member_uid,
+                            "player_name": member_name,
+                            "kingdom": member_kingdom,
+                            "castle_level": castle_level,
+                            "enabled": True,
+                        }
+                    )
                 added_players.append(f"`{fid}`" + (f" ({member_name})" if member_name else ""))
+
+            if players_to_add:
+                await self._player_registry_service.add_registered_players(players_to_add)
 
             alliance_name = self._extract_alliance_name(payload) or f"Alliance {aid}"
             embed = discord.Embed(
@@ -1112,13 +1289,18 @@ class GiftCodeHandler:
                 embed.add_field(
                     name="Skipped",
                     value=(
-                        f"{len(skipped_members)} member(s) did not include `fid` yet, "
+                        f"{len(skipped_members)} member(s) could not be mapped to a `fid`, "
                         f"so they cannot be added for gift redemption.\n{skipped_preview}"
                     ),
                     inline=False,
                 )
 
-            embed.set_footer(text="Requires alliance roster members to include Governor ID (fid)")
+            embed.set_footer(
+                text=(
+                    f"UID cache hits: {cached_uid_count} | UID API resolves: {resolved_uid_count} | "
+                    "Gift redemption uses Governor ID (fid)"
+                )
+            )
             await interaction.followup.send(embed=embed)
 
         except Exception as e:

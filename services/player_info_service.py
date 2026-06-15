@@ -49,6 +49,7 @@ class PlayerInfoService(IPlayerInfoService):
                         player_data = {
                             "name": raw_data.get("nickname"),
                             "playerId": str(raw_data.get("fid", player_id)),
+                            "playerUid": str(raw_data.get("uid")) if raw_data.get("uid") is not None else None,
                             "level": raw_data.get("stove_lv"),
                             "kingdom": raw_data.get("kid"),
                             "profilePhoto": raw_data.get("avatar_image"),

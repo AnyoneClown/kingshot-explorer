@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional, Set
+from typing import Any, Optional, Set
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -152,9 +152,88 @@ class RegisteredPlayerRepository:
         result = await self._session.execute(select(RegisteredPlayer).where(RegisteredPlayer.player_id == player_id))
         return result.scalar_one_or_none()
 
+    async def get_by_uid(self, player_uid: str) -> Optional[RegisteredPlayer]:
+        result = await self._session.execute(
+            select(RegisteredPlayer).where(RegisteredPlayer.player_uid == player_uid)
+        )
+        return result.scalar_one_or_none()
+
+    async def list_by_uids(self, player_uids: list[str]) -> dict[str, RegisteredPlayer]:
+        normalized_uids = [str(uid) for uid in player_uids if uid not in (None, "", "0", 0)]
+        if not normalized_uids:
+            return {}
+
+        result = await self._session.execute(
+            select(RegisteredPlayer).where(RegisteredPlayer.player_uid.in_(normalized_uids))
+        )
+        return {str(player.player_uid): player for player in result.scalars().all() if player.player_uid}
+
+    async def _assign_uid_if_available(self, player: RegisteredPlayer, player_uid: Optional[str]) -> None:
+        if player_uid in (None, "", "0", 0):
+            return
+
+        normalized_uid = str(player_uid)
+        existing = await self.get_by_uid(normalized_uid)
+        if existing is not None and existing.id != player.id:
+            logger.warning(
+                "Skipping uid cache update for player %s because uid %s is already mapped to player %s",
+                player.player_id,
+                normalized_uid,
+                existing.player_id,
+            )
+            return
+
+        player.player_uid = normalized_uid
+
+    @staticmethod
+    def _assign_uid_from_maps(
+        player: RegisteredPlayer,
+        player_uid: Optional[str],
+        uid_map: dict[str, RegisteredPlayer],
+    ) -> None:
+        if player_uid in (None, "", "0", 0):
+            return
+
+        normalized_uid = str(player_uid)
+        existing = uid_map.get(normalized_uid)
+        if existing is not None and existing is not player:
+            logger.warning(
+                "Skipping uid cache update for player %s because uid %s is already mapped to player %s",
+                player.player_id,
+                normalized_uid,
+                existing.player_id,
+            )
+            return
+
+        player.player_uid = normalized_uid
+        uid_map[normalized_uid] = player
+
+    @staticmethod
+    def _apply_profile_updates(
+        player: RegisteredPlayer,
+        *,
+        player_name: Optional[str],
+        kingdom: Optional[str],
+        castle_level: Optional[str],
+        enabled: Optional[bool],
+        added_by_user_id: Optional[int],
+        overwrite_owner: bool,
+    ) -> None:
+        if player_name:
+            player.player_name = player_name
+        if kingdom is not None:
+            player.kingdom = kingdom
+        if castle_level is not None:
+            player.castle_level = castle_level
+        if enabled is not None:
+            player.enabled = enabled
+        if overwrite_owner and added_by_user_id is not None:
+            player.added_by_user_id = added_by_user_id
+
     async def upsert_profile(
         self,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -163,8 +242,14 @@ class RegisteredPlayerRepository:
         overwrite_owner: bool = False,
     ) -> Optional[RegisteredPlayer]:
         player = await self._get(player_id)
+        if player is None and player_uid not in (None, "", "0", 0):
+            player = await self.get_by_uid(str(player_uid))
+            if player is not None and player.player_id != player_id:
+                logger.info("Updating uid-cached player %s to canonical fid %s", player.player_id, player_id)
+                player.player_id = player_id
 
         if player:
+            await self._assign_uid_if_available(player, player_uid)
             if player_name:
                 player.player_name = player_name
             if kingdom is not None:
@@ -184,6 +269,7 @@ class RegisteredPlayerRepository:
 
         player = RegisteredPlayer(
             player_id=player_id,
+            player_uid=str(player_uid) if player_uid not in (None, "", "0", 0) else None,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
@@ -212,6 +298,7 @@ class RegisteredPlayerRepository:
         self,
         player_id: str,
         added_by_user_id: int,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -219,6 +306,7 @@ class RegisteredPlayerRepository:
     ) -> RegisteredPlayer:
         player = await self.upsert_profile(
             player_id=player_id,
+            player_uid=player_uid,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
@@ -231,6 +319,84 @@ class RegisteredPlayerRepository:
 
         logger.info("Upserted registered player %s (enabled=%s)", player_id, enabled)
         return player
+
+    async def add_or_update_many(self, players: list[dict[str, Any]]) -> list[RegisteredPlayer]:
+        if not players:
+            return []
+
+        player_ids = [str(player["player_id"]) for player in players]
+        player_uids = [
+            str(player.get("player_uid"))
+            for player in players
+            if player.get("player_uid") not in (None, "", "0", 0)
+        ]
+
+        query = select(RegisteredPlayer).where(
+            or_(
+                RegisteredPlayer.player_id.in_(player_ids),
+                RegisteredPlayer.player_uid.in_(player_uids),
+            )
+        )
+        result = await self._session.execute(query)
+        existing_players = list(result.scalars().all())
+        player_id_map = {player.player_id: player for player in existing_players}
+        uid_map = {str(player.player_uid): player for player in existing_players if player.player_uid}
+
+        upserted_players: list[RegisteredPlayer] = []
+        created_count = 0
+        updated_count = 0
+
+        for row in players:
+            player_id = str(row["player_id"])
+            player_uid = row.get("player_uid")
+            normalized_uid = str(player_uid) if player_uid not in (None, "", "0", 0) else None
+            player = player_id_map.get(player_id)
+            if player is None and normalized_uid:
+                player = uid_map.get(normalized_uid)
+                if player is not None and player.player_id != player_id:
+                    logger.info("Updating uid-cached player %s to canonical fid %s", player.player_id, player_id)
+                    player_id_map.pop(player.player_id, None)
+                    player.player_id = player_id
+                    player_id_map[player_id] = player
+
+            if player is None:
+                player = RegisteredPlayer(
+                    player_id=player_id,
+                    player_uid=normalized_uid,
+                    player_name=row.get("player_name"),
+                    kingdom=row.get("kingdom"),
+                    castle_level=row.get("castle_level"),
+                    enabled=row.get("enabled", True),
+                    added_by_user_id=row["added_by_user_id"],
+                )
+                self._session.add(player)
+                player_id_map[player_id] = player
+                if normalized_uid:
+                    uid_map[normalized_uid] = player
+                created_count += 1
+            else:
+                self._assign_uid_from_maps(player, player_uid, uid_map)
+                self._apply_profile_updates(
+                    player,
+                    player_name=row.get("player_name"),
+                    kingdom=row.get("kingdom"),
+                    castle_level=row.get("castle_level"),
+                    enabled=row.get("enabled", True),
+                    added_by_user_id=row.get("added_by_user_id"),
+                    overwrite_owner=True,
+                )
+                updated_count += 1
+
+            upserted_players.append(player)
+
+        await self._session.flush()
+        logger.info(
+            "Bulk upserted %s registered players (%s created, %s updated)",
+            len(upserted_players),
+            created_count,
+            updated_count,
+        )
+        return upserted_players
 
     async def remove(self, player_id: str) -> bool:
         player = await self._get(player_id)
@@ -257,6 +423,7 @@ class RegisteredPlayerRepository:
     async def sync_metadata(
         self,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -264,6 +431,7 @@ class RegisteredPlayerRepository:
     ) -> bool:
         player = await self.upsert_profile(
             player_id=player_id,
+            player_uid=player_uid,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,

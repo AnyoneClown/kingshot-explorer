@@ -95,6 +95,7 @@ class RegisteredPlayer(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     player_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    player_uid: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True, index=True)
     player_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     kingdom: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     castle_level: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -118,7 +119,8 @@ class RegisteredPlayer(Base):
     def __repr__(self) -> str:
         return (
             f"<RegisteredPlayer(id={self.id}, player_id={self.player_id}, player_name={self.player_name}, "
-            f"kingdom={self.kingdom}, castle_level={self.castle_level}, enabled={self.enabled})>"
+            f"player_uid={self.player_uid}, kingdom={self.kingdom}, castle_level={self.castle_level}, "
+            f"enabled={self.enabled})>"
         )
 
 

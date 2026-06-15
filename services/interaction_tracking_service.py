@@ -80,6 +80,7 @@ class InteractionTrackingService:
         self,
         user_id: int,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -107,6 +108,7 @@ class InteractionTrackingService:
 
             return await RegisteredPlayerRepository(db_session).upsert_profile(
                 player_id=player_id,
+                player_uid=player_uid,
                 player_name=player_name,
                 kingdom=kingdom,
                 castle_level=castle_level,
@@ -116,6 +118,7 @@ class InteractionTrackingService:
     async def sync_player_metadata(
         self,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -125,6 +128,7 @@ class InteractionTrackingService:
         async with self._session(session) as db_session:
             return await RegisteredPlayerRepository(db_session).sync_metadata(
                 player_id=player_id,
+                player_uid=player_uid,
                 player_name=player_name,
                 kingdom=kingdom,
                 castle_level=castle_level,

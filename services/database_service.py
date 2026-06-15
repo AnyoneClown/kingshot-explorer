@@ -114,6 +114,7 @@ class DatabaseService:
     async def _upsert_player_profile(
         session: AsyncSession,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -124,6 +125,7 @@ class DatabaseService:
         """Create or update a player profile in the unified player table."""
         return await RegisteredPlayerRepository(session).upsert_profile(
             player_id=player_id,
+            player_uid=player_uid,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
@@ -137,6 +139,7 @@ class DatabaseService:
         session: AsyncSession,
         user_id: int,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -171,6 +174,7 @@ class DatabaseService:
 
         player = await RegisteredPlayerRepository(session).upsert_profile(
             player_id=player_id,
+            player_uid=player_uid,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
@@ -227,6 +231,7 @@ class DatabaseService:
         session: AsyncSession,
         player_id: str,
         added_by_user_id: int,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -250,6 +255,7 @@ class DatabaseService:
         player = await RegisteredPlayerRepository(session).add_or_update(
             player_id=player_id,
             added_by_user_id=added_by_user_id,
+            player_uid=player_uid,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
@@ -331,6 +337,7 @@ class DatabaseService:
     async def update_registered_player_metadata(
         session: AsyncSession,
         player_id: str,
+        player_uid: Optional[str] = None,
         player_name: Optional[str] = None,
         kingdom: Optional[str] = None,
         castle_level: Optional[str] = None,
@@ -339,6 +346,7 @@ class DatabaseService:
         """Update metadata for a player, creating a disabled profile if user context is provided."""
         return await RegisteredPlayerRepository(session).sync_metadata(
             player_id=player_id,
+            player_uid=player_uid,
             player_name=player_name,
             kingdom=kingdom,
             castle_level=castle_level,
