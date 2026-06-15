@@ -37,13 +37,13 @@ class GuildConfigView(discord.ui.View):
         self._sync_voice_button(guild_config.use_voice_replies)
         self._sync_random_replies_button(guild_config.use_random_replies)
         voice_status = "Enabled" if guild_config.use_voice_replies else "Disabled"
-        random_replies_status = "Enabled" if guild_config.use_random_replies else "Disabled"
+        ai_replies_status = "Enabled" if guild_config.use_random_replies else "Disabled"
         return build_status_embed(
             title="Bot Configuration",
             description=(
                 f"Server: **{self._guild_name}**\n"
                 f"Voice replies: **{voice_status}**\n"
-                f"AI random replies: **{random_replies_status}**\n"
+                f"AI replies: **{ai_replies_status}**\n"
                 "Use the buttons below to update guild-wide bot behavior."
             ),
             color=EmbedColors.NEUTRAL,

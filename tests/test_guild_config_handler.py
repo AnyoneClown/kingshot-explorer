@@ -93,9 +93,9 @@ def test_guild_config_view_builds_embed_with_default_off_statuses():
 
     assert embed.title == "Bot Configuration"
     assert "Voice replies" in embed.description
-    assert "AI random replies" in embed.description
+    assert "AI replies" in embed.description
     assert "Voice replies: **Disabled**" in embed.description
-    assert "AI random replies: **Disabled**" in embed.description
+    assert "AI replies: **Disabled**" in embed.description
 
 
 def test_toggle_voice_button_updates_config_and_message():
@@ -129,7 +129,7 @@ def test_toggle_random_replies_button_updates_config_and_message():
     assert service.random_reply_updates == [True]
     assert interaction.response.deferred == (False, False)
     assert interaction.edited_original_embed.title == "Bot Configuration"
-    assert "AI random replies: **Enabled**" in interaction.edited_original_embed.description
+    assert "AI replies: **Enabled**" in interaction.edited_original_embed.description
 
 
 def test_interaction_check_rejects_other_users():

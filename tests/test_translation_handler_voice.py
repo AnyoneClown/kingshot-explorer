@@ -153,7 +153,7 @@ def test_direct_reply_detection_fetches_unresolved_reference():
     assert asyncio.run(handler._is_direct_mention_or_reply(message)) is True
 
 
-def test_random_replies_can_be_disabled_per_guild_without_blocking_direct_triggers():
+def test_ai_replies_can_be_disabled_per_guild_including_direct_triggers():
     handler = TranslationHandler(
         translation_service=FakeTranslationService(),
         chatbot_service=FakeChatbotService(),
@@ -174,4 +174,4 @@ def test_random_replies_can_be_disabled_per_guild_without_blocking_direct_trigge
     )
 
     assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=False)) is False
-    assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=True)) is True
+    assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=True)) is False

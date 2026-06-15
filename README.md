@@ -120,7 +120,7 @@ main.py      Application entrypoint
 
 - OCR functionality has been removed from this project.
 - Keep AUTO_REDEEM_CHANNELS empty if you do not want announcement messages.
-- The bot will always answer when directly mentioned or replied to, and `/configure` can turn random AI replies on or off for a server.
+- `/configure` can turn contextual AI replies on or off for a server, including direct mentions/replies and random chat replies.
 - Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
 
 ## License

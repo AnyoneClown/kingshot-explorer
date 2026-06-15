@@ -511,13 +511,15 @@ class TranslationHandler:
         if direct_trigger is None:
             direct_trigger = self._has_direct_mention_or_resolved_reply(message)
 
+        guild_id = message.guild.id if message.guild else None
+        default_enabled = True if direct_trigger else bool(getattr(self._config, "random_reply_chance", 0) > 0)
+        if not await self._ai_replies_enabled_for_guild(guild_id, default_enabled=default_enabled):
+            return False
+
         if direct_trigger:
             return True
 
         if not self._config:
-            return False
-
-        if not await self._random_replies_enabled_for_guild(message.guild.id if message.guild else None):
             return False
 
         if self._config.random_reply_chance <= 0:
@@ -533,8 +535,7 @@ class TranslationHandler:
 
         return random.random() < self._config.random_reply_chance
 
-    async def _random_replies_enabled_for_guild(self, guild_id: int | None) -> bool:
-        default_enabled = bool(getattr(self._config, "random_reply_chance", 0) > 0)
+    async def _ai_replies_enabled_for_guild(self, guild_id: int | None, *, default_enabled: bool) -> bool:
         if guild_id is None:
             return default_enabled
 
@@ -545,7 +546,7 @@ class TranslationHandler:
                     return bool(guild_config.use_random_replies)
             except Exception as exc:
                 logger.error(
-                    "Guild configuration lookup failed for random replies in guild %s: %s",
+                    "Guild configuration lookup failed for AI replies in guild %s: %s",
                     guild_id,
                     exc,
                     exc_info=True,
