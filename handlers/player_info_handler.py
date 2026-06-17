@@ -20,6 +20,10 @@ class PlayerInfoHandler:
     """Handles player info Discord commands."""
 
     HERO_IMAGE_DIR = Path(__file__).resolve().parents[1] / "images" / "heroes"
+    HERO_GEAR_IMAGE_DIR = Path(__file__).resolve().parents[1] / "images" / "exclusive_weapons"
+    ARENA_HERO_MAX_WIDTH = 76
+    ARENA_HERO_MAX_HEIGHT = 134
+    ARENA_GEAR_ICON_SIZE = 56
     SCOUT_BOARD_TYPE_POWER = 8
     SCOUT_DEFAULT_LIMIT = 5
     SCOUT_MAX_LIMIT = 15
@@ -154,9 +158,9 @@ class PlayerInfoHandler:
             )
             embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
 
-            hero_file = await self._get_arena_hero_strip(player_data, ks_data)
+            hero_file = await self._get_arena_loadout_image(player_data, ks_data)
             if hero_file:
-                embed.set_image(url="attachment://arena_heroes.png")
+                embed.set_image(url="attachment://arena_loadout.png")
                 await interaction.followup.send(embed=embed, file=hero_file)
             else:
                 await interaction.followup.send(embed=embed)
@@ -332,7 +336,7 @@ class PlayerInfoHandler:
             return data
         return None
 
-    async def _get_arena_hero_strip(
+    async def _get_arena_loadout_image(
         self,
         player_data: dict[str, Any],
         ks_data: dict[str, Any] | None,
@@ -357,8 +361,8 @@ class PlayerInfoHandler:
         if not isinstance(arena_data, dict) or not isinstance(arena_data.get("heroes"), list):
             return None
 
-        image_paths = []
-        for hero in arena_data["heroes"]:
+        loadouts = []
+        for hero in sorted(arena_data["heroes"], key=self._arena_hero_sort_key):
             if not isinstance(hero, dict):
                 continue
 
@@ -371,38 +375,347 @@ class PlayerInfoHandler:
                 logger.warning("Arena hero image missing for hero id %s at %s", hero_id, image_path)
                 continue
 
-            image_paths.append(image_path)
+            loadouts.append(
+                {
+                    "hero_path": image_path,
+                    "gear_items": self._extract_hero_gear_items(hero),
+                }
+            )
 
-        if not image_paths:
+        if not loadouts:
             return None
 
         try:
-            strip_png = self._build_hero_strip_png(image_paths)
+            strip_png = self._build_hero_loadout_png(loadouts)
         except Exception as exc:
-            logger.warning("Failed to build arena hero image strip: %s", exc, exc_info=True)
+            logger.warning("Failed to build arena hero loadout image: %s", exc, exc_info=True)
             return None
 
-        return discord.File(BytesIO(strip_png), filename="arena_heroes.png")
+        return discord.File(BytesIO(strip_png), filename="arena_loadout.png")
+
+    @staticmethod
+    def _arena_hero_sort_key(hero: Any) -> tuple[int, int]:
+        if not isinstance(hero, dict):
+            return (999, 0)
+        try:
+            slot = int(hero.get("slot") or hero.get("pos") or 999)
+        except (TypeError, ValueError):
+            slot = 999
+        try:
+            hero_id = int(hero.get("id") or 0)
+        except (TypeError, ValueError):
+            hero_id = 0
+        return (slot, hero_id)
+
+    def _extract_hero_gear_items(self, hero: dict[str, Any]) -> list[dict[str, Any]]:
+        equipment = hero.get("equipment")
+        if not isinstance(equipment, list):
+            return []
+
+        gear_items = []
+        for item in sorted((item for item in equipment if isinstance(item, dict)), key=self._equipment_sort_key):
+            eid = item.get("eid")
+            if eid in (None, ""):
+                continue
+
+            image_path = self.HERO_GEAR_IMAGE_DIR / f"{eid}.png"
+            if not image_path.is_file():
+                logger.warning("Arena gear image missing for equipment id %s at %s", eid, image_path)
+                continue
+
+            gear_items.append(
+                {
+                    "path": image_path,
+                    "slv": self._coerce_level(item.get("slv")),
+                    "rlv": self._coerce_level(item.get("rlv")),
+                }
+            )
+
+        return gear_items[:4]
+
+    @staticmethod
+    def _coerce_level(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _equipment_sort_key(item: dict[str, Any]) -> tuple[int, int]:
+        try:
+            sid = int(item.get("sid") or 999)
+        except (TypeError, ValueError):
+            sid = 999
+        try:
+            eid = int(item.get("eid") or 0)
+        except (TypeError, ValueError):
+            eid = 0
+        return (sid, eid)
 
     @classmethod
-    def _build_hero_strip_png(cls, image_paths: list[Path]) -> bytes:
-        images = [cls._read_rgba_png(path) for path in image_paths]
-        spacing = 10
-        width = sum(image["width"] for image in images) + spacing * (len(images) - 1)
-        height = max(image["height"] for image in images)
+    def _build_hero_loadout_png(cls, loadouts: list[dict[str, Any]]) -> bytes:
+        hero_images = [
+            cls._resize_rgba_fit(
+                cls._read_rgba_png(loadout["hero_path"]),
+                cls.ARENA_HERO_MAX_WIDTH,
+                cls.ARENA_HERO_MAX_HEIGHT,
+            )
+            for loadout in loadouts
+        ]
+        gear_images = [
+            [
+                cls._annotate_gear_image(
+                    cls._resize_rgba_nearest(
+                        cls._read_rgba_png(item["path"]),
+                        cls.ARENA_GEAR_ICON_SIZE,
+                        cls.ARENA_GEAR_ICON_SIZE,
+                    ),
+                    item["slv"],
+                    item["rlv"],
+                )
+                for item in loadout["gear_items"]
+            ]
+            for loadout in loadouts
+        ]
+
+        column_spacing = 10
+        gear_spacing = 5
+        gear_top_gap = 8
+        max_hero_height = max(image["height"] for image in hero_images)
+        column_widths = []
+        for hero_image, hero_gears in zip(hero_images, gear_images, strict=True):
+            gear_width = 0
+            if hero_gears:
+                gear_columns = min(2, len(hero_gears))
+                gear_width = gear_columns * cls.ARENA_GEAR_ICON_SIZE + gear_spacing * (gear_columns - 1)
+            column_widths.append(max(hero_image["width"], gear_width))
+
+        width = sum(column_widths) + column_spacing * (len(column_widths) - 1)
+        has_gear = any(gear_images)
+        max_gear_rows = max(((len(gears) + 1) // 2 for gears in gear_images), default=0)
+        gear_grid_height = (
+            max_gear_rows * cls.ARENA_GEAR_ICON_SIZE + gear_spacing * (max_gear_rows - 1)
+            if max_gear_rows
+            else 0
+        )
+        height = max_hero_height + (gear_top_gap + gear_grid_height if has_gear else 0)
         canvas = bytearray(width * height * 4)
 
         offset_x = 0
-        for image in images:
-            top = (height - image["height"]) // 2
-            for row_index in range(image["height"]):
-                src_start = row_index * image["width"] * 4
-                src_end = src_start + image["width"] * 4
-                dst_start = ((top + row_index) * width + offset_x) * 4
-                canvas[dst_start : dst_start + image["width"] * 4] = image["pixels"][src_start:src_end]
-            offset_x += image["width"] + spacing
+        for column_width, hero_image, hero_gears in zip(column_widths, hero_images, gear_images, strict=True):
+            hero_left = offset_x + (column_width - hero_image["width"]) // 2
+            cls._paste_rgba(canvas, width, hero_image, hero_left, 0)
+
+            if hero_gears:
+                gear_columns = min(2, len(hero_gears))
+                gear_width = gear_columns * cls.ARENA_GEAR_ICON_SIZE + gear_spacing * (gear_columns - 1)
+                gear_left = offset_x + (column_width - gear_width) // 2
+                gear_top = max_hero_height + gear_top_gap
+                for index, gear_image in enumerate(hero_gears):
+                    column = index % gear_columns
+                    row = index // gear_columns
+                    left = gear_left + column * (cls.ARENA_GEAR_ICON_SIZE + gear_spacing)
+                    top = gear_top + row * (cls.ARENA_GEAR_ICON_SIZE + gear_spacing)
+                    cls._paste_rgba(canvas, width, gear_image, left, top)
+
+            offset_x += column_width + column_spacing
 
         return cls._write_rgba_png(width, height, bytes(canvas))
+
+    @staticmethod
+    def _paste_rgba(canvas: bytearray, canvas_width: int, image: dict[str, Any], left: int, top: int) -> None:
+        for row_index in range(image["height"]):
+            src_start = row_index * image["width"] * 4
+            src_end = src_start + image["width"] * 4
+            dst_start = ((top + row_index) * canvas_width + left) * 4
+            canvas[dst_start : dst_start + image["width"] * 4] = image["pixels"][src_start:src_end]
+
+    @staticmethod
+    def _resize_rgba_nearest(image: dict[str, Any], width: int, height: int) -> dict[str, Any]:
+        source_width = image["width"]
+        source_height = image["height"]
+        source_pixels = image["pixels"]
+        resized = bytearray(width * height * 4)
+
+        for y in range(height):
+            source_y = min(source_height - 1, y * source_height // height)
+            for x in range(width):
+                source_x = min(source_width - 1, x * source_width // width)
+                src = (source_y * source_width + source_x) * 4
+                dst = (y * width + x) * 4
+                resized[dst : dst + 4] = source_pixels[src : src + 4]
+
+        return {"width": width, "height": height, "pixels": bytes(resized)}
+
+    @classmethod
+    def _annotate_gear_image(cls, image: dict[str, Any], slv: int, rlv: int) -> dict[str, Any]:
+        annotated = {
+            "width": image["width"],
+            "height": image["height"],
+            "pixels": bytearray(image["pixels"]),
+        }
+        if slv > 100:
+            cls._tint_visible_pixels(annotated, (180, 24, 32, 255), opacity=0.42)
+        general_text, general_background, general_foreground = cls._format_general_gear_level(slv)
+        cls._draw_badge(annotated, 1, 1, general_text, general_background, general_foreground)
+        mystery_text = f"LV{rlv}"
+        mystery_width, mystery_height = cls._badge_size(mystery_text)
+        cls._draw_badge(
+            annotated,
+            annotated["width"] - mystery_width - 1,
+            annotated["height"] - mystery_height - 1,
+            mystery_text,
+            (62, 38, 86, 230),
+            (232, 214, 255, 255),
+        )
+        annotated["pixels"] = bytes(annotated["pixels"])
+        return annotated
+
+    @staticmethod
+    def _format_general_gear_level(slv: int) -> tuple[str, tuple[int, int, int, int], tuple[int, int, int, int]]:
+        if slv > 100:
+            return f"+{slv - 100}", (115, 28, 34, 235), (255, 235, 220, 255)
+        return f"+{slv}", (35, 39, 52, 230), (255, 236, 160, 255)
+
+    @staticmethod
+    def _tint_visible_pixels(image: dict[str, Any], color: tuple[int, int, int, int], *, opacity: float) -> None:
+        pixels = image["pixels"]
+        tint_r, tint_g, tint_b, _ = color
+        opacity = max(0.0, min(1.0, opacity))
+        for offset in range(0, len(pixels), 4):
+            alpha = pixels[offset + 3]
+            if alpha == 0:
+                continue
+            pixels[offset] = round(pixels[offset] * (1 - opacity) + tint_r * opacity)
+            pixels[offset + 1] = round(pixels[offset + 1] * (1 - opacity) + tint_g * opacity)
+            pixels[offset + 2] = round(pixels[offset + 2] * (1 - opacity) + tint_b * opacity)
+
+    @classmethod
+    def _draw_badge(
+        cls,
+        image: dict[str, Any],
+        x: int,
+        y: int,
+        text: str,
+        background: tuple[int, int, int, int],
+        foreground: tuple[int, int, int, int],
+    ) -> None:
+        width, height = cls._badge_size(text)
+        cls._draw_rect(image, x, y, width, height, background)
+        cls._draw_text(image, x + 2, y + 1, text, foreground, scale=3)
+
+    @classmethod
+    def _badge_size(cls, text: str) -> tuple[int, int]:
+        scale = 3
+        padding_x = 2
+        padding_y = 1
+        return (
+            cls._text_width(text, scale=scale) + padding_x * 2,
+            cls._text_height(scale=scale) + padding_y * 2,
+        )
+
+    @staticmethod
+    def _draw_rect(image: dict[str, Any], x: int, y: int, width: int, height: int, color: tuple[int, int, int, int]) -> None:
+        pixels = image["pixels"]
+        image_width = image["width"]
+        image_height = image["height"]
+        for yy in range(max(0, y), min(image_height, y + height)):
+            for xx in range(max(0, x), min(image_width, x + width)):
+                offset = (yy * image_width + xx) * 4
+                PlayerInfoHandler._blend_pixel(pixels, offset, color)
+
+    @staticmethod
+    def _draw_text(
+        image: dict[str, Any],
+        x: int,
+        y: int,
+        text: str,
+        color: tuple[int, int, int, int],
+        *,
+        scale: int = 1,
+    ) -> None:
+        cursor = x
+        for char in text.upper():
+            glyph = PlayerInfoHandler._glyph(char)
+            if glyph is None:
+                cursor += 2 * scale
+                continue
+            for row_index, row in enumerate(glyph):
+                for column_index, enabled in enumerate(row):
+                    if not enabled:
+                        continue
+                    PlayerInfoHandler._draw_rect(
+                        image,
+                        cursor + column_index * scale,
+                        y + row_index * scale,
+                        scale,
+                        scale,
+                        color,
+                    )
+            cursor += (len(glyph[0]) + 1) * scale
+
+    @staticmethod
+    def _text_width(text: str, *, scale: int) -> int:
+        width = 0
+        for char in text.upper():
+            glyph = PlayerInfoHandler._glyph(char)
+            width += ((len(glyph[0]) if glyph else 1) + 1) * scale
+        return max(0, width - scale)
+
+    @staticmethod
+    def _text_height(*, scale: int) -> int:
+        return 5 * scale
+
+    @staticmethod
+    def _glyph(char: str) -> tuple[tuple[int, ...], ...] | None:
+        glyphs = {
+            "0": ((1, 1, 1), (1, 0, 1), (1, 0, 1), (1, 0, 1), (1, 1, 1)),
+            "1": ((0, 1, 0), (1, 1, 0), (0, 1, 0), (0, 1, 0), (1, 1, 1)),
+            "2": ((1, 1, 1), (0, 0, 1), (1, 1, 1), (1, 0, 0), (1, 1, 1)),
+            "3": ((1, 1, 1), (0, 0, 1), (0, 1, 1), (0, 0, 1), (1, 1, 1)),
+            "4": ((1, 0, 1), (1, 0, 1), (1, 1, 1), (0, 0, 1), (0, 0, 1)),
+            "5": ((1, 1, 1), (1, 0, 0), (1, 1, 1), (0, 0, 1), (1, 1, 1)),
+            "6": ((1, 1, 1), (1, 0, 0), (1, 1, 1), (1, 0, 1), (1, 1, 1)),
+            "7": ((1, 1, 1), (0, 0, 1), (0, 1, 0), (0, 1, 0), (0, 1, 0)),
+            "8": ((1, 1, 1), (1, 0, 1), (1, 1, 1), (1, 0, 1), (1, 1, 1)),
+            "9": ((1, 1, 1), (1, 0, 1), (1, 1, 1), (0, 0, 1), (1, 1, 1)),
+            "L": ((1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 1, 1)),
+            "M": ((1, 0, 1), (1, 1, 1), (1, 1, 1), (1, 0, 1), (1, 0, 1)),
+            "V": ((1, 0, 1), (1, 0, 1), (1, 0, 1), (1, 0, 1), (0, 1, 0)),
+            "+": ((0, 0, 0), (0, 1, 0), (1, 1, 1), (0, 1, 0), (0, 0, 0)),
+        }
+        return glyphs.get(char)
+
+    @staticmethod
+    def _blend_pixel(pixels: bytearray, offset: int, color: tuple[int, int, int, int]) -> None:
+        src_r, src_g, src_b, src_a = color
+        if src_a == 255:
+            pixels[offset : offset + 4] = bytes(color)
+            return
+
+        dst_r, dst_g, dst_b, dst_a = pixels[offset : offset + 4]
+        alpha = src_a / 255
+        inv_alpha = 1 - alpha
+        out_a = src_a + dst_a * inv_alpha
+        if out_a <= 0:
+            pixels[offset : offset + 4] = b"\x00\x00\x00\x00"
+            return
+
+        pixels[offset] = round((src_r * src_a + dst_r * dst_a * inv_alpha) / out_a)
+        pixels[offset + 1] = round((src_g * src_a + dst_g * dst_a * inv_alpha) / out_a)
+        pixels[offset + 2] = round((src_b * src_a + dst_b * dst_a * inv_alpha) / out_a)
+        pixels[offset + 3] = round(out_a)
+
+    @classmethod
+    def _resize_rgba_fit(cls, image: dict[str, Any], max_width: int, max_height: int) -> dict[str, Any]:
+        source_width = image["width"]
+        source_height = image["height"]
+        scale = min(max_width / source_width, max_height / source_height, 1)
+        width = max(1, round(source_width * scale))
+        height = max(1, round(source_height * scale))
+        if width == source_width and height == source_height:
+            return image
+        return cls._resize_rgba_nearest(image, width, height)
 
     @staticmethod
     def _read_rgba_png(path: Path) -> dict[str, Any]:

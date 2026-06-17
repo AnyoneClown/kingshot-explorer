@@ -136,16 +136,35 @@ def test_build_scout_player_embed_matches_stats_style():
     assert "Player details" in fields["Links"]
 
 
-def test_get_arena_hero_strip_uses_local_hero_ids(tmp_path):
-    (tmp_path / "50024.png").write_bytes(PlayerInfoHandler._write_rgba_png(1, 1, bytes([255, 0, 0, 255])))
-    (tmp_path / "50021.png").write_bytes(PlayerInfoHandler._write_rgba_png(1, 1, bytes([0, 255, 0, 255])))
+def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):
+    hero_dir = tmp_path / "heroes"
+    gear_dir = tmp_path / "gear"
+    hero_dir.mkdir()
+    gear_dir.mkdir()
+    (hero_dir / "50024.png").write_bytes(PlayerInfoHandler._write_rgba_png(1, 1, bytes([255, 0, 0, 255])))
+    (hero_dir / "50021.png").write_bytes(PlayerInfoHandler._write_rgba_png(1, 1, bytes([0, 255, 0, 255])))
+    (gear_dir / "1011501.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([0, 0, 255, 255] * 4)))
+    (gear_dir / "1021501.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([255, 255, 0, 255] * 4)))
+    (gear_dir / "1031501.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([255, 0, 255, 255] * 4)))
     service = FakeKingshotDataService(
         {
             "success": True,
             "data": {
                 "heroes": [
-                    {"id": 50024},
-                    {"id": 50021},
+                    {
+                        "slot": 2,
+                        "id": 50021,
+                        "equipment": [{"sid": 3, "eid": 1031501, "slv": 20, "rlv": 0}],
+                    },
+                    {
+                        "slot": 1,
+                        "id": 50024,
+                        "equipment": [
+                            {"sid": 2, "eid": 1021501, "slv": 70, "rlv": 3},
+                            {"sid": 1, "eid": 1011501, "slv": 100, "rlv": 8},
+                            {"sid": 3, "eid": 1031501, "slv": 61},
+                        ],
+                    },
                     {"id": 99999},
                     "bad-row",
                 ]
@@ -159,17 +178,41 @@ def test_get_arena_hero_strip_uses_local_hero_ids(tmp_path):
         kingshot_data_service=service,
     )
     original_dir = PlayerInfoHandler.HERO_IMAGE_DIR
-    PlayerInfoHandler.HERO_IMAGE_DIR = tmp_path
+    original_gear_dir = PlayerInfoHandler.HERO_GEAR_IMAGE_DIR
+    PlayerInfoHandler.HERO_IMAGE_DIR = hero_dir
+    PlayerInfoHandler.HERO_GEAR_IMAGE_DIR = gear_dir
     try:
-        file = asyncio.run(handler._get_arena_hero_strip({"playerUid": "30669644"}, None))
+        file = asyncio.run(handler._get_arena_loadout_image({"playerUid": "30669644"}, None))
     finally:
         PlayerInfoHandler.HERO_IMAGE_DIR = original_dir
+        PlayerInfoHandler.HERO_GEAR_IMAGE_DIR = original_gear_dir
 
     assert service.arena_uids == ["30669644"]
-    assert file.filename == "arena_heroes.png"
+    assert file.filename == "arena_loadout.png"
     file.fp.seek(0)
     strip_path = tmp_path / "strip.png"
     strip_path.write_bytes(file.fp.read())
     strip = PlayerInfoHandler._read_rgba_png(strip_path)
-    assert strip["width"] == 12
-    assert strip["height"] == 1
+    assert strip["width"] == 183
+    assert strip["height"] == 126
+
+
+def test_format_general_gear_level_wraps_red_levels():
+    normal_text, normal_background, normal_foreground = PlayerInfoHandler._format_general_gear_level(100)
+    red_text, red_background, red_foreground = PlayerInfoHandler._format_general_gear_level(120)
+
+    assert normal_text == "+100"
+    assert red_text == "+20"
+    assert red_background != normal_background
+    assert red_foreground != normal_foreground
+
+
+def test_annotate_gear_image_tints_red_stage_gear():
+    image = {"width": 40, "height": 40, "pixels": bytes([100, 100, 100, 255] * 40 * 40)}
+
+    normal = PlayerInfoHandler._annotate_gear_image(image, 100, 0)
+    red = PlayerInfoHandler._annotate_gear_image(image, 120, 0)
+    sample_offset = ((20 * 40) + 20) * 4
+
+    assert red["pixels"][sample_offset] > normal["pixels"][sample_offset]
+    assert red["pixels"][sample_offset + 1] < normal["pixels"][sample_offset + 1]
