@@ -1,4 +1,5 @@
 import importlib.util
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -14,6 +15,7 @@ def load_player_info_handler():
             self.color = color
             self.fields = []
             self.footer = None
+            self.image_url = None
 
         def add_field(self, name, value, inline=True):
             self.fields.append({"name": name, "value": value, "inline": inline})
@@ -21,9 +23,13 @@ def load_player_info_handler():
         def set_footer(self, text):
             self.footer = text
 
+        def set_image(self, url):
+            self.image_url = url
+
     discord_module = types.ModuleType("discord")
     discord_module.Interaction = object
     discord_module.Embed = FakeEmbed
+    discord_module.File = lambda fp, filename=None: types.SimpleNamespace(fp=fp, filename=filename)
     discord_module.Color = types.SimpleNamespace(blue=lambda: "blue")
     discord_module.app_commands = types.SimpleNamespace(describe=lambda **_: lambda func: func)
     stub_modules["discord"] = discord_module
@@ -67,6 +73,16 @@ def load_player_info_handler():
 
 
 PlayerInfoHandler = load_player_info_handler()
+
+
+class FakeKingshotDataService:
+    def __init__(self, arena_result):
+        self.arena_result = arena_result
+        self.arena_uids = []
+
+    async def get_arena(self, uid):
+        self.arena_uids.append(uid)
+        return self.arena_result
 
 
 def test_extract_leaderboard_entries_from_api_payload():
@@ -118,3 +134,42 @@ def test_build_scout_player_embed_matches_stats_style():
     assert fields["VIP Level"] == "Hidden"
     assert fields["Alliance"] == "`[FKA]` FateKillsAll (`83900009`)"
     assert "Player details" in fields["Links"]
+
+
+def test_get_arena_hero_strip_uses_local_hero_ids(tmp_path):
+    (tmp_path / "50024.png").write_bytes(PlayerInfoHandler._write_rgba_png(1, 1, bytes([255, 0, 0, 255])))
+    (tmp_path / "50021.png").write_bytes(PlayerInfoHandler._write_rgba_png(1, 1, bytes([0, 255, 0, 255])))
+    service = FakeKingshotDataService(
+        {
+            "success": True,
+            "data": {
+                "heroes": [
+                    {"id": 50024},
+                    {"id": 50021},
+                    {"id": 99999},
+                    "bad-row",
+                ]
+            },
+        }
+    )
+    handler = PlayerInfoHandler(
+        player_info_service=object(),
+        bot=object(),
+        interaction_tracking_service=object(),
+        kingshot_data_service=service,
+    )
+    original_dir = PlayerInfoHandler.HERO_IMAGE_DIR
+    PlayerInfoHandler.HERO_IMAGE_DIR = tmp_path
+    try:
+        file = asyncio.run(handler._get_arena_hero_strip({"playerUid": "30669644"}, None))
+    finally:
+        PlayerInfoHandler.HERO_IMAGE_DIR = original_dir
+
+    assert service.arena_uids == ["30669644"]
+    assert file.filename == "arena_heroes.png"
+    file.fp.seek(0)
+    strip_path = tmp_path / "strip.png"
+    strip_path.write_bytes(file.fp.read())
+    strip = PlayerInfoHandler._read_rgba_png(strip_path)
+    assert strip["width"] == 12
+    assert strip["height"] == 1

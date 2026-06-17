@@ -1,4 +1,8 @@
 import logging
+import struct
+import zlib
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import discord
@@ -15,6 +19,7 @@ logger = logging.getLogger(__name__)
 class PlayerInfoHandler:
     """Handles player info Discord commands."""
 
+    HERO_IMAGE_DIR = Path(__file__).resolve().parents[1] / "images" / "heroes"
     SCOUT_BOARD_TYPE_POWER = 8
     SCOUT_DEFAULT_LIMIT = 5
     SCOUT_MAX_LIMIT = 15
@@ -149,7 +154,12 @@ class PlayerInfoHandler:
             )
             embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
 
-            await interaction.followup.send(embed=embed)
+            hero_file = await self._get_arena_hero_strip(player_data, ks_data)
+            if hero_file:
+                embed.set_image(url="attachment://arena_heroes.png")
+                await interaction.followup.send(embed=embed, file=hero_file)
+            else:
+                await interaction.followup.send(embed=embed)
             logger.info(f"Successfully displayed stats for {player_name} (ID: {player_id}) to {user_info}")
 
             try:
@@ -320,6 +330,202 @@ class PlayerInfoHandler:
         data = result.get("data")
         if isinstance(data, dict) and not data.get("error"):
             return data
+        return None
+
+    async def _get_arena_hero_strip(
+        self,
+        player_data: dict[str, Any],
+        ks_data: dict[str, Any] | None,
+    ) -> Any | None:
+        if self._kingshot_data_service is None:
+            return None
+
+        uid = self._extract_player_uid(player_data, ks_data)
+        if uid is None:
+            return None
+
+        result = await self._kingshot_data_service.get_arena(uid)
+        if not result.get("success"):
+            logger.warning(
+                "KingShot arena enrichment failed for uid %s: %s",
+                uid,
+                result.get("error_message") or result.get("error_code"),
+            )
+            return None
+
+        arena_data = result.get("data")
+        if not isinstance(arena_data, dict) or not isinstance(arena_data.get("heroes"), list):
+            return None
+
+        image_paths = []
+        for hero in arena_data["heroes"]:
+            if not isinstance(hero, dict):
+                continue
+
+            hero_id = hero.get("id")
+            if hero_id in (None, ""):
+                continue
+
+            image_path = self.HERO_IMAGE_DIR / f"{hero_id}.png"
+            if not image_path.is_file():
+                logger.warning("Arena hero image missing for hero id %s at %s", hero_id, image_path)
+                continue
+
+            image_paths.append(image_path)
+
+        if not image_paths:
+            return None
+
+        try:
+            strip_png = self._build_hero_strip_png(image_paths)
+        except Exception as exc:
+            logger.warning("Failed to build arena hero image strip: %s", exc, exc_info=True)
+            return None
+
+        return discord.File(BytesIO(strip_png), filename="arena_heroes.png")
+
+    @classmethod
+    def _build_hero_strip_png(cls, image_paths: list[Path]) -> bytes:
+        images = [cls._read_rgba_png(path) for path in image_paths]
+        spacing = 10
+        width = sum(image["width"] for image in images) + spacing * (len(images) - 1)
+        height = max(image["height"] for image in images)
+        canvas = bytearray(width * height * 4)
+
+        offset_x = 0
+        for image in images:
+            top = (height - image["height"]) // 2
+            for row_index in range(image["height"]):
+                src_start = row_index * image["width"] * 4
+                src_end = src_start + image["width"] * 4
+                dst_start = ((top + row_index) * width + offset_x) * 4
+                canvas[dst_start : dst_start + image["width"] * 4] = image["pixels"][src_start:src_end]
+            offset_x += image["width"] + spacing
+
+        return cls._write_rgba_png(width, height, bytes(canvas))
+
+    @staticmethod
+    def _read_rgba_png(path: Path) -> dict[str, Any]:
+        data = path.read_bytes()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            raise ValueError(f"{path} is not a PNG")
+
+        pos = 8
+        width = height = None
+        idat = bytearray()
+        while pos < len(data):
+            length = struct.unpack(">I", data[pos : pos + 4])[0]
+            chunk_type = data[pos + 4 : pos + 8]
+            chunk_data = data[pos + 8 : pos + 8 + length]
+            pos += 12 + length
+
+            if chunk_type == b"IHDR":
+                width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(
+                    ">IIBBBBB",
+                    chunk_data,
+                )
+                if (bit_depth, color_type, compression, filter_method, interlace) != (8, 6, 0, 0, 0):
+                    raise ValueError(f"{path} must be non-interlaced 8-bit RGBA PNG")
+            elif chunk_type == b"IDAT":
+                idat.extend(chunk_data)
+            elif chunk_type == b"IEND":
+                break
+
+        if width is None or height is None:
+            raise ValueError(f"{path} is missing IHDR")
+
+        raw = zlib.decompress(bytes(idat))
+        stride = width * 4
+        pixels = bytearray()
+        previous = bytearray(stride)
+        source = 0
+
+        for _ in range(height):
+            filter_type = raw[source]
+            source += 1
+            row = bytearray(raw[source : source + stride])
+            source += stride
+            PlayerInfoHandler._unfilter_png_row(row, previous, filter_type, 4)
+            pixels.extend(row)
+            previous = row
+
+        return {"width": width, "height": height, "pixels": bytes(pixels)}
+
+    @staticmethod
+    def _unfilter_png_row(row: bytearray, previous: bytearray, filter_type: int, bytes_per_pixel: int) -> None:
+        if filter_type == 0:
+            return
+        if filter_type == 1:
+            for index in range(len(row)):
+                left = row[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                row[index] = (row[index] + left) & 0xFF
+            return
+        if filter_type == 2:
+            for index in range(len(row)):
+                row[index] = (row[index] + previous[index]) & 0xFF
+            return
+        if filter_type == 3:
+            for index in range(len(row)):
+                left = row[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                up = previous[index]
+                row[index] = (row[index] + ((left + up) // 2)) & 0xFF
+            return
+        if filter_type == 4:
+            for index in range(len(row)):
+                left = row[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                up = previous[index]
+                up_left = previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                row[index] = (row[index] + PlayerInfoHandler._paeth_predictor(left, up, up_left)) & 0xFF
+            return
+        raise ValueError(f"Unsupported PNG filter type {filter_type}")
+
+    @staticmethod
+    def _paeth_predictor(left: int, up: int, up_left: int) -> int:
+        estimate = left + up - up_left
+        distance_left = abs(estimate - left)
+        distance_up = abs(estimate - up)
+        distance_up_left = abs(estimate - up_left)
+        if distance_left <= distance_up and distance_left <= distance_up_left:
+            return left
+        if distance_up <= distance_up_left:
+            return up
+        return up_left
+
+    @staticmethod
+    def _write_rgba_png(width: int, height: int, pixels: bytes) -> bytes:
+        raw = bytearray()
+        stride = width * 4
+        for row_index in range(height):
+            raw.append(0)
+            start = row_index * stride
+            raw.extend(pixels[start : start + stride])
+
+        def chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
+            checksum = zlib.crc32(chunk_type)
+            checksum = zlib.crc32(chunk_data, checksum)
+            return (
+                struct.pack(">I", len(chunk_data))
+                + chunk_type
+                + chunk_data
+                + struct.pack(">I", checksum & 0xFFFFFFFF)
+            )
+
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw)))
+            + chunk(b"IEND", b"")
+        )
+
+    @staticmethod
+    def _extract_player_uid(player_data: dict[str, Any], ks_data: dict[str, Any] | None) -> str | None:
+        for source in (ks_data, player_data):
+            if not isinstance(source, dict):
+                continue
+            for key in ("uid", "playerUid", "player_uid"):
+                value = source.get(key)
+                if value not in (None, ""):
+                    return str(value)
         return None
 
     @staticmethod
