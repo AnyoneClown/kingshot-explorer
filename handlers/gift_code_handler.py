@@ -1,6 +1,7 @@
 import asyncio
 import socket
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -98,6 +99,11 @@ class GiftCodeHandler:
     STATUS_INVALID_ID = "invalid_id"
     REDEEM_MAX_RETRIES = 2
     REDEEM_RETRY_DELAY_SECONDS = 1.0
+    REDEEM_RETRY_MAX_DELAY_SECONDS = 30.0
+    REDEEM_RATE_LIMIT_MAX_RETRIES = 15
+    REDEEM_RATE_LIMIT_DELAY_SECONDS = 8.0
+    REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS = 45.0
+    REDEEM_CONCURRENCY = 3
 
     def __init__(
         self,
@@ -290,66 +296,34 @@ class GiftCodeHandler:
                             f"Auto-redeeming code '{new_code}' for {len(registered_players)} players..."
                         )
 
-                        # Fetch already redeemed set specific to this code to minimize lookups
-                        already_redeemed = await self._gift_code_service.get_redeemed_players(None, new_code)
+                        results = await self._run_bulk_redemption(
+                            gift_code=new_code,
+                            registered_players=registered_players,
+                            actor_user_id=bot_user_id,
+                            guild_id=None,
+                            channel_id=None,
+                        )
 
-                        # Track results for this specific code
-                        success_count = 0
-                        already_redeemed_count = 0
-                        api_rejected_count = 0
-                        invalid_id_count = 0
-
-                        for player in registered_players:
-                            if player.player_id in already_redeemed:
-                                already_redeemed_count += 1
-                                continue
-
-                            try:
-                                player_id_int = int(player.player_id)
-
-                                # Add jitter to avoid rating limits
-                                await asyncio.sleep(1.0)
-
-                                result = await self._redeem_with_retries(
-                                    player_id_int=player_id_int,
-                                    gift_code=new_code,
-                                    player_id_for_logs=player.player_id,
-                                )
-
-                                # Track detailed status category
-                                status_category = self._categorize_redemption_status(result)
-                                if status_category == self.STATUS_SUCCESS:
-                                    success_count += 1
-                                elif status_category == self.STATUS_ALREADY_REDEEMED:
-                                    already_redeemed_count += 1
-                                elif status_category == self.STATUS_INVALID_ID:
-                                    invalid_id_count += 1
-                                else:
-                                    api_rejected_count += 1
-
-                                # We need a system bot user ID since there is no interaction context
-                                # We use the bot's user ID
-                                await self._sync_player_metadata_from_redemption_result(
-                                    player_id=player.player_id,
-                                    redemption_result=result,
-                                    added_by_user_id=bot_user_id,
-                                )
-
-                                await self._tracking_service.log_gift_code_redemption(
-                                    user_id=bot_user_id,
-                                    player_id=player.player_id,
-                                    gift_code=new_code,
-                                    success=result.get("success", False),
-                                    response_message=result.get("message"),
-                                    error_code=result.get("error_code"),
-                                )
-
-                            except ValueError:
-                                logger.error(f"Invalid player ID format during auto-redeem: {player.player_id}")
-                                invalid_id_count += 1
-                            except Exception as e:
-                                logger.error(f"Error auto-redeeming {new_code} for {player.player_id}: {e}")
-                                api_rejected_count += 1
+                        success_count = len(
+                            [result for result in results if result.get("status_category") == self.STATUS_SUCCESS]
+                        )
+                        already_redeemed_count = len(
+                            [
+                                result
+                                for result in results
+                                if result.get("status_category") == self.STATUS_ALREADY_REDEEMED
+                            ]
+                        )
+                        api_rejected_count = len(
+                            [
+                                result
+                                for result in results
+                                if result.get("status_category") == self.STATUS_API_REJECTED
+                            ]
+                        )
+                        invalid_id_count = len(
+                            [result for result in results if result.get("status_category") == self.STATUS_INVALID_ID]
+                        )
 
                         # Send Discord announcement if channels are configured
                         if self._config.auto_redeem_channels:
@@ -522,74 +496,13 @@ class GiftCodeHandler:
                 )
                 return
 
-            results = []
-            for player in registered_players:
-                try:
-                    player_id_int = int(player.player_id)
-
-                    # Add jitter/delay to prevent 429 Too Many Requests from bulk redemption
-                    if len(results) > 0:
-                        await asyncio.sleep(1.0)
-
-                    result = await self._redeem_with_retries(
-                        player_id_int=player_id_int,
-                        gift_code=gift_code,
-                        player_id_for_logs=player.player_id,
-                    )
-
-                    await self._sync_player_metadata_from_redemption_result(
-                        player_id=player.player_id,
-                        redemption_result=result,
-                        added_by_user_id=interaction.user.id,
-                    )
-
-                    # Log to database
-                    await self._tracking_service.log_gift_code_redemption(
-                        user_id=interaction.user.id,
-                        player_id=player.player_id,
-                        gift_code=gift_code,
-                        success=result.get("success", False),
-                        response_message=result.get("message"),
-                        error_code=result.get("error_code"),
-                        guild_id=interaction.guild.id if interaction.guild else None,
-                        channel_id=interaction.channel.id,
-                    )
-
-                    results.append(
-                        {
-                            "player_id": player.player_id,
-                            "player_name": (result.get("player_profile") or {}).get("name") or player.player_name,
-                            "success": result.get("success", False),
-                            "message": result.get("message", "Unknown error"),
-                            "error_code": result.get("error_code"),
-                            "already_redeemed": result.get("already_redeemed", False),
-                            "status_category": self._categorize_redemption_status(result),
-                        }
-                    )
-                except ValueError:
-                    logger.error(f"Invalid player ID format: {player.player_id}")
-                    results.append(
-                        {
-                            "player_id": player.player_id,
-                            "player_name": player.player_name,
-                            "success": False,
-                            "message": "Invalid player ID format",
-                            "error_code": "INVALID_ID",
-                            "status_category": self.STATUS_INVALID_ID,
-                        }
-                    )
-                except Exception as e:
-                    logger.error(f"Error redeeming for player {player.player_id}: {e}")
-                    results.append(
-                        {
-                            "player_id": player.player_id,
-                            "player_name": player.player_name,
-                            "success": False,
-                            "message": "Unexpected error occurred",
-                            "error_code": "UNKNOWN_ERROR",
-                            "status_category": self.STATUS_API_REJECTED,
-                        }
-                    )
+            results = await self._run_bulk_redemption(
+                gift_code=gift_code,
+                registered_players=registered_players,
+                actor_user_id=interaction.user.id,
+                guild_id=interaction.guild.id if interaction.guild else None,
+                channel_id=interaction.channel.id if interaction.channel else None,
+            )
 
             # Format and send results
             await self._send_redemption_results_slash(interaction, gift_code, results)
@@ -674,7 +587,8 @@ class GiftCodeHandler:
         embed.set_footer(
             text=(
                 f"🎮 Check in-game mail for successful claims • "
-                f"Retry policy: up to {self.REDEEM_MAX_RETRIES} retries for API-rejected failures"
+                f"Retry policy: {self.REDEEM_MAX_RETRIES} transient retries; "
+                f"{self.REDEEM_RATE_LIMIT_MAX_RETRIES} retries for 429"
             )
         )
 
@@ -704,28 +618,269 @@ class GiftCodeHandler:
 
         return self.STATUS_API_REJECTED
 
+    def _is_retryable_redemption_result(self, result: Dict) -> bool:
+        """Return whether a failed redemption looks transient enough to retry."""
+        if self._categorize_redemption_status(result) != self.STATUS_API_REJECTED:
+            return False
+
+        raw_code = result.get("error_code")
+        if raw_code is None and isinstance(result.get("error_details"), dict):
+            raw_code = result["error_details"].get("err_code")
+
+        code = str(raw_code or "").upper()
+        retryable_codes = {"API_ERROR", "UNEXPECTED_ERROR", "UNKNOWN_ERROR", "429", "500", "502", "503", "504"}
+        if code in retryable_codes:
+            return True
+
+        try:
+            numeric_code = int(code)
+            if numeric_code == 429 or numeric_code >= 500:
+                return True
+        except ValueError:
+            pass
+
+        message = str(result.get("message") or "").lower()
+        retryable_phrases = (
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "temporar",
+            "network",
+            "not login",
+            "http error 429",
+            "http error 5",
+            "max retries",
+        )
+        return any(phrase in message for phrase in retryable_phrases)
+
+    @staticmethod
+    def _is_rate_limited_redemption_result(result: Dict) -> bool:
+        """Return whether the upstream explicitly rate-limited this redemption."""
+        raw_code = result.get("error_code")
+        if raw_code is None and isinstance(result.get("error_details"), dict):
+            raw_code = result["error_details"].get("err_code")
+
+        code = str(raw_code or "").upper()
+        if code == "429":
+            return True
+
+        message = str(result.get("message") or "").lower()
+        return (
+            "429" in message
+            or "rate limit" in message
+            or "too many requests" in message
+        )
+
+    @staticmethod
+    def _already_redeemed_result(player: Any, gift_code: str) -> Dict[str, Any]:
+        return {
+            "player_id": str(player.player_id),
+            "player_name": player.player_name,
+            "success": False,
+            "message": f"Gift code `{gift_code}` was already redeemed for this player.",
+            "error_code": "ALREADY_REDEEMED",
+            "already_redeemed": True,
+            "status_category": GiftCodeHandler.STATUS_ALREADY_REDEEMED,
+            "should_log": False,
+        }
+
+    @staticmethod
+    def _invalid_player_id_result(player: Any) -> Dict[str, Any]:
+        return {
+            "player_id": str(player.player_id),
+            "player_name": player.player_name,
+            "success": False,
+            "message": "Invalid player ID format",
+            "error_code": "INVALID_ID",
+            "status_category": GiftCodeHandler.STATUS_INVALID_ID,
+            "should_log": False,
+        }
+
+    def _build_metadata_rows_from_result(
+        self,
+        player_id: str,
+        redemption_result: Dict[str, Any],
+        added_by_user_id: int,
+    ) -> list[dict[str, Any]]:
+        player_profile = redemption_result.get("player_profile")
+        if not isinstance(player_profile, dict):
+            return []
+
+        resolved_player_id = str(player_profile.get("playerId") or player_id)
+        resolved_player_uid = (
+            str(player_profile.get("playerUid") or player_profile.get("uid"))
+            if (player_profile.get("playerUid") or player_profile.get("uid")) is not None
+            else None
+        )
+        resolved_name = player_profile.get("name")
+        resolved_kingdom = str(player_profile.get("kingdom")) if player_profile.get("kingdom") is not None else None
+        resolved_castle_level = (
+            str(player_profile.get("level")) if player_profile.get("level") is not None else None
+        )
+
+        rows = [
+            {
+                "player_id": resolved_player_id,
+                "player_uid": resolved_player_uid,
+                "player_name": resolved_name,
+                "kingdom": resolved_kingdom,
+                "castle_level": resolved_castle_level,
+                "added_by_user_id": added_by_user_id,
+            }
+        ]
+
+        if resolved_player_id != str(player_id):
+            rows.append(
+                {
+                    "player_id": str(player_id),
+                    "player_name": resolved_name,
+                    "kingdom": resolved_kingdom,
+                    "castle_level": resolved_castle_level,
+                }
+            )
+
+        return rows
+
+    async def _persist_bulk_redemption_results(
+        self,
+        *,
+        gift_code: str,
+        results: list[dict[str, Any]],
+        actor_user_id: int,
+        guild_id: int | None,
+        channel_id: int | None,
+    ) -> None:
+        metadata_rows: list[dict[str, Any]] = []
+        log_rows: list[dict[str, Any]] = []
+
+        for result in results:
+            player_id = str(result["player_id"])
+            metadata_rows.extend(
+                self._build_metadata_rows_from_result(
+                    player_id=player_id,
+                    redemption_result=result,
+                    added_by_user_id=actor_user_id,
+                )
+            )
+
+            if result.get("should_log", True):
+                log_rows.append(
+                    {
+                        "user_id": actor_user_id,
+                        "player_id": player_id,
+                        "gift_code": gift_code,
+                        "success": result.get("success", False),
+                        "response_message": result.get("message"),
+                        "error_code": result.get("error_code"),
+                        "guild_id": guild_id,
+                        "channel_id": channel_id,
+                    }
+                )
+
+        if metadata_rows:
+            await self._tracking_service.sync_player_metadata_many(metadata_rows)
+
+        if log_rows:
+            await self._tracking_service.log_gift_code_redemptions_many(log_rows)
+
+    async def _run_bulk_redemption(
+        self,
+        *,
+        gift_code: str,
+        registered_players: list[Any],
+        actor_user_id: int,
+        guild_id: int | None,
+        channel_id: int | None,
+    ) -> list[dict[str, Any]]:
+        """Redeem one code for many players with one prefetch and bulk persistence."""
+        already_redeemed = await self._gift_code_service.get_redeemed_players(None, gift_code)
+        indexed_results: list[tuple[int, dict[str, Any]]] = []
+        pending: list[tuple[int, Any, int]] = []
+
+        for index, player in enumerate(registered_players):
+            player_id = str(player.player_id)
+            if player_id in already_redeemed:
+                indexed_results.append((index, self._already_redeemed_result(player, gift_code)))
+                continue
+
+            try:
+                player_id_int = int(player_id)
+            except ValueError:
+                logger.error("Invalid player ID format during bulk redeem: %s", player_id)
+                indexed_results.append((index, self._invalid_player_id_result(player)))
+                continue
+
+            pending.append((index, player, player_id_int))
+
+        semaphore = asyncio.Semaphore(self.REDEEM_CONCURRENCY)
+
+        async def redeem_one(index: int, player: Any, player_id_int: int) -> tuple[int, dict[str, Any]]:
+            result = await self._redeem_with_retries(
+                player_id_int=player_id_int,
+                gift_code=gift_code,
+                player_id_for_logs=str(player.player_id),
+                semaphore=semaphore,
+            )
+
+            player_profile = result.get("player_profile") or {}
+            normalized_result = {
+                "player_id": str(player.player_id),
+                "player_name": player_profile.get("name") or player.player_name,
+                "success": result.get("success", False),
+                "message": result.get("message", "Unknown error"),
+                "error_code": result.get("error_code"),
+                "already_redeemed": result.get("already_redeemed", False),
+                "already_redeemed_by_api": result.get("already_redeemed_by_api", False),
+                "status_category": self._categorize_redemption_status(result),
+                "player_profile": result.get("player_profile"),
+                "attempts": result.get("attempts"),
+                "retries": result.get("retries", 0),
+                "should_log": True,
+            }
+            return index, normalized_result
+
+        if pending:
+            indexed_results.extend(await asyncio.gather(*(redeem_one(*item) for item in pending)))
+
+        results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+        await self._persist_bulk_redemption_results(
+            gift_code=gift_code,
+            results=results,
+            actor_user_id=actor_user_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+        )
+        return results
+
     async def _redeem_with_retries(
         self,
         player_id_int: int,
         gift_code: str,
         player_id_for_logs: str,
+        semaphore: asyncio.Semaphore | None = None,
     ) -> Dict:
         """Redeem a code with retry for transient/API failures only."""
-        max_attempts = self.REDEEM_MAX_RETRIES + 1
+        standard_max_attempts = self.REDEEM_MAX_RETRIES + 1
+        rate_limit_max_attempts = self.REDEEM_RATE_LIMIT_MAX_RETRIES + 1
         last_result: Dict = {
             "success": False,
             "message": "Unexpected error occurred",
             "error_code": "UNEXPECTED_ERROR",
         }
 
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, rate_limit_max_attempts + 1):
             try:
-                last_result = await self._gift_code_service.redeem_gift_code(None, player_id_int, gift_code)
+                if semaphore is None:
+                    last_result = await self._gift_code_service.redeem_gift_code_remote(player_id_int, gift_code)
+                else:
+                    async with semaphore:
+                        last_result = await self._gift_code_service.redeem_gift_code_remote(player_id_int, gift_code)
             except Exception as exc:
                 logger.error(
                     "Redeem attempt %s/%s crashed for player %s and code '%s': %s",
                     attempt,
-                    max_attempts,
+                    rate_limit_max_attempts,
                     player_id_for_logs,
                     gift_code,
                     exc,
@@ -737,14 +892,33 @@ class GiftCodeHandler:
                     "error_code": "UNEXPECTED_ERROR",
                 }
 
-            status_category = self._categorize_redemption_status(last_result)
-            if status_category != self.STATUS_API_REJECTED or attempt >= max_attempts:
+            is_rate_limited = self._is_rate_limited_redemption_result(last_result)
+            max_attempts = rate_limit_max_attempts if is_rate_limited else standard_max_attempts
+
+            if not self._is_retryable_redemption_result(last_result) or attempt >= max_attempts:
                 normalized_result = dict(last_result)
                 normalized_result.setdefault("attempts", attempt)
                 normalized_result.setdefault("retries", max(0, attempt - 1))
+                if is_rate_limited and attempt >= max_attempts:
+                    normalized_result.setdefault(
+                        "message",
+                        "Rate limit persisted after the extended retry window.",
+                    )
                 return normalized_result
 
-            retry_delay = self.REDEEM_RETRY_DELAY_SECONDS * attempt
+            if is_rate_limited:
+                retry_delay = min(
+                    self.REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS,
+                    self.REDEEM_RATE_LIMIT_DELAY_SECONDS * attempt,
+                )
+                retry_delay += random.uniform(1.0, 4.0)
+            else:
+                retry_delay = min(
+                    self.REDEEM_RETRY_MAX_DELAY_SECONDS,
+                    self.REDEEM_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)),
+                )
+                retry_delay += random.uniform(0, 0.5)
+
             logger.warning(
                 "Redeem attempt %s/%s failed for player %s and code '%s' with retryable status. "
                 "Retrying in %.1fs (error_code=%s, message=%s)",

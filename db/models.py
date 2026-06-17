@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, List, Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import UserDefinedType
@@ -128,6 +128,15 @@ class GiftCodeRedemption(Base):
     """Log of all gift code redemptions."""
 
     __tablename__ = "gift_code_redemptions"
+    __table_args__ = (
+        Index(
+            "ix_gift_code_redemptions_code_status_player",
+            "gift_code",
+            "success",
+            "error_code",
+            "player_id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(

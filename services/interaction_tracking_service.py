@@ -135,6 +135,14 @@ class InteractionTrackingService:
                 added_by_user_id=added_by_user_id,
             )
 
+    async def sync_player_metadata_many(
+        self,
+        players: list[dict[str, Any]],
+        session: Optional[Any] = None,
+    ) -> int:
+        async with self._session(session) as db_session:
+            return await RegisteredPlayerRepository(db_session).sync_metadata_many(players)
+
     async def log_gift_code_redemption(
         self,
         *,
@@ -160,6 +168,15 @@ class InteractionTrackingService:
                 guild_id=guild_id,
                 channel_id=channel_id,
             )
+
+    async def log_gift_code_redemptions_many(
+        self,
+        rows: list[dict[str, Any]],
+        session: Optional[Any] = None,
+    ):
+        async with self._session(session) as db_session:
+            redemption_repo = GiftCodeRedemptionRepository(db_session)
+            return await redemption_repo.create_many(rows)
 
     async def is_voice_replies_enabled(self, guild_id: int, default_enabled: bool = True) -> bool:
         async with self._session() as db_session:

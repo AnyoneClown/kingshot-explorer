@@ -26,6 +26,10 @@ class IGiftCodeService(ABC):
         """Redeem a gift code for a player."""
 
     @abstractmethod
+    async def redeem_gift_code_remote(self, player_id: int, gift_code: str) -> Dict[str, Any]:
+        """Redeem a gift code for a player through the remote API only."""
+
+    @abstractmethod
     async def check_already_redeemed(
         self, session: AsyncSession | None, player_id: int, gift_code: str
     ) -> Optional[dict[str, Any]]:
@@ -141,42 +145,45 @@ class GiftCodeService(IGiftCodeService):
         """
 
         async def _inner(db_session: AsyncSession) -> Dict[str, Any]:
-            return await self._redeem_gift_code_with_session(player_id=player_id, gift_code=gift_code)
+            existing_redemption = await GiftCodeRedemptionRepository(db_session).find_successful_redemption(
+                player_id=player_id,
+                gift_code=gift_code,
+            )
+            if existing_redemption:
+                player_profile: Optional[Dict[str, Any]] = None
+                try:
+                    api_client = await self.ensure_client()
+                    player_resp = await api_client.get_player(str(player_id))
+                    player_profile = self._extract_player_profile(player_resp, str(player_id))
+                except Exception as lookup_error:
+                    logger.debug(
+                        "Skipping player metadata refresh for already-redeemed code '%s' and player %s: %s",
+                        gift_code,
+                        player_id,
+                        lookup_error,
+                    )
+
+                logger.info(
+                    "Gift code '%s' already redeemed for player %s at %s. Skipping API call.",
+                    gift_code,
+                    player_id,
+                    existing_redemption.created_at,
+                )
+                return {
+                    "success": False,
+                    "message": "This gift code has already been redeemed for this player.",
+                    "error_code": "ALREADY_REDEEMED",
+                    "already_redeemed": True,
+                    "already_redeemed_at": existing_redemption.created_at.isoformat(),
+                    "player_profile": player_profile,
+                }
+
+            return await self.redeem_gift_code_remote(player_id=player_id, gift_code=gift_code)
 
         return await self._with_session(session, _inner)
 
-    async def _redeem_gift_code_with_session(self, player_id: int, gift_code: str) -> Dict[str, Any]:
-        # Check if already redeemed
-        existing_redemption = await self.check_already_redeemed(None, player_id, gift_code)
-        if existing_redemption:
-            player_profile: Optional[Dict[str, Any]] = None
-            try:
-                api_client = await self.ensure_client()
-                player_resp = await api_client.get_player(str(player_id))
-                player_profile = self._extract_player_profile(player_resp, str(player_id))
-            except Exception as lookup_error:
-                logger.debug(
-                    "Skipping player metadata refresh for already-redeemed code '%s' and player %s: %s",
-                    gift_code,
-                    player_id,
-                    lookup_error,
-                )
-
-            logger.info(
-                "Gift code '%s' already redeemed for player %s at %s. Skipping API call.",
-                gift_code,
-                player_id,
-                existing_redemption.created_at,
-            )
-            return {
-                "success": False,
-                "message": "This gift code has already been redeemed for this player.",
-                "error_code": "ALREADY_REDEEMED",
-                "already_redeemed": True,
-                "already_redeemed_at": existing_redemption.created_at.isoformat(),
-                "player_profile": player_profile,
-            }
-
+    async def redeem_gift_code_remote(self, player_id: int, gift_code: str) -> Dict[str, Any]:
+        """Redeem a gift code through the upstream API without database checks or writes."""
         logger.info("Redeeming gift code '%s' for player ID: %s", gift_code, player_id)
         player_profile: Optional[Dict[str, Any]] = None
 

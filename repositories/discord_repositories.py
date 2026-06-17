@@ -443,6 +443,83 @@ class RegisteredPlayerRepository:
         logger.debug("Refreshed metadata for player %s", player_id)
         return True
 
+    async def sync_metadata_many(self, players: list[dict[str, Any]]) -> int:
+        """Bulk-refresh player metadata without changing redemption enabled state."""
+        if not players:
+            return 0
+
+        player_ids = [str(player["player_id"]) for player in players if player.get("player_id") is not None]
+        player_uids = [
+            str(player.get("player_uid"))
+            for player in players
+            if player.get("player_uid") not in (None, "", "0", 0)
+        ]
+
+        filters = []
+        if player_ids:
+            filters.append(RegisteredPlayer.player_id.in_(player_ids))
+        if player_uids:
+            filters.append(RegisteredPlayer.player_uid.in_(player_uids))
+
+        existing_players: list[RegisteredPlayer] = []
+        if filters:
+            result = await self._session.execute(select(RegisteredPlayer).where(or_(*filters)))
+            existing_players = list(result.scalars().all())
+
+        player_id_map = {player.player_id: player for player in existing_players}
+        uid_map = {str(player.player_uid): player for player in existing_players if player.player_uid}
+        synced_count = 0
+
+        for row in players:
+            player_id = str(row["player_id"])
+            player_uid = row.get("player_uid")
+            normalized_uid = str(player_uid) if player_uid not in (None, "", "0", 0) else None
+
+            player = player_id_map.get(player_id)
+            if player is None and normalized_uid:
+                player = uid_map.get(normalized_uid)
+                if player is not None and player.player_id != player_id:
+                    logger.info("Updating uid-cached player %s to canonical fid %s", player.player_id, player_id)
+                    player_id_map.pop(player.player_id, None)
+                    player.player_id = player_id
+                    player_id_map[player_id] = player
+
+            if player is None:
+                added_by_user_id = row.get("added_by_user_id")
+                if added_by_user_id is None:
+                    continue
+
+                player = RegisteredPlayer(
+                    player_id=player_id,
+                    player_uid=normalized_uid,
+                    player_name=row.get("player_name"),
+                    kingdom=row.get("kingdom"),
+                    castle_level=row.get("castle_level"),
+                    enabled=False,
+                    added_by_user_id=added_by_user_id,
+                )
+                self._session.add(player)
+                player_id_map[player_id] = player
+                if normalized_uid:
+                    uid_map[normalized_uid] = player
+            else:
+                self._assign_uid_from_maps(player, player_uid, uid_map)
+                self._apply_profile_updates(
+                    player,
+                    player_name=row.get("player_name"),
+                    kingdom=row.get("kingdom"),
+                    castle_level=row.get("castle_level"),
+                    enabled=None,
+                    added_by_user_id=row.get("added_by_user_id"),
+                    overwrite_owner=False,
+                )
+
+            synced_count += 1
+
+        await self._session.flush()
+        logger.debug("Bulk-refreshed metadata for %s registered players", synced_count)
+        return synced_count
+
 
 class GiftCodeRepository:
     """Repository for gift code catalog records."""
@@ -520,6 +597,16 @@ class GiftCodeRedemptionRepository:
             success,
         )
         return log
+
+    async def create_many(self, rows: list[dict[str, Any]]) -> list[GiftCodeRedemption]:
+        if not rows:
+            return []
+
+        logs = [GiftCodeRedemption(**row) for row in rows]
+        self._session.add_all(logs)
+        await self._session.flush()
+        logger.info("Bulk logged %s gift code redemption attempts", len(logs))
+        return logs
 
     async def find_successful_redemption(self, player_id: int, gift_code: str):
         result = await self._session.execute(
