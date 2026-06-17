@@ -119,44 +119,15 @@ class PlayerInfoHandler:
 
                 return
 
-            # Format the response
             formatted_stats = self._player_info_service.format_player_stats(player_data)
-
-            # Get player name for title
             player_name = player_data.get("name", f"Player {player_id}")
-
-            # Create an embed for better presentation
-            embed = discord.Embed(
-                title=f"📊 {player_name}",
+            embed = self._build_stats_embed(
+                player_id=player_id,
+                player_name=player_name,
+                player_data=player_data,
+                ks_data=ks_data,
                 description=formatted_stats,
-                color=discord.Color.blue(),
             )
-
-            embed.add_field(name="Player ID", value=f"`{player_data.get('playerId', player_id)}`", inline=True)
-            embed.add_field(
-                name="Kingdom",
-                value=str(player_data.get("kingdom", "N/A")),
-                inline=True,
-            )
-            embed.add_field(
-                name="Castle Level",
-                value=str(player_data.get("levelRenderedDetailed") or player_data.get("level") or "N/A"),
-                inline=True,
-            )
-            embed.add_field(name="Power", value=self._format_power(ks_data), inline=True)
-            embed.add_field(name="VIP Level", value=self._format_vip(ks_data), inline=True)
-            embed.add_field(name="Alliance", value=self._format_alliance(ks_data), inline=True)
-
-            # Add profile photo if available
-            if "profilePhoto" in player_data and player_data["profilePhoto"]:
-                embed.set_thumbnail(url=player_data["profilePhoto"])
-
-            embed.add_field(
-                name="Links",
-                value=self._format_data_links(player_id, player_data, ks_data),
-                inline=False,
-            )
-            embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
 
             hero_file = await self._get_arena_loadout_image(player_data, ks_data)
             if hero_file:
@@ -296,16 +267,28 @@ class PlayerInfoHandler:
                     continue
                 profiles_by_fid[str(fid)] = await self._get_kingshot_data_player(str(fid))
 
-            embeds = []
             for entry in entries:
                 fid = self._extract_entry_fid(entry)
                 profile = profiles_by_fid.get(str(fid)) if fid is not None else None
-                embeds.append(self._build_scout_player_embed(entry, profile, kingdom_number))
+                data = profile or entry
+                player_data = self._build_player_data_from_kingshot(data, entry, kingdom_number)
+                player_id = str(player_data.get("playerId") or fid or "")
+                player_name = player_data.get("name") or f"Player {player_id or '?'}"
+                embed = self._build_stats_embed(
+                    player_id=player_id,
+                    player_name=player_name,
+                    player_data=player_data,
+                    ks_data=data,
+                    description=self._format_kingshot_profile_summary(player_data),
+                )
 
-            await interaction.followup.send(
-                content=f"🔎 Scout report for Kingdom {kingdom_number} • Top {len(embeds)} from leaderboard type 8",
-                embeds=embeds,
-            )
+                hero_file = await self._get_arena_loadout_image(player_data, data)
+                if hero_file:
+                    embed.set_image(url="attachment://arena_loadout.png")
+                    await interaction.followup.send(embed=embed, file=hero_file)
+                else:
+                    await interaction.followup.send(embed=embed)
+
             logger.info("Successfully sent scout report for kingdom %s", kingdom_number)
 
         except Exception as e:
@@ -335,6 +318,48 @@ class PlayerInfoHandler:
         if isinstance(data, dict) and not data.get("error"):
             return data
         return None
+
+    @classmethod
+    def _build_stats_embed(
+        cls,
+        *,
+        player_id: str,
+        player_name: str,
+        player_data: dict[str, Any],
+        ks_data: dict[str, Any] | None,
+        description: str,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"📊 {player_name}",
+            description=description,
+            color=discord.Color.blue(),
+        )
+
+        embed.add_field(name="Player ID", value=f"`{player_data.get('playerId', player_id)}`", inline=True)
+        embed.add_field(
+            name="Kingdom",
+            value=str(player_data.get("kingdom", "N/A")),
+            inline=True,
+        )
+        embed.add_field(
+            name="Castle Level",
+            value=str(player_data.get("levelRenderedDetailed") or player_data.get("level") or "N/A"),
+            inline=True,
+        )
+        embed.add_field(name="Power", value=cls._format_power(ks_data), inline=True)
+        embed.add_field(name="VIP Level", value=cls._format_vip(ks_data), inline=True)
+        embed.add_field(name="Alliance", value=cls._format_alliance(ks_data), inline=True)
+
+        if "profilePhoto" in player_data and player_data["profilePhoto"]:
+            embed.set_thumbnail(url=player_data["profilePhoto"])
+
+        embed.add_field(
+            name="Links",
+            value=cls._format_data_links(player_id, player_data, ks_data),
+            inline=False,
+        )
+        embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
+        return embed
 
     async def _get_arena_loadout_image(
         self,
@@ -860,34 +885,6 @@ class PlayerInfoHandler:
                 if player.get(key) not in (None, ""):
                     return player[key]
         return None
-
-    @classmethod
-    def _build_scout_player_embed(
-        cls,
-        entry: dict[str, Any],
-        profile: dict[str, Any] | None,
-        kingdom_number: int,
-    ) -> discord.Embed:
-        data = profile or entry
-        fid = cls._extract_entry_fid(entry) or data.get("fid")
-        player_name = data.get("name") or entry.get("name") or f"Player {fid or '?'}"
-        player_data = cls._build_player_data_from_kingshot(data, entry, kingdom_number)
-        rank = entry.get("rank", "?")
-
-        embed = discord.Embed(
-            title=f"📊 #{rank} {player_name}",
-            description=cls._format_kingshot_profile_summary(player_data),
-            color=discord.Color.blue(),
-        )
-        embed.add_field(name="Player ID", value=f"`{player_data.get('playerId', fid or 'N/A')}`", inline=True)
-        embed.add_field(name="Kingdom", value=str(player_data.get("kingdom", "N/A")), inline=True)
-        embed.add_field(name="Castle Level", value=str(player_data.get("level") or "N/A"), inline=True)
-        embed.add_field(name="Power", value=cls._format_power(data), inline=True)
-        embed.add_field(name="VIP Level", value=cls._format_vip(data), inline=True)
-        embed.add_field(name="Alliance", value=cls._format_alliance(data), inline=True)
-        embed.add_field(name="Links", value=cls._format_data_links(str(fid or ""), player_data, data), inline=False)
-        embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
-        return embed
 
     @staticmethod
     def _build_player_data_from_kingshot(

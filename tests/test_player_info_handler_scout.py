@@ -104,7 +104,7 @@ def test_extract_leaderboard_entries_from_api_payload():
     ]
 
 
-def test_build_scout_player_embed_matches_stats_style():
+def test_build_stats_embed_matches_stats_style_for_scout_data():
     entry = {
         "rank": 1,
         "fid": 121704562,
@@ -122,10 +122,17 @@ def test_build_scout_player_embed_matches_stats_style():
         "alliance": {"aid": 83900009, "abbr": "FKA", "name": "FateKillsAll"},
     }
 
-    embed = PlayerInfoHandler._build_scout_player_embed(entry, profile, 830)
+    player_data = PlayerInfoHandler._build_player_data_from_kingshot(profile, entry, 830)
+    embed = PlayerInfoHandler._build_stats_embed(
+        player_id=str(player_data["playerId"]),
+        player_name=player_data["name"],
+        player_data=player_data,
+        ks_data=profile,
+        description=PlayerInfoHandler._format_kingshot_profile_summary(player_data),
+    )
     fields = {field["name"]: field["value"] for field in embed.fields}
 
-    assert embed.title == "📊 #1 Amoeba"
+    assert embed.title == "📊 Amoeba"
     assert "👤 **Name:** Amoeba" in embed.description
     assert fields["Player ID"] == "`121704562`"
     assert fields["Kingdom"] == "830"
