@@ -12,7 +12,7 @@ This guide covers the two helper scripts used to scrape Kingshot Guide hero data
 Parse one hero:
 
 ```bash
-python3 scripts/parse_kingshot_heroes.py \
+uv run python scripts/parse_kingshot_heroes.py \
   --url https://www.kingshotguide.org/heroes/amadeus \
   --output kingshot_heroes.json \
   --pretty
@@ -21,7 +21,7 @@ python3 scripts/parse_kingshot_heroes.py \
 Parse all heroes linked from the Kingshot Guide heroes index:
 
 ```bash
-python3 scripts/parse_kingshot_heroes.py \
+uv run python scripts/parse_kingshot_heroes.py \
   --all-heroes \
   --output kingshot_heroes.json \
   --pretty
@@ -30,7 +30,7 @@ python3 scripts/parse_kingshot_heroes.py \
 Parse a custom list of URLs:
 
 ```bash
-python3 scripts/parse_kingshot_heroes.py \
+uv run python scripts/parse_kingshot_heroes.py \
   --urls-file hero_urls.txt \
   --output kingshot_heroes.json \
   --pretty
@@ -75,7 +75,7 @@ For one URL, the parser writes one JSON object. For multiple URLs, it writes a J
 Use dry-run mode first. This validates the file and shows how many chunks will be embedded per hero.
 
 ```bash
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json \
   --dry-run
 ```
@@ -83,7 +83,7 @@ Use dry-run mode first. This validates the file and shows how many chunks will b
 Limit validation to the first few heroes:
 
 ```bash
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json \
   --dry-run \
   --limit 3
@@ -111,7 +111,7 @@ NVIDIA_MODEL=openai/gpt-oss-120b
 Run upload:
 
 ```bash
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json
 ```
 
@@ -120,7 +120,7 @@ By default, upload replaces existing chunks for each matching hero slug. The str
 Append chunks instead of replacing them:
 
 ```bash
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json \
   --keep-existing-chunks
 ```
@@ -128,7 +128,7 @@ Append chunks instead of replacing them:
 Upload only the first hero:
 
 ```bash
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json \
   --limit 1
 ```
@@ -136,16 +136,16 @@ Upload only the first hero:
 ## Full Flow
 
 ```bash
-python3 scripts/parse_kingshot_heroes.py \
+uv run python scripts/parse_kingshot_heroes.py \
   --all-heroes \
   --output kingshot_heroes.json \
   --pretty
 
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json \
   --dry-run
 
-.venv/bin/python scripts/upload_kingshot_heroes.py \
+uv run python scripts/upload_kingshot_heroes.py \
   --input kingshot_heroes.json
 ```
 

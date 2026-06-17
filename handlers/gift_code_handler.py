@@ -100,7 +100,6 @@ class GiftCodeHandler:
     REDEEM_MAX_RETRIES = 2
     REDEEM_RETRY_DELAY_SECONDS = 1.0
     REDEEM_RETRY_MAX_DELAY_SECONDS = 30.0
-    REDEEM_RATE_LIMIT_MAX_RETRIES = 15
     REDEEM_RATE_LIMIT_DELAY_SECONDS = 8.0
     REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS = 45.0
     REDEEM_CONCURRENCY = 3
@@ -588,7 +587,7 @@ class GiftCodeHandler:
             text=(
                 f"🎮 Check in-game mail for successful claims • "
                 f"Retry policy: {self.REDEEM_MAX_RETRIES} transient retries; "
-                f"{self.REDEEM_RATE_LIMIT_MAX_RETRIES} retries for 429"
+                "429 retries until the rate limit clears"
             )
         )
 
@@ -862,14 +861,15 @@ class GiftCodeHandler:
     ) -> Dict:
         """Redeem a code with retry for transient/API failures only."""
         standard_max_attempts = self.REDEEM_MAX_RETRIES + 1
-        rate_limit_max_attempts = self.REDEEM_RATE_LIMIT_MAX_RETRIES + 1
         last_result: Dict = {
             "success": False,
             "message": "Unexpected error occurred",
             "error_code": "UNEXPECTED_ERROR",
         }
 
-        for attempt in range(1, rate_limit_max_attempts + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 if semaphore is None:
                     last_result = await self._gift_code_service.redeem_gift_code_remote(player_id_int, gift_code)
@@ -880,7 +880,7 @@ class GiftCodeHandler:
                 logger.error(
                     "Redeem attempt %s/%s crashed for player %s and code '%s': %s",
                     attempt,
-                    rate_limit_max_attempts,
+                    standard_max_attempts,
                     player_id_for_logs,
                     gift_code,
                     exc,
@@ -893,17 +893,14 @@ class GiftCodeHandler:
                 }
 
             is_rate_limited = self._is_rate_limited_redemption_result(last_result)
-            max_attempts = rate_limit_max_attempts if is_rate_limited else standard_max_attempts
+            max_attempts_label = "unbounded" if is_rate_limited else str(standard_max_attempts)
 
-            if not self._is_retryable_redemption_result(last_result) or attempt >= max_attempts:
+            if not self._is_retryable_redemption_result(last_result) or (
+                not is_rate_limited and attempt >= standard_max_attempts
+            ):
                 normalized_result = dict(last_result)
                 normalized_result.setdefault("attempts", attempt)
                 normalized_result.setdefault("retries", max(0, attempt - 1))
-                if is_rate_limited and attempt >= max_attempts:
-                    normalized_result.setdefault(
-                        "message",
-                        "Rate limit persisted after the extended retry window.",
-                    )
                 return normalized_result
 
             if is_rate_limited:
@@ -923,7 +920,7 @@ class GiftCodeHandler:
                 "Redeem attempt %s/%s failed for player %s and code '%s' with retryable status. "
                 "Retrying in %.1fs (error_code=%s, message=%s)",
                 attempt,
-                max_attempts,
+                max_attempts_label,
                 player_id_for_logs,
                 gift_code,
                 retry_delay,
@@ -931,8 +928,6 @@ class GiftCodeHandler:
                 last_result.get("message"),
             )
             await asyncio.sleep(retry_delay)
-
-        return last_result
 
     def _format_result_lines(self, records: List[Dict], emoji: str, limit: int = 10) -> str:
         """Render result records for embed fields with deterministic truncation."""

@@ -122,11 +122,11 @@ async def test_transient_redemption_failures_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_retries_use_extended_budget(monkeypatch):
+async def test_rate_limit_retries_until_cleared(monkeypatch):
     class RateLimitedGiftCodeService(FakeGiftCodeService):
         async def redeem_gift_code_remote(self, player_id, gift_code):
             self.remote_calls.append((player_id, gift_code))
-            if len(self.remote_calls) <= 4:
+            if len(self.remote_calls) <= 20:
                 return {
                     "success": False,
                     "message": "API rate limit exceeded (429 Too Many Requests).",
@@ -150,6 +150,38 @@ async def test_rate_limit_retries_use_extended_budget(monkeypatch):
     )
 
     assert result["success"] is True
-    assert result["attempts"] == 5
-    assert result["retries"] == 4
-    assert gift_service.remote_calls == [(222, "CODE")] * 5
+    assert result["attempts"] == 21
+    assert result["retries"] == 20
+    assert gift_service.remote_calls == [(222, "CODE")] * 21
+
+
+@pytest.mark.asyncio
+async def test_non_rate_limit_transient_failures_keep_standard_budget(monkeypatch):
+    class FailingGiftCodeService(FakeGiftCodeService):
+        async def redeem_gift_code_remote(self, player_id, gift_code):
+            self.remote_calls.append((player_id, gift_code))
+            return {
+                "success": False,
+                "message": "HTTP Error 503",
+                "error_code": "503",
+            }
+
+    async def no_sleep(delay):
+        del delay
+
+    monkeypatch.setattr("handlers.gift_code_handler.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("handlers.gift_code_handler.random.uniform", lambda _start, _end: 0)
+
+    gift_service = FailingGiftCodeService()
+    handler = make_handler(gift_service)
+
+    result = await handler._redeem_with_retries(
+        player_id_int=222,
+        gift_code="CODE",
+        player_id_for_logs="222",
+    )
+
+    assert result["success"] is False
+    assert result["attempts"] == 3
+    assert result["retries"] == 2
+    assert gift_service.remote_calls == [(222, "CODE")] * 3

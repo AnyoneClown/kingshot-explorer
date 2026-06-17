@@ -33,7 +33,7 @@ The redemption summary now separates outcomes by category instead of a single ge
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.11 through 3.13
 - A Discord bot token
 - CockroachDB (or compatible PostgreSQL setup used by current models/migrations)
 
@@ -42,7 +42,7 @@ The redemption summary now separates outcomes by category instead of a single ge
 1. Install dependencies.
 
 ```bash
-pip install -r requirements.txt
+uv sync --group dev
 ```
 
 2. Create a .env file.
@@ -77,13 +77,13 @@ Use `ADMIN_USER_IDS=123,456` instead of `ADMIN_USER_ID` if multiple Discord user
 3. Run migrations.
 
 ```bash
-python -m alembic upgrade head
+uv run alembic upgrade head
 ```
 
 4. Start the bot.
 
 ```bash
-python main.py
+uv run python main.py
 ```
 
 ## Commands Overview

@@ -47,7 +47,7 @@ class RivaTtsBackend:
             import riva.client
         except ImportError as exc:
             raise RuntimeError(
-                "nvidia-riva-client is not installed. Run `pip install -r requirements.txt`."
+                "nvidia-riva-client is not installed. Run `uv sync`."
             ) from exc
 
         metadata_args = [
