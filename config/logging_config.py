@@ -7,6 +7,20 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+class BotContextFilter(logging.Filter):
+    """Attach bot instance/profile metadata to every log record."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bot_instance = os.getenv("BOT_INSTANCE") or os.getenv("BOT_PROFILE") or "bot"
+        self.bot_profile = os.getenv("BOT_PROFILE", "unknown")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.bot_instance = self.bot_instance
+        record.bot_profile = self.bot_profile
+        return True
+
+
 def setup_logging(log_level: str = "INFO") -> None:
     """
     Configure logging for the application.
@@ -33,20 +47,26 @@ def setup_logging(log_level: str = "INFO") -> None:
     # Remove existing handlers to avoid duplicates
     root_logger.handlers.clear()
 
+    context_filter = BotContextFilter()
+
     # Create formatters
     detailed_formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(message)s",
+        fmt=(
+            "%(asctime)s | %(levelname)-8s | %(bot_instance)s | %(name)s:%(funcName)s:%(lineno)d | "
+            "%(message)s"
+        ),
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     console_formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%H:%M:%S"
+        fmt="%(asctime)s | %(levelname).1s | %(bot_instance)s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
     )
 
     # File handler with rotation (10MB max, keep 5 backup files) - only if we can create the directory
     if log_dir:
         try:
-            log_file = log_dir / f"bot_{datetime.now().strftime('%Y%m%d')}.log"
+            log_file = log_dir / f"{context_filter.bot_instance}_{datetime.now().strftime('%Y%m%d')}.log"
             file_handler = RotatingFileHandler(
                 log_file,
                 maxBytes=10 * 1024 * 1024,  # 10 MB
@@ -55,6 +75,7 @@ def setup_logging(log_level: str = "INFO") -> None:
             )
             file_handler.setLevel(logging.DEBUG)  # Log everything to file
             file_handler.setFormatter(detailed_formatter)
+            file_handler.addFilter(context_filter)
             root_logger.addHandler(file_handler)
         except Exception as e:
             print(f"Warning: Cannot create log file: {e}")
@@ -64,6 +85,7 @@ def setup_logging(log_level: str = "INFO") -> None:
     console_handler = logging.StreamHandler()
     console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     console_handler.setFormatter(console_formatter)
+    console_handler.addFilter(context_filter)
 
     # Add handlers
     root_logger.addHandler(console_handler)
@@ -73,10 +95,13 @@ def setup_logging(log_level: str = "INFO") -> None:
     logging.getLogger("discord.http").setLevel(logging.WARNING)
     logging.getLogger("discord.gateway").setLevel(logging.INFO)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     # Log startup message
     root_logger.info("=" * 80)
     root_logger.info("Logging system initialized")
+    root_logger.info(f"Bot instance: {context_filter.bot_instance}")
     root_logger.info(f"Log level: {log_level.upper()}")
     if log_dir:
         root_logger.info(f"Log file: {log_file}")

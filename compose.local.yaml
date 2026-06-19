@@ -1,0 +1,24 @@
+services:
+  translator-bot-local:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-translator-bot-local
+    env_file:
+      - .env.local
+    environment:
+      BOT_PROFILE: local
+      BOT_INSTANCE: local
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.50'
+        reservations:
+          memory: 128M

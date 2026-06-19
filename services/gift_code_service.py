@@ -334,7 +334,7 @@ class GiftCodeService(IGiftCodeService):
                         }
 
                     codes = data.get("data", {}).get("giftCodes", [])
-                    logger.info("Successfully fetched %s gift codes from kingshot.net", len(codes))
+                    logger.debug("Successfully fetched %s gift codes from kingshot.net", len(codes))
 
                     return {
                         "success": True,

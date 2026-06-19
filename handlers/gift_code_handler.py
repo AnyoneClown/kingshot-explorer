@@ -210,7 +210,7 @@ class GiftCodeHandler:
         @tasks.loop(minutes=1)
         async def poll_gift_codes():
             """Check for new gift codes and redeem them for all users."""
-            logger.info("Polling for new gift codes...")
+            logger.debug("Polling for new gift codes...")
 
             if not self._can_poll():
                 logger.debug("Skipping gift-code polling due temporary network error backoff window")

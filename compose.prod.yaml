@@ -1,11 +1,14 @@
 services:
-  translator-bot:
+  translator-bot-global:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: discord-translator-bot
+    container_name: discord-translator-bot-global
     env_file:
-      - .env
+      - .env.prod
+    environment:
+      BOT_PROFILE: global
+      BOT_INSTANCE: global
     volumes:
       - ./logs:/app/logs
     restart: unless-stopped
