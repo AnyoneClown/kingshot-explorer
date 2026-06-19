@@ -353,7 +353,6 @@ class PlayerInfoHandler:
         if "profilePhoto" in player_data and player_data["profilePhoto"]:
             embed.set_thumbnail(url=player_data["profilePhoto"])
 
-        embed.set_footer(text="Use /addplayer to include this player in auto-redeem")
         return embed
 
     async def _get_arena_loadout_image(
