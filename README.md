@@ -96,46 +96,68 @@ uv run python main.py
 
 ## Docker
 
-Docker is split into two Compose files:
+Docker uses one Compose file with profiles:
 
-- `compose.local.yaml` runs `translator-bot-local` with `.env.local` and `BOT_PROFILE=local`.
-- `compose.prod.yaml` runs `translator-bot-global` with `.env.prod` and `BOT_PROFILE=global`.
-- `compose.grafana.yaml` runs Grafana Alloy to forward bot container logs to Grafana Cloud Logs.
+- The default services run `translator-bot-local`, `translator-bot-global`, and Grafana Alloy.
+- `translator-bot-local` uses `.env.local` and `BOT_PROFILE=local`.
+- `translator-bot-global` uses `.env.prod` and `BOT_PROFILE=global`.
+- Grafana Alloy uses `.env.grafana` to forward bot container logs to Grafana Cloud Logs.
+- The `dev` profile runs `translator-bot-dev` with `.env` and mounts the working tree into the container.
 
 Create the real env files from the committed examples:
 
 ```bash
 cp .env.local.example .env.local
 cp .env.prod.example .env.prod
+cp .env.grafana.example .env.grafana
 ```
 
-Start local/full bot:
+Start local, prod, and Grafana:
 
 ```bash
-docker compose -f compose.local.yaml up -d --build
+docker compose -f compose.yaml up --build
 ```
 
-Start prod/global bot:
+Start in the background:
 
 ```bash
-docker compose -f compose.prod.yaml up -d --build
+docker compose -f compose.yaml up -d --build
+```
+
+Start development bot:
+
+```bash
+docker compose -f compose.yaml --profile dev up --build translator-bot-dev
+```
+
+Start only local/full bot:
+
+```bash
+docker compose -f compose.yaml up -d --build translator-bot-local
+```
+
+Start only prod/global bot:
+
+```bash
+docker compose -f compose.yaml up -d --build translator-bot-global
 ```
 
 Start both bots together:
 
 ```bash
-docker compose -f compose.local.yaml -f compose.prod.yaml up -d --build
+docker compose -f compose.yaml up -d --build translator-bot-local translator-bot-global
 ```
 
 Common commands:
 
 ```bash
-docker compose -f compose.local.yaml logs -f
-docker compose -f compose.prod.yaml logs -f
-docker compose -f compose.local.yaml -f compose.prod.yaml logs -f
-docker compose -f compose.prod.yaml restart
-docker compose -f compose.local.yaml stop
-docker compose -f compose.local.yaml -f compose.prod.yaml stop
+docker compose -f compose.yaml logs -f translator-bot-dev
+docker compose -f compose.yaml logs -f translator-bot-local
+docker compose -f compose.yaml logs -f translator-bot-global
+docker compose -f compose.yaml logs -f translator-bot-local translator-bot-global
+docker compose -f compose.yaml restart translator-bot-global
+docker compose -f compose.yaml stop translator-bot-local
+docker compose -f compose.yaml stop translator-bot-local translator-bot-global
 ```
 
 Log output includes the bot instance name, for example `local` or `global`. File logs are separated by instance in `logs/`:
@@ -166,19 +188,19 @@ Fill these values in `.env.grafana` from Grafana Cloud:
 Start both bots with Grafana log forwarding:
 
 ```bash
-docker compose -f compose.local.yaml -f compose.prod.yaml -f compose.grafana.yaml up -d --build
+docker compose -f compose.yaml up -d --build
 ```
 
 Start only the log collector after bots are already running:
 
 ```bash
-docker compose -f compose.grafana.yaml up -d
+docker compose -f compose.yaml up -d grafana-alloy
 ```
 
 Check Alloy locally:
 
 ```bash
-docker compose -f compose.grafana.yaml logs -f
+docker compose -f compose.yaml logs -f grafana-alloy
 open http://localhost:12345
 ```
 

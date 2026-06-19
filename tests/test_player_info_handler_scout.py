@@ -140,7 +140,8 @@ def test_build_stats_embed_matches_stats_style_for_scout_data():
     assert fields["Power"] == "572,264,916"
     assert fields["VIP Level"] == "Hidden"
     assert fields["Alliance"] == "`[FKA]` FateKillsAll (`83900009`)"
-    assert "Player details" in fields["Links"]
+    assert "Links" not in fields
+    assert embed.footer == "Use /addplayer to include this player in auto-redeem"
 
 
 def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):

@@ -353,12 +353,7 @@ class PlayerInfoHandler:
         if "profilePhoto" in player_data and player_data["profilePhoto"]:
             embed.set_thumbnail(url=player_data["profilePhoto"])
 
-        embed.add_field(
-            name="Links",
-            value=cls._format_data_links(player_id, player_data, ks_data),
-            inline=False,
-        )
-        embed.set_footer(text="Data from kingshot.jeab.dev • Use /addplayer to include this player in auto-redeem")
+        embed.set_footer(text="Use /addplayer to include this player in auto-redeem")
         return embed
 
     async def _get_arena_loadout_image(
@@ -949,30 +944,6 @@ class PlayerInfoHandler:
         if aid is not None:
             return f"ID `{aid}`"
         return "N/A"
-
-    @classmethod
-    def _format_data_links(
-        cls,
-        player_id: str,
-        player_data: dict[str, Any],
-        ks_data: dict[str, Any] | None,
-    ) -> str:
-        player_link = f"[Player details](https://kingshot.jeab.dev/player/{player_id})"
-        alliance_link = cls._format_alliance_link(player_data, ks_data)
-        return f"{player_link}\n{alliance_link}"
-
-    @staticmethod
-    def _format_alliance_link(player_data: dict[str, Any], ks_data: dict[str, Any] | None) -> str:
-        if not ks_data or not isinstance(ks_data.get("alliance"), dict):
-            return "Alliance details: N/A"
-
-        alliance = ks_data["alliance"]
-        aid = alliance.get("aid")
-        kingdom = ks_data.get("kid") or player_data.get("kingdom")
-        if aid is None or kingdom is None:
-            return "Alliance details: N/A"
-
-        return f"[Alliance details](https://kingshot.jeab.dev/alliances/{kingdom}/{aid})"
 
     @staticmethod
     def _format_number(value: Any) -> str:
