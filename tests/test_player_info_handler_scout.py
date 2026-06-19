@@ -154,6 +154,7 @@ def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):
     (gear_dir / "1011501.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([0, 0, 255, 255] * 4)))
     (gear_dir / "1021501.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([255, 255, 0, 255] * 4)))
     (gear_dir / "1031501.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([255, 0, 255, 255] * 4)))
+    (gear_dir / "1050024.png").write_bytes(PlayerInfoHandler._write_rgba_png(2, 2, bytes([255, 180, 0, 255] * 4)))
     service = FakeKingshotDataService(
         {
             "success": True,
@@ -167,6 +168,8 @@ def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):
                     {
                         "slot": 1,
                         "id": 50024,
+                        "exclusive_equip": 1050024,
+                        "exclusive_equip_lv": 10,
                         "equipment": [
                             {"sid": 2, "eid": 1021501, "slv": 70, "rlv": 3},
                             {"sid": 1, "eid": 1011501, "slv": 100, "rlv": 8},
@@ -202,7 +205,7 @@ def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):
     strip_path.write_bytes(file.fp.read())
     strip = PlayerInfoHandler._read_rgba_png(strip_path)
     assert strip["width"] == 183
-    assert strip["height"] == 126
+    assert strip["height"] == 190
 
 
 def test_format_general_gear_level_wraps_red_levels():

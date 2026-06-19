@@ -123,7 +123,7 @@ Start in the background:
 docker compose -f compose.yaml up -d --build
 ```
 
-Start only local/full bot:
+Start only local/full bot while developing:
 
 ```bash
 docker compose -f compose.yaml up -d --build translator-bot-local

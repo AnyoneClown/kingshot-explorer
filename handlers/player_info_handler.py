@@ -396,6 +396,7 @@ class PlayerInfoHandler:
             loadouts.append(
                 {
                     "hero_path": image_path,
+                    "exclusive_item": self._extract_hero_exclusive_item(hero),
                     "gear_items": self._extract_hero_gear_items(hero),
                 }
             )
@@ -424,6 +425,21 @@ class PlayerInfoHandler:
         except (TypeError, ValueError):
             hero_id = 0
         return (slot, hero_id)
+
+    def _extract_hero_exclusive_item(self, hero: dict[str, Any]) -> dict[str, Any] | None:
+        eid = hero.get("exclusive_equip")
+        if eid in (None, ""):
+            return None
+
+        image_path = self.HERO_GEAR_IMAGE_DIR / f"{eid}.png"
+        if not image_path.is_file():
+            logger.warning("Arena exclusive weapon image missing for equipment id %s at %s", eid, image_path)
+            return None
+
+        return {
+            "path": image_path,
+            "lv": self._coerce_level(hero.get("exclusive_equip_lv")),
+        }
 
     def _extract_hero_gear_items(self, hero: dict[str, Any]) -> list[dict[str, Any]]:
         equipment = hero.get("equipment")
@@ -480,6 +496,21 @@ class PlayerInfoHandler:
             )
             for loadout in loadouts
         ]
+        exclusive_images = [
+            (
+                cls._annotate_exclusive_image(
+                    cls._resize_rgba_nearest(
+                        cls._read_rgba_png(item["path"]),
+                        cls.ARENA_GEAR_ICON_SIZE,
+                        cls.ARENA_GEAR_ICON_SIZE,
+                    ),
+                    item["lv"],
+                )
+                if (item := loadout.get("exclusive_item"))
+                else None
+            )
+            for loadout in loadouts
+        ]
         gear_images = [
             [
                 cls._annotate_gear_image(
@@ -498,17 +529,20 @@ class PlayerInfoHandler:
 
         column_spacing = 10
         gear_spacing = 5
+        exclusive_top_gap = 8
         gear_top_gap = 8
         max_hero_height = max(image["height"] for image in hero_images)
         column_widths = []
-        for hero_image, hero_gears in zip(hero_images, gear_images, strict=True):
+        for hero_image, exclusive_image, hero_gears in zip(hero_images, exclusive_images, gear_images, strict=True):
             gear_width = 0
             if hero_gears:
                 gear_columns = min(2, len(hero_gears))
                 gear_width = gear_columns * cls.ARENA_GEAR_ICON_SIZE + gear_spacing * (gear_columns - 1)
-            column_widths.append(max(hero_image["width"], gear_width))
+            exclusive_width = exclusive_image["width"] if exclusive_image else 0
+            column_widths.append(max(hero_image["width"], exclusive_width, gear_width))
 
         width = sum(column_widths) + column_spacing * (len(column_widths) - 1)
+        has_exclusive = any(exclusive_images)
         has_gear = any(gear_images)
         max_gear_rows = max(((len(gears) + 1) // 2 for gears in gear_images), default=0)
         gear_grid_height = (
@@ -516,19 +550,36 @@ class PlayerInfoHandler:
             if max_gear_rows
             else 0
         )
-        height = max_hero_height + (gear_top_gap + gear_grid_height if has_gear else 0)
+        height = max_hero_height
+        if has_exclusive:
+            height += exclusive_top_gap + cls.ARENA_GEAR_ICON_SIZE
+        if has_gear:
+            height += gear_top_gap + gear_grid_height
         canvas = bytearray(width * height * 4)
 
         offset_x = 0
-        for column_width, hero_image, hero_gears in zip(column_widths, hero_images, gear_images, strict=True):
+        for column_width, hero_image, exclusive_image, hero_gears in zip(
+            column_widths,
+            hero_images,
+            exclusive_images,
+            gear_images,
+            strict=True,
+        ):
             hero_left = offset_x + (column_width - hero_image["width"]) // 2
             cls._paste_rgba(canvas, width, hero_image, hero_left, 0)
+
+            gear_top = max_hero_height
+            if has_exclusive:
+                if exclusive_image:
+                    exclusive_left = offset_x + (column_width - exclusive_image["width"]) // 2
+                    cls._paste_rgba(canvas, width, exclusive_image, exclusive_left, max_hero_height + exclusive_top_gap)
+                gear_top += exclusive_top_gap + cls.ARENA_GEAR_ICON_SIZE
 
             if hero_gears:
                 gear_columns = min(2, len(hero_gears))
                 gear_width = gear_columns * cls.ARENA_GEAR_ICON_SIZE + gear_spacing * (gear_columns - 1)
                 gear_left = offset_x + (column_width - gear_width) // 2
-                gear_top = max_hero_height + gear_top_gap
+                gear_top += gear_top_gap
                 for index, gear_image in enumerate(hero_gears):
                     column = index % gear_columns
                     row = index // gear_columns
@@ -566,6 +617,27 @@ class PlayerInfoHandler:
         return {"width": width, "height": height, "pixels": bytes(resized)}
 
     @classmethod
+    def _annotate_exclusive_image(cls, image: dict[str, Any], lv: int) -> dict[str, Any]:
+        annotated = {
+            "width": image["width"],
+            "height": image["height"],
+            "pixels": bytearray(image["pixels"]),
+        }
+        cls._draw_border(annotated, (245, 190, 68, 235))
+        text = f"LV{lv}"
+        text_width, text_height = cls._badge_size(text)
+        cls._draw_badge(
+            annotated,
+            annotated["width"] - text_width - 1,
+            annotated["height"] - text_height - 1,
+            text,
+            (88, 53, 15, 235),
+            (255, 237, 176, 255),
+        )
+        annotated["pixels"] = bytes(annotated["pixels"])
+        return annotated
+
+    @classmethod
     def _annotate_gear_image(cls, image: dict[str, Any], slv: int, rlv: int) -> dict[str, Any]:
         annotated = {
             "width": image["width"],
@@ -588,6 +660,13 @@ class PlayerInfoHandler:
         )
         annotated["pixels"] = bytes(annotated["pixels"])
         return annotated
+
+    @classmethod
+    def _draw_border(cls, image: dict[str, Any], color: tuple[int, int, int, int]) -> None:
+        cls._draw_rect(image, 0, 0, image["width"], 2, color)
+        cls._draw_rect(image, 0, image["height"] - 2, image["width"], 2, color)
+        cls._draw_rect(image, 0, 0, 2, image["height"], color)
+        cls._draw_rect(image, image["width"] - 2, 0, 2, image["height"], color)
 
     @staticmethod
     def _format_general_gear_level(slv: int) -> tuple[str, tuple[int, int, int, int], tuple[int, int, int, int]]:
