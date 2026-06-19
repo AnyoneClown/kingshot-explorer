@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -31,13 +30,13 @@ async def test_concurrent_execution_time():
     elapsed_time = time.time() - start_time
 
     print(f"\n{'='*60}")
-    print(f"Async Concurrency Pattern Test")
+    print("Async Concurrency Pattern Test")
     print(f"{'='*60}")
-    print(f"Total tasks: 5")
-    print(f"Time per task: 0.1 second")
+    print("Total tasks: 5")
+    print("Time per task: 0.1 second")
     print(f"Elapsed time: {elapsed_time:.3f}s")
-    print(f"Expected if concurrent: ~0.1s")
-    print(f"Expected if sequential: ~0.5s")
+    print("Expected if concurrent: ~0.1s")
+    print("Expected if sequential: ~0.5s")
     print(f"Status: {'✓ TRULY CONCURRENT' if elapsed_time < 0.3 else '✗ SEQUENTIAL'}")
     print(f"{'='*60}\n")
 

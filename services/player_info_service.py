@@ -2,8 +2,6 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
-import aiohttp
-
 from services.kingshot_api import KingshotAPIClient
 
 logger = logging.getLogger(__name__)

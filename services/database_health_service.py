@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-
 from sqlalchemy import text
 
 from db.session import DatabaseManager, get_db
@@ -26,4 +24,3 @@ class DatabaseHealthService:
             return True, "Reachable"
         except Exception as exc:
             return False, str(exc)
-

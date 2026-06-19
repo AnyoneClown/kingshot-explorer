@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """Database service for managing users and statistics."""
+
+from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,9 @@ from repositories.discord_repositories import (
     TranslationLogRepository,
     UserRepository,
 )
+
+if TYPE_CHECKING:
+    from db.models import GiftCode, GiftCodeRedemption, GuildConfiguration, RegisteredPlayer, TranslationLog, User
 
 logger = logging.getLogger(__name__)
 
