@@ -19,20 +19,6 @@ x-bot-common: &bot-common
         memory: 128M
 
 services:
-  translator-bot-dev:
-    <<: *bot-common
-    profiles:
-      - dev
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    container_name: discord-translator-bot-dev
-    env_file:
-      - .env
-    volumes:
-      - .:/app
-      - ./logs:/app/logs
-
   translator-bot-local:
     <<: *bot-common
     container_name: discord-translator-bot-local

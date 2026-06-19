@@ -96,13 +96,12 @@ uv run python main.py
 
 ## Docker
 
-Docker uses one Compose file with profiles:
+Docker uses one Compose file:
 
 - The default services run `translator-bot-local`, `translator-bot-global`, and Grafana Alloy.
 - `translator-bot-local` uses `.env.local` and `BOT_PROFILE=local`.
 - `translator-bot-global` uses `.env.prod` and `BOT_PROFILE=global`.
 - Grafana Alloy uses `.env.grafana` to forward bot container logs to Grafana Cloud Logs.
-- The `dev` profile runs `translator-bot-dev` with `.env` and mounts the working tree into the container.
 
 Create the real env files from the committed examples:
 
@@ -122,12 +121,6 @@ Start in the background:
 
 ```bash
 docker compose -f compose.yaml up -d --build
-```
-
-Start development bot:
-
-```bash
-docker compose -f compose.yaml --profile dev up --build translator-bot-dev
 ```
 
 Start only local/full bot:
@@ -151,7 +144,6 @@ docker compose -f compose.yaml up -d --build translator-bot-local translator-bot
 Common commands:
 
 ```bash
-docker compose -f compose.yaml logs -f translator-bot-dev
 docker compose -f compose.yaml logs -f translator-bot-local
 docker compose -f compose.yaml logs -f translator-bot-global
 docker compose -f compose.yaml logs -f translator-bot-local translator-bot-global
