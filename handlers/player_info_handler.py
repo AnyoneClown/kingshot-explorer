@@ -101,7 +101,6 @@ class PlayerInfoHandler:
                     ),
                     color=discord.Color.red(),
                 )
-                not_found_embed.set_footer(text="Tip: You can add a valid player later with /addplayer")
                 await interaction.followup.send(embed=not_found_embed)
 
                 # Track failed lookup in database
