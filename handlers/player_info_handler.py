@@ -26,6 +26,7 @@ class PlayerInfoHandler:
     ARENA_GEAR_ICON_SIZE = 56
     ARENA_STAR_ICON_SIZE = 20
     SCOUT_BOARD_TYPE_POWER = 8
+    MYSTIC_TRIAL_BOARD_TYPE = 20
     SCOUT_DEFAULT_LIMIT = 5
     SCOUT_MAX_LIMIT = 15
 
@@ -121,11 +122,13 @@ class PlayerInfoHandler:
 
             formatted_stats = self._player_info_service.format_player_stats(player_data)
             player_name = player_data.get("name", f"Player {player_id}")
+            mystic_trial = await self._get_mystic_trial(player_data, ks_data)
             embed = self._build_stats_embed(
                 player_id=player_id,
                 player_name=player_name,
                 player_data=player_data,
                 ks_data=ks_data,
+                mystic_trial=mystic_trial,
                 description=formatted_stats,
             )
 
@@ -274,11 +277,13 @@ class PlayerInfoHandler:
                 player_data = self._build_player_data_from_kingshot(data, entry, kingdom_number)
                 player_id = str(player_data.get("playerId") or fid or "")
                 player_name = player_data.get("name") or f"Player {player_id or '?'}"
+                mystic_trial = await self._get_mystic_trial(player_data, data)
                 embed = self._build_stats_embed(
                     player_id=player_id,
                     player_name=player_name,
                     player_data=player_data,
                     ks_data=data,
+                    mystic_trial=mystic_trial,
                     description=self._format_kingshot_profile_summary(player_data),
                 )
 
@@ -319,6 +324,32 @@ class PlayerInfoHandler:
             return data
         return None
 
+    async def _get_mystic_trial(
+        self,
+        player_data: dict[str, Any],
+        ks_data: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if self._kingshot_data_service is None:
+            return None
+
+        uid = self._extract_player_uid(player_data, ks_data)
+        kid = self._extract_player_kingdom(player_data, ks_data)
+        if uid is None or kid is None:
+            return None
+
+        result = await self._kingshot_data_service.search_leaderboard(self.MYSTIC_TRIAL_BOARD_TYPE, uid, kid)
+        if not result.get("success"):
+            logger.warning(
+                "Mystic Trial enrichment failed for uid %s kid %s: %s",
+                uid,
+                kid,
+                result.get("error_message") or result.get("error_code"),
+            )
+            return None
+
+        data = result.get("data")
+        return data if isinstance(data, dict) else None
+
     @classmethod
     def _build_stats_embed(
         cls,
@@ -328,6 +359,7 @@ class PlayerInfoHandler:
         player_data: dict[str, Any],
         ks_data: dict[str, Any] | None,
         description: str,
+        mystic_trial: dict[str, Any] | None = None,
     ) -> discord.Embed:
         embed = discord.Embed(
             title=f"📊 {player_name}",
@@ -349,6 +381,7 @@ class PlayerInfoHandler:
         embed.add_field(name="Power", value=cls._format_power(ks_data), inline=True)
         embed.add_field(name="VIP Level", value=cls._format_vip(ks_data), inline=True)
         embed.add_field(name="Alliance", value=cls._format_alliance(ks_data), inline=True)
+        embed.add_field(name="Mystic Trial", value=cls._format_mystic_trial(mystic_trial), inline=True)
 
         if "profilePhoto" in player_data and player_data["profilePhoto"]:
             embed.set_thumbnail(url=player_data["profilePhoto"])
@@ -1018,6 +1051,17 @@ class PlayerInfoHandler:
         return None
 
     @staticmethod
+    def _extract_player_kingdom(player_data: dict[str, Any], ks_data: dict[str, Any] | None) -> str | None:
+        for source in (ks_data, player_data):
+            if not isinstance(source, dict):
+                continue
+            for key in ("kid", "kingdom", "kingdomId", "kingdom_id"):
+                value = source.get(key)
+                if value not in (None, ""):
+                    return str(value)
+        return None
+
+    @staticmethod
     def _extract_leaderboard_entries(board_data: Any) -> list[dict[str, Any]]:
         if isinstance(board_data, dict) and isinstance(board_data.get("entries"), list):
             return [entry for entry in board_data["entries"] if isinstance(entry, dict)]
@@ -1044,9 +1088,14 @@ class PlayerInfoHandler:
         kingdom_number: int,
     ) -> dict[str, Any]:
         fid = data.get("fid") or entry.get("fid") or entry.get("playerId")
+        uid = data.get("uid") or entry.get("uid")
+        player = entry.get("player")
+        if uid is None and isinstance(player, dict):
+            uid = player.get("uid")
         return {
             "name": data.get("name") or entry.get("name"),
             "playerId": str(fid) if fid is not None else "N/A",
+            "playerUid": str(uid) if uid is not None else None,
             "level": data.get("stove_lv") or data.get("castle_level") or data.get("lv"),
             "kingdom": data.get("kid") or entry.get("kid") or kingdom_number,
         }
@@ -1100,6 +1149,21 @@ class PlayerInfoHandler:
         if aid is not None:
             return f"ID `{aid}`"
         return "N/A"
+
+    @classmethod
+    def _format_mystic_trial(cls, mystic_trial: dict[str, Any] | None) -> str:
+        if not mystic_trial:
+            return "Kingdom Rank: N/A\nScore: N/A"
+
+        entry = mystic_trial.get("entry")
+        if not isinstance(entry, dict):
+            entry = {}
+
+        rank = entry.get("rank") or mystic_trial.get("rank")
+        score = entry.get("score") if entry.get("score") is not None else mystic_trial.get("score")
+        rank_text = f"#{cls._format_number(rank)}" if rank is not None else "N/A"
+        score_text = cls._format_number(score) if score is not None else "N/A"
+        return f"Kingdom Rank: {rank_text}\nScore: {score_text}"
 
     @staticmethod
     def _format_number(value: Any) -> str:

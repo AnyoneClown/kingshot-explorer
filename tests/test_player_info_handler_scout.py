@@ -76,13 +76,19 @@ PlayerInfoHandler = load_player_info_handler()
 
 
 class FakeKingshotDataService:
-    def __init__(self, arena_result):
+    def __init__(self, arena_result=None, search_result=None):
         self.arena_result = arena_result
+        self.search_result = search_result
         self.arena_uids = []
+        self.search_calls = []
 
     async def get_arena(self, uid):
         self.arena_uids.append(uid)
         return self.arena_result
+
+    async def search_leaderboard(self, board_type, uid, kid):
+        self.search_calls.append((board_type, uid, kid))
+        return self.search_result
 
 
 def test_extract_leaderboard_entries_from_api_payload():
@@ -108,6 +114,7 @@ def test_build_stats_embed_matches_stats_style_for_scout_data():
     entry = {
         "rank": 1,
         "fid": 121704562,
+        "uid": 30669644,
         "name": "Old Name",
         "score": 572264916,
         "alliance": {"abbr": "OLD", "name": "Old Alliance"},
@@ -128,6 +135,7 @@ def test_build_stats_embed_matches_stats_style_for_scout_data():
         player_name=player_data["name"],
         player_data=player_data,
         ks_data=profile,
+        mystic_trial={"rank": 93, "entry": {"rank": 93, "score": 1239}},
         description=PlayerInfoHandler._format_kingshot_profile_summary(player_data),
     )
     fields = {field["name"]: field["value"] for field in embed.fields}
@@ -135,13 +143,39 @@ def test_build_stats_embed_matches_stats_style_for_scout_data():
     assert embed.title == "📊 Amoeba"
     assert "👤 **Name:** Amoeba" in embed.description
     assert fields["Player ID"] == "`121704562`"
+    assert player_data["playerUid"] == "30669644"
     assert fields["Kingdom"] == "830"
     assert fields["Castle Level"] == "55"
     assert fields["Power"] == "572,264,916"
     assert fields["VIP Level"] == "Hidden"
     assert fields["Alliance"] == "`[FKA]` FateKillsAll (`83900009`)"
+    assert fields["Mystic Trial"] == "Kingdom Rank: #93\nScore: 1,239"
     assert "Links" not in fields
     assert embed.footer is None
+
+
+def test_get_mystic_trial_searches_type_20_by_uid_and_kingdom():
+    service = FakeKingshotDataService(search_result={"success": True, "data": {"rank": 93, "entry": {"score": 1239}}})
+    handler = PlayerInfoHandler(
+        player_info_service=object(),
+        bot=object(),
+        interaction_tracking_service=object(),
+        kingshot_data_service=service,
+    )
+
+    result = asyncio.run(handler._get_mystic_trial({"kingdom": 830}, {"uid": 30669644}))
+
+    assert service.search_calls == [(20, "30669644", "830")]
+    assert result == {"rank": 93, "entry": {"score": 1239}}
+
+
+def test_scout_player_data_keeps_entry_uid_for_mystic_trial_search():
+    entry = {"fid": 121704562, "uid": 30669644, "kid": 830}
+    profile = {"fid": 121704562, "name": "Amoeba", "stove_lv": 55}
+
+    player_data = PlayerInfoHandler._build_player_data_from_kingshot(profile, entry, 830)
+
+    assert PlayerInfoHandler._extract_player_uid(player_data, profile) == "30669644"
 
 
 def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):

@@ -107,12 +107,26 @@ class KingshotDataService:
             params={"limit": str(limit), "resolve": str(resolve).lower()},
         )
 
-    async def search_leaderboard(self, board_type: int | str, uid: str, kid: int | str) -> Dict[str, Any]:
+    async def search_leaderboard(
+        self,
+        board_type: int | str,
+        uid: str,
+        kid: int | str,
+        *,
+        aid: int | str = 0,
+        rank_id: int | str = 0,
+    ) -> Dict[str, Any]:
         """Search one player's leaderboard entry."""
         return await self._request(
             "GET",
             "/v1/leaderboards/search",
-            params={"type": str(board_type), "uid": str(uid), "kid": str(kid)},
+            params={
+                "type": str(board_type),
+                "uid": str(uid),
+                "kid": str(kid),
+                "aid": str(aid),
+                "rank_id": str(rank_id),
+            },
         )
 
     def _build_headers(self) -> Dict[str, str]:
