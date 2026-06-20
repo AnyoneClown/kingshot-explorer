@@ -75,6 +75,10 @@ def load_player_info_handler():
 PlayerInfoHandler = load_player_info_handler()
 
 
+def test_scout_uses_mystic_trial_board_type():
+    assert PlayerInfoHandler.SCOUT_BOARD_TYPE == 20
+
+
 class FakeKingshotDataService:
     def __init__(self, arena_result=None, search_result=None):
         self.arena_result = arena_result

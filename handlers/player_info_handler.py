@@ -25,8 +25,8 @@ class PlayerInfoHandler:
     ARENA_HERO_MAX_HEIGHT = 134
     ARENA_GEAR_ICON_SIZE = 56
     ARENA_STAR_ICON_SIZE = 20
-    SCOUT_BOARD_TYPE_POWER = 8
     MYSTIC_TRIAL_BOARD_TYPE = 20
+    SCOUT_BOARD_TYPE = MYSTIC_TRIAL_BOARD_TYPE
     SCOUT_DEFAULT_LIMIT = 5
     SCOUT_MAX_LIMIT = 15
 
@@ -60,7 +60,7 @@ class PlayerInfoHandler:
             """Fetch and display player statistics."""
             await self._handle_player_stats_slash(interaction, player_id)
 
-        @self._bot.tree.command(name="scout", description="Scout top power players in a kingdom")
+        @self._bot.tree.command(name="scout", description="Scout top Mystic Trial players in a kingdom")
         @app_commands.describe(
             kingdom_number="Kingdom number to scout",
             limit="Number of leaderboard players to scout, default 5, max 15",
@@ -70,7 +70,7 @@ class PlayerInfoHandler:
             kingdom_number: int,
             limit: int = default_scout_limit,
         ):
-            """Scout top power players in a kingdom."""
+            """Scout top Mystic Trial players in a kingdom."""
             await self._handle_scout_slash(interaction, kingdom_number, limit)
 
     async def _handle_player_stats_slash(self, interaction: discord.Interaction, player_id: str):
@@ -236,7 +236,7 @@ class PlayerInfoHandler:
 
         try:
             board_result = await self._kingshot_data_service.get_kingdom_board(
-                self.SCOUT_BOARD_TYPE_POWER,
+                self.SCOUT_BOARD_TYPE,
                 kingdom_number,
                 limit=limit,
                 resolve=True,
@@ -257,7 +257,7 @@ class PlayerInfoHandler:
                 await interaction.followup.send(
                     embed=discord.Embed(
                         title=f"🔎 Scout Report - Kingdom {kingdom_number}",
-                        description="No power leaderboard entries were returned for this kingdom.",
+                        description="No Mystic Trial leaderboard entries were returned for this kingdom.",
                         color=discord.Color.orange(),
                     )
                 )

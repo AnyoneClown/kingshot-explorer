@@ -240,7 +240,7 @@ Gift code related commands include:
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
 - `/configure` is an ephemeral guild configuration panel available only to bot admins listed in `ADMIN_USER_ID` or `ADMIN_USER_IDS`. It can toggle voice replies and random AI chat replies.
-- `/scout` fetches players from KingShot leaderboard type 8 for a kingdom and returns stats-style embeds enriched by Governor ID. It defaults to 5 players and caps the limit at 15.
+- `/scout` fetches players from KingShot Mystic Trial leaderboard type 20 for a kingdom and returns stats-style embeds enriched by Governor ID. It defaults to 5 players and caps the limit at 15.
 - In `BOT_PROFILE=global`, only `/stats`, `/scout`, `/kvk`, and `/kvk_compare` are registered.
 
 ## Project Layout

@@ -260,7 +260,7 @@ These are server-side variables for the API service itself. The bot normally onl
 Current project usage:
 
 - `/stats` uses the default KingShot API for the profile image, then enriches fields from `GET /v1/players/by-fid/{fid}`.
-- `/scout` uses `GET /v1/leaderboards/kingdom/8?kid={kid}&limit={limit}&resolve=true`, then enriches returned entries with `GET /v1/players/by-fid/{fid}` and sends stats-style embeds. The command defaults to 5 players and caps the limit at 15.
+- `/scout` uses `GET /v1/leaderboards/kingdom/20?kid={kid}&limit={limit}&resolve=true`, then enriches returned entries with `GET /v1/players/by-fid/{fid}` and sends stats-style embeds. The command defaults to 5 players and caps the limit at 15.
 - `/addalliance` uses `/v1/alliances/{aid}?kid={kid}` and only imports members that include `fid`.
 
 ## Client Etiquette
