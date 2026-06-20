@@ -163,11 +163,13 @@ def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):
                     {
                         "slot": 2,
                         "id": 50021,
+                        "star": 20,
                         "equipment": [{"sid": 3, "eid": 1031501, "slv": 20, "rlv": 0}],
                     },
                     {
                         "slot": 1,
                         "id": 50024,
+                        "star": 30,
                         "exclusive_equip": 1050024,
                         "exclusive_equip_lv": 10,
                         "equipment": [
@@ -204,8 +206,24 @@ def test_get_arena_loadout_image_uses_local_hero_and_gear_ids(tmp_path):
     strip_path = tmp_path / "strip.png"
     strip_path.write_bytes(file.fp.read())
     strip = PlayerInfoHandler._read_rgba_png(strip_path)
-    assert strip["width"] == 183
-    assert strip["height"] == 190
+    assert strip["width"] == 235
+    assert strip["height"] == 216
+
+
+def test_build_star_row_image_draws_five_six_part_stars():
+    row = PlayerInfoHandler._build_star_row_image(30)
+    partial = PlayerInfoHandler._build_star_row_image(29)
+    low = PlayerInfoHandler._build_star_row_image(5)
+
+    assert row is not None
+    assert row["width"] == 108
+    assert row["height"] == PlayerInfoHandler.ARENA_STAR_ICON_SIZE
+    assert _count_yellow_pixels(row) > _count_yellow_pixels(partial) > _count_yellow_pixels(low)
+
+
+def _count_yellow_pixels(image):
+    pixels = image["pixels"]
+    return sum(1 for offset in range(0, len(pixels), 4) if pixels[offset] > 200 and pixels[offset + 1] > 200)
 
 
 def test_format_general_gear_level_wraps_red_levels():

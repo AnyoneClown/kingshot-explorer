@@ -24,6 +24,7 @@ class PlayerInfoHandler:
     ARENA_HERO_MAX_WIDTH = 76
     ARENA_HERO_MAX_HEIGHT = 134
     ARENA_GEAR_ICON_SIZE = 56
+    ARENA_STAR_ICON_SIZE = 20
     SCOUT_BOARD_TYPE_POWER = 8
     SCOUT_DEFAULT_LIMIT = 5
     SCOUT_MAX_LIMIT = 15
@@ -396,6 +397,7 @@ class PlayerInfoHandler:
             loadouts.append(
                 {
                     "hero_path": image_path,
+                    "star": self._coerce_level(hero.get("star")),
                     "exclusive_item": self._extract_hero_exclusive_item(hero),
                     "gear_items": self._extract_hero_gear_items(hero),
                 }
@@ -496,6 +498,7 @@ class PlayerInfoHandler:
             )
             for loadout in loadouts
         ]
+        star_images = [cls._build_star_row_image(loadout.get("star", 0)) for loadout in loadouts]
         exclusive_images = [
             (
                 cls._annotate_exclusive_image(
@@ -529,19 +532,28 @@ class PlayerInfoHandler:
 
         column_spacing = 10
         gear_spacing = 5
+        star_top_gap = 6
         exclusive_top_gap = 8
         gear_top_gap = 8
         max_hero_height = max(image["height"] for image in hero_images)
         column_widths = []
-        for hero_image, exclusive_image, hero_gears in zip(hero_images, exclusive_images, gear_images, strict=True):
+        for hero_image, star_image, exclusive_image, hero_gears in zip(
+            hero_images,
+            star_images,
+            exclusive_images,
+            gear_images,
+            strict=True,
+        ):
             gear_width = 0
             if hero_gears:
                 gear_columns = min(2, len(hero_gears))
                 gear_width = gear_columns * cls.ARENA_GEAR_ICON_SIZE + gear_spacing * (gear_columns - 1)
+            star_width = star_image["width"] if star_image else 0
             exclusive_width = exclusive_image["width"] if exclusive_image else 0
-            column_widths.append(max(hero_image["width"], exclusive_width, gear_width))
+            column_widths.append(max(hero_image["width"], star_width, exclusive_width, gear_width))
 
         width = sum(column_widths) + column_spacing * (len(column_widths) - 1)
+        has_star = any(star_images)
         has_exclusive = any(exclusive_images)
         has_gear = any(gear_images)
         max_gear_rows = max(((len(gears) + 1) // 2 for gears in gear_images), default=0)
@@ -551,6 +563,8 @@ class PlayerInfoHandler:
             else 0
         )
         height = max_hero_height
+        if has_star:
+            height += star_top_gap + cls.ARENA_STAR_ICON_SIZE
         if has_exclusive:
             height += exclusive_top_gap + cls.ARENA_GEAR_ICON_SIZE
         if has_gear:
@@ -558,9 +572,10 @@ class PlayerInfoHandler:
         canvas = bytearray(width * height * 4)
 
         offset_x = 0
-        for column_width, hero_image, exclusive_image, hero_gears in zip(
+        for column_width, hero_image, star_image, exclusive_image, hero_gears in zip(
             column_widths,
             hero_images,
+            star_images,
             exclusive_images,
             gear_images,
             strict=True,
@@ -569,10 +584,16 @@ class PlayerInfoHandler:
             cls._paste_rgba(canvas, width, hero_image, hero_left, 0)
 
             gear_top = max_hero_height
+            if has_star:
+                if star_image:
+                    star_left = offset_x + (column_width - star_image["width"]) // 2
+                    cls._paste_rgba(canvas, width, star_image, star_left, max_hero_height + star_top_gap)
+                gear_top += star_top_gap + cls.ARENA_STAR_ICON_SIZE
+
             if has_exclusive:
                 if exclusive_image:
                     exclusive_left = offset_x + (column_width - exclusive_image["width"]) // 2
-                    cls._paste_rgba(canvas, width, exclusive_image, exclusive_left, max_hero_height + exclusive_top_gap)
+                    cls._paste_rgba(canvas, width, exclusive_image, exclusive_left, gear_top + exclusive_top_gap)
                 gear_top += exclusive_top_gap + cls.ARENA_GEAR_ICON_SIZE
 
             if hero_gears:
@@ -615,6 +636,43 @@ class PlayerInfoHandler:
                 resized[dst : dst + 4] = source_pixels[src : src + 4]
 
         return {"width": width, "height": height, "pixels": bytes(resized)}
+
+    @classmethod
+    def _build_star_row_image(cls, star: int) -> dict[str, Any] | None:
+        if star <= 0:
+            return None
+
+        gap = 2
+        size = cls.ARENA_STAR_ICON_SIZE
+        width = 5 * size + 4 * gap
+        image = {"width": width, "height": size, "pixels": bytearray(width * size * 4)}
+        parts = max(0, min(star, 30))
+        for index in range(5):
+            cls._draw_six_part_star(image, index * (size + gap), 0, max(0, min(parts - index * 6, 6)))
+        image["pixels"] = bytes(image["pixels"])
+        return image
+
+    @classmethod
+    def _draw_six_part_star(cls, image: dict[str, Any], left: int, top: int, filled_parts: int) -> None:
+        filled = (255, 238, 142, 245)
+        empty = (73, 86, 88, 180)
+        outline = (116, 111, 70, 160)
+        size = cls.ARENA_STAR_ICON_SIZE
+        center_x = left + size // 2
+        center_y = top + size // 2
+        petals = (
+            (center_x, top + 3),
+            (left + size - 4, top + 6),
+            (left + size - 4, top + size - 6),
+            (center_x, top + size - 3),
+            (left + 4, top + size - 6),
+            (left + 4, top + 6),
+        )
+        for index, (x, y) in enumerate(petals):
+            cls._draw_diamond(image, x, y, 4, filled if index < filled_parts else empty)
+        cls._draw_diamond(image, center_x, center_y, 3, filled if filled_parts else empty)
+        for x, y in petals:
+            cls._draw_diamond_outline(image, x, y, 4, outline)
 
     @classmethod
     def _annotate_exclusive_image(cls, image: dict[str, Any], lv: int) -> dict[str, Any]:
@@ -720,6 +778,27 @@ class PlayerInfoHandler:
             for xx in range(max(0, x), min(image_width, x + width)):
                 offset = (yy * image_width + xx) * 4
                 PlayerInfoHandler._blend_pixel(pixels, offset, color)
+
+    @classmethod
+    def _draw_diamond(cls, image: dict[str, Any], center_x: int, center_y: int, radius: int, color: tuple[int, int, int, int]) -> None:
+        for y in range(center_y - radius, center_y + radius + 1):
+            for x in range(center_x - radius, center_x + radius + 1):
+                if abs(x - center_x) + abs(y - center_y) <= radius:
+                    cls._draw_rect(image, x, y, 1, 1, color)
+
+    @classmethod
+    def _draw_diamond_outline(
+        cls,
+        image: dict[str, Any],
+        center_x: int,
+        center_y: int,
+        radius: int,
+        color: tuple[int, int, int, int],
+    ) -> None:
+        for y in range(center_y - radius, center_y + radius + 1):
+            for x in range(center_x - radius, center_x + radius + 1):
+                if abs(x - center_x) + abs(y - center_y) == radius:
+                    cls._draw_rect(image, x, y, 1, 1, color)
 
     @staticmethod
     def _draw_text(
