@@ -190,14 +190,16 @@ class TranslatorBot:
             )
             self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
             self.database_handler = DatabaseHandler(self.bot)
-            self.status_handler = StatusHandler(
-                self.bot,
-                config,
-                event_handler=self.event_handler,
-                gift_code_handler=self.gift_code_handler,
-                database_health_service=self.database_health_service,
-                started_at=self.started_at,
-            )
+
+        self.status_handler = StatusHandler(
+            self.bot,
+            config,
+            event_handler=self.event_handler,
+            gift_code_handler=self.gift_code_handler,
+            database_health_service=self.database_health_service,
+            kingshot_data_service=self.kingshot_data_service,
+            started_at=self.started_at,
+        )
         logger.info("All handlers initialized")
 
         # Setup bot
@@ -289,7 +291,7 @@ class TranslatorBot:
             self.kingshot_rag_handler.register_commands()
             self.database_handler.register_commands()
             self.database_handler.register_events()
-            self.status_handler.register_commands()
+        self.status_handler.register_commands()
         logger.info("All command handlers registered")
 
     def run(self):

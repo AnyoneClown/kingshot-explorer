@@ -77,8 +77,8 @@ Use `ADMIN_USER_IDS=123,456` instead of `ADMIN_USER_ID` if multiple Discord user
 
 `BOT_PROFILE` controls which bot surface starts from the same codebase:
 
-- `local` starts every current feature: translation, chat replies, events, gift code automation, admin/config/database commands, player stats, scout, and KVK. This profile requires `NVIDIA_API_KEY`.
-- `global` starts only the public command set: `/stats`, `/scout`, `/kvk`, and `/kvk_compare`. It does not start event scheduling, gift-code polling, RAG, translation, voice replies, admin/config, or database command handlers, and does not require `NVIDIA_API_KEY`.
+- `local` starts every current feature: translation, chat replies, events, gift code automation, admin/config/database commands, player stats, scout, KVK, and `/status`. This profile requires `NVIDIA_API_KEY`.
+- `global` starts only the public command set: `/stats`, `/scout`, `/kvk`, `/kvk_compare`, and `/status`. It does not start event scheduling, gift-code polling, RAG, translation, voice replies, admin/config, or database command handlers, and does not require `NVIDIA_API_KEY`.
 
 When running without Docker, start the local and global bots as two separate processes with different `DISCORD_TOKEN` and `BOT_PROFILE` environment values.
 
@@ -241,7 +241,8 @@ Additional commands are provided by translation, event, player info, KVK, and da
 
 - `/configure` is an ephemeral guild configuration panel available only to bot admins listed in `ADMIN_USER_ID` or `ADMIN_USER_IDS`. It can toggle voice replies and random AI chat replies.
 - `/scout` fetches players from KingShot Mystic Trial leaderboard type 20 for a kingdom and returns stats-style embeds enriched by Governor ID. It defaults to 5 players and caps the limit at 15.
-- In `BOT_PROFILE=global`, only `/stats`, `/scout`, `/kvk`, and `/kvk_compare` are registered.
+- `/status` returns a private health summary for Discord, the database, KingShot Data API, and profile-specific background workers.
+- In `BOT_PROFILE=global`, only `/stats`, `/scout`, `/kvk`, `/kvk_compare`, and `/status` are registered.
 
 ## Project Layout
 

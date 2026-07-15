@@ -32,6 +32,11 @@ No auth is required:
 curl https://ks.jeab.dev/healthz
 ```
 
+`KingshotDataService.get_health()` calls this endpoint without requiring an API key. The
+bot's private `/status` response uses it to distinguish a reachable gateway from
+a degraded or unavailable one. This integration is verified with a mocked HTTP
+transport and status-handler tests covering healthy and degraded responses.
+
 ## Player Endpoints
 
 Use `fid` for the Governor ID shown in game. Use `uid` only when the API has already returned it.

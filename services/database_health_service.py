@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import text
 
 from db.session import DatabaseManager, get_db
+
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseHealthService:
@@ -22,5 +27,6 @@ class DatabaseHealthService:
             async with db.session() as session:
                 await session.execute(text("SELECT 1"))
             return True, "Reachable"
-        except Exception as exc:
-            return False, str(exc)
+        except Exception:
+            logger.exception("Database health check failed")
+            return False, "Unavailable"

@@ -60,6 +60,10 @@ class KingshotDataService:
             )
         return self._client
 
+    async def get_health(self) -> Dict[str, Any]:
+        """Fetch unauthenticated KingShot Data API and gateway health."""
+        return await self._request("GET", "/healthz", require_api_key=False)
+
     async def get_arena(self, uid: str) -> Dict[str, Any]:
         """Fetch arena team for internal player uid."""
         return await self._request("GET", f"/v1/arena/{uid}")
@@ -135,8 +139,15 @@ class KingshotDataService:
             headers["X-API-Key"] = self._api_key
         return headers
 
-    async def _request(self, method: str, path: str, *, params: Dict[str, str] | None = None) -> Dict[str, Any]:
-        if not self._api_key:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Dict[str, str] | None = None,
+        require_api_key: bool = True,
+    ) -> Dict[str, Any]:
+        if require_api_key and not self._api_key:
             logger.warning("KingShot Data API request blocked: missing API key")
             return {
                 "success": False,
