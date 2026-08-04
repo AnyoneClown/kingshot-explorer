@@ -303,62 +303,11 @@ class GiftCodeHandler:
                             channel_id=None,
                         )
 
-                        success_count = len(
-                            [result for result in results if result.get("status_category") == self.STATUS_SUCCESS]
+                        await self._send_auto_redemption_announcement(
+                            gift_code=new_code,
+                            total_players=len(registered_players),
+                            results=results,
                         )
-                        already_redeemed_count = len(
-                            [
-                                result
-                                for result in results
-                                if result.get("status_category") == self.STATUS_ALREADY_REDEEMED
-                            ]
-                        )
-                        api_rejected_count = len(
-                            [
-                                result
-                                for result in results
-                                if result.get("status_category") == self.STATUS_API_REJECTED
-                            ]
-                        )
-                        invalid_id_count = len(
-                            [result for result in results if result.get("status_category") == self.STATUS_INVALID_ID]
-                        )
-
-                        # Send Discord announcement if channels are configured
-                        if self._config.auto_redeem_channels:
-                            embed = discord.Embed(
-                                title="🎁 New Gift Code Found!",
-                                description="Auto-redemption triggered for newly discovered gift code.",
-                                color=discord.Color.brand_green(),
-                            )
-                            embed.add_field(name="Gift Code", value=f"`{new_code}`", inline=False)
-                            embed.add_field(
-                                name="Auto-Redeem Status",
-                                value=(
-                                    f"✅ **Success**: {success_count}\n"
-                                    f"🔄 **Already Claimed**: {already_redeemed_count}\n"
-                                    f"🚫 **API Rejected**: {api_rejected_count}\n"
-                                    f"🆔 **Invalid ID**: {invalid_id_count}\n"
-                                    f"👥 **Total Players**: {len(registered_players)}"
-                                ),
-                                inline=False,
-                            )
-                            embed.set_footer(text="Check in-game mail for successfully redeemed codes!")
-
-                            for channel_id in self._config.auto_redeem_channels:
-                                channel = self._bot.get_channel(channel_id)
-                                if channel and isinstance(channel, discord.TextChannel):
-                                    try:
-                                        await channel.send(embed=embed)
-                                        logger.info(f"Announced gift code {new_code} in channel {channel_id}")
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Failed to send gift code announcement to channel {channel_id}: {e}"
-                                        )
-                                else:
-                                    logger.warning(
-                                        f"Configured auto-redeem channel {channel_id} not found or is not a text channel"
-                                    )
 
             except socket.gaierror as e:
                 self._mark_poll_backoff(e)
@@ -378,6 +327,75 @@ class GiftCodeHandler:
     def is_polling_running(self) -> bool:
         """Return whether the gift-code polling loop is currently active."""
         return bool(self._polling_loop and self._polling_loop.is_running())
+
+    async def _send_auto_redemption_announcement(
+        self,
+        *,
+        gift_code: str,
+        total_players: int,
+        results: list[dict[str, Any]],
+    ) -> None:
+        """Announce an auto-redemption only when at least one redemption succeeded."""
+        success_count = sum(
+            result.get("status_category") == self.STATUS_SUCCESS for result in results
+        )
+        if success_count == 0:
+            logger.info(
+                "Skipping announcement for gift code %s because no redemptions succeeded",
+                gift_code,
+            )
+            return
+
+        if not self._config.auto_redeem_channels:
+            return
+
+        already_redeemed_count = sum(
+            result.get("status_category") == self.STATUS_ALREADY_REDEEMED
+            for result in results
+        )
+        api_rejected_count = sum(
+            result.get("status_category") == self.STATUS_API_REJECTED for result in results
+        )
+        invalid_id_count = sum(
+            result.get("status_category") == self.STATUS_INVALID_ID for result in results
+        )
+
+        embed = discord.Embed(
+            title="🎁 New Gift Code Found!",
+            description="Auto-redemption triggered for newly discovered gift code.",
+            color=discord.Color.brand_green(),
+        )
+        embed.add_field(name="Gift Code", value=f"`{gift_code}`", inline=False)
+        embed.add_field(
+            name="Auto-Redeem Status",
+            value=(
+                f"✅ **Success**: {success_count}\n"
+                f"🔄 **Already Claimed**: {already_redeemed_count}\n"
+                f"🚫 **API Rejected**: {api_rejected_count}\n"
+                f"🆔 **Invalid ID**: {invalid_id_count}\n"
+                f"👥 **Total Players**: {total_players}"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Check in-game mail for successfully redeemed codes!")
+
+        for channel_id in self._config.auto_redeem_channels:
+            channel = self._bot.get_channel(channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.send(embed=embed)
+                    logger.info("Announced gift code %s in channel %s", gift_code, channel_id)
+                except Exception as e:
+                    logger.error(
+                        "Failed to send gift code announcement to channel %s: %s",
+                        channel_id,
+                        e,
+                    )
+            else:
+                logger.warning(
+                    "Configured auto-redeem channel %s not found or is not a text channel",
+                    channel_id,
+                )
 
     async def _handle_list_gift_codes_slash(self, interaction: discord.Interaction):
         """Handle listing available gift codes."""

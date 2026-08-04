@@ -53,6 +53,62 @@ def make_handler(gift_code_service=None, tracking_service=None):
 
 
 @pytest.mark.asyncio
+async def test_auto_redemption_does_not_announce_when_every_result_failed(monkeypatch):
+    class FakeChannel:
+        def __init__(self):
+            self.sent_embeds = []
+
+        async def send(self, *, embed):
+            self.sent_embeds.append(embed)
+
+    channel = FakeChannel()
+    handler = make_handler()
+    handler._config.auto_redeem_channels = {123}
+    handler._bot.get_channel = lambda channel_id: channel if channel_id == 123 else None
+    monkeypatch.setattr("handlers.gift_code_handler.discord.TextChannel", FakeChannel)
+
+    await handler._send_auto_redemption_announcement(
+        gift_code="CODE",
+        total_players=3,
+        results=[
+            {"status_category": handler.STATUS_API_REJECTED},
+            {"status_category": handler.STATUS_INVALID_ID},
+            {"status_category": handler.STATUS_ALREADY_REDEEMED},
+        ],
+    )
+
+    assert channel.sent_embeds == []
+
+
+@pytest.mark.asyncio
+async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatch):
+    class FakeChannel:
+        def __init__(self):
+            self.sent_embeds = []
+
+        async def send(self, *, embed):
+            self.sent_embeds.append(embed)
+
+    channel = FakeChannel()
+    handler = make_handler()
+    handler._config.auto_redeem_channels = {123}
+    handler._bot.get_channel = lambda channel_id: channel if channel_id == 123 else None
+    monkeypatch.setattr("handlers.gift_code_handler.discord.TextChannel", FakeChannel)
+
+    await handler._send_auto_redemption_announcement(
+        gift_code="CODE",
+        total_players=2,
+        results=[
+            {"status_category": handler.STATUS_SUCCESS},
+            {"status_category": handler.STATUS_API_REJECTED},
+        ],
+    )
+
+    assert len(channel.sent_embeds) == 1
+    assert "✅ **Success**: 1" in channel.sent_embeds[0].fields[1].value
+
+
+@pytest.mark.asyncio
 async def test_bulk_redemption_prefetches_and_persists_in_batches():
     gift_service = FakeGiftCodeService()
     tracking = FakeTrackingService()

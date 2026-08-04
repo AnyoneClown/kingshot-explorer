@@ -27,7 +27,7 @@ Gift code support includes:
 - Polling upstream gift code source every 10 minutes.
 - Auto-redeeming newly discovered codes for enabled players.
 - Logging redemption attempts to the database.
-- Posting summary embeds to optional announcement channels.
+- Posting summary embeds to optional announcement channels when at least one auto-redemption succeeds.
 
 The redemption summary now separates outcomes by category instead of a single generic failure bucket.
 
