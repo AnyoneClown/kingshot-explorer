@@ -237,6 +237,14 @@ Gift code related commands include:
 - /playerlist (alias)
 - /giftcodes
 
+Gift-code redemption normally uses each Governor ID's kingdom cached in the database.
+If Century Games rejects that player/kingdom pair after a transfer, the bot refreshes the
+player through the configured KingShot Data API and retries once with the new kingdom.
+It validates a code with one player before starting bounded bulk batches, so expired,
+unknown, or globally exhausted codes do not produce hundreds of redundant requests.
+Completion announcements include all-failure and early-abort outcomes as well as
+successful runs.
+
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
 - `/configure` is an ephemeral guild configuration panel available only to bot admins listed in `ADMIN_USER_ID` or `ADMIN_USER_IDS`. It can toggle voice replies and random AI chat replies.

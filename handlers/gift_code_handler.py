@@ -97,11 +97,13 @@ class GiftCodeHandler:
     STATUS_ALREADY_REDEEMED = "already_redeemed"
     STATUS_API_REJECTED = "api_rejected"
     STATUS_INVALID_ID = "invalid_id"
+    STATUS_SKIPPED = "skipped"
     REDEEM_MAX_RETRIES = 2
+    REDEEM_RATE_LIMIT_MAX_RETRIES = 3
     REDEEM_RETRY_DELAY_SECONDS = 1.0
     REDEEM_RETRY_MAX_DELAY_SECONDS = 30.0
-    REDEEM_RATE_LIMIT_DELAY_SECONDS = 8.0
-    REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS = 45.0
+    REDEEM_RATE_LIMIT_DELAY_SECONDS = 60.0
+    REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
     REDEEM_CONCURRENCY = 3
 
     def __init__(
@@ -335,17 +337,10 @@ class GiftCodeHandler:
         total_players: int,
         results: list[dict[str, Any]],
     ) -> None:
-        """Announce an auto-redemption only when at least one redemption succeeded."""
+        """Announce the final auto-redemption outcome, including rejected codes."""
         success_count = sum(
             result.get("status_category") == self.STATUS_SUCCESS for result in results
         )
-        if success_count == 0:
-            logger.info(
-                "Skipping announcement for gift code %s because no redemptions succeeded",
-                gift_code,
-            )
-            return
-
         if not self._config.auto_redeem_channels:
             return
 
@@ -359,11 +354,31 @@ class GiftCodeHandler:
         invalid_id_count = sum(
             result.get("status_category") == self.STATUS_INVALID_ID for result in results
         )
+        skipped_count = sum(
+            result.get("status_category") == self.STATUS_SKIPPED for result in results
+        )
+
+        global_code_error = next(
+            (result for result in results if self._is_global_code_rejection(result)),
+            None,
+        )
+        if global_code_error is not None:
+            title = "❌ Gift Code Rejected"
+            description = str(global_code_error.get("message") or "The gift code was rejected.")
+            color = discord.Color.red()
+        elif success_count > 0:
+            title = "🎁 New Gift Code Found!"
+            description = "Auto-redemption completed for a newly discovered gift code."
+            color = discord.Color.brand_green()
+        else:
+            title = "❌ Auto-Redemption Failed"
+            description = "Auto-redemption completed without a successful claim."
+            color = discord.Color.red()
 
         embed = discord.Embed(
-            title="🎁 New Gift Code Found!",
-            description="Auto-redemption triggered for newly discovered gift code.",
-            color=discord.Color.brand_green(),
+            title=title,
+            description=description,
+            color=color,
         )
         embed.add_field(name="Gift Code", value=f"`{gift_code}`", inline=False)
         embed.add_field(
@@ -373,6 +388,7 @@ class GiftCodeHandler:
                 f"🔄 **Already Claimed**: {already_redeemed_count}\n"
                 f"🚫 **API Rejected**: {api_rejected_count}\n"
                 f"🆔 **Invalid ID**: {invalid_id_count}\n"
+                f"⏭️ **Skipped**: {skipped_count}\n"
                 f"👥 **Total Players**: {total_players}"
             ),
             inline=False,
@@ -545,15 +561,24 @@ class GiftCodeHandler:
         already_redeemed_results = [r for r in results if r.get("status_category") == self.STATUS_ALREADY_REDEEMED]
         api_rejected_results = [r for r in results if r.get("status_category") == self.STATUS_API_REJECTED]
         invalid_id_results = [r for r in results if r.get("status_category") == self.STATUS_INVALID_ID]
+        skipped_results = [r for r in results if r.get("status_category") == self.STATUS_SKIPPED]
 
         success_count = len(success_results)
         already_redeemed_count = len(already_redeemed_results)
         api_rejected_count = len(api_rejected_results)
         invalid_id_count = len(invalid_id_results)
+        skipped_count = len(skipped_results)
         total_count = len(results)
+        global_code_error = next(
+            (result for result in results if self._is_global_code_rejection(result)),
+            None,
+        )
 
         # Create embed
-        if success_count == total_count:
+        if global_code_error is not None:
+            color = discord.Color.red()
+            title = "❌ Gift Code Rejected"
+        elif success_count == total_count:
             color = discord.Color.green()
             title = "✅ All Gift Codes Redeemed Successfully!"
         elif success_count > 0:
@@ -569,7 +594,8 @@ class GiftCodeHandler:
             f"**✅ Success:** {success_count}/{total_count}\n"
             f"**🔄 Already Redeemed:** {already_redeemed_count}/{total_count}\n"
             f"**🚫 API Rejected:** {api_rejected_count}/{total_count}\n"
-            f"**🆔 Invalid ID:** {invalid_id_count}/{total_count}",
+            f"**🆔 Player/Kingdom Error:** {invalid_id_count}/{total_count}\n"
+            f"**⏭️ Skipped:** {skipped_count}/{total_count}",
             color=color,
         )
 
@@ -596,8 +622,15 @@ class GiftCodeHandler:
 
         if invalid_id_results:
             embed.add_field(
-                name="🆔 Invalid ID",
+                name="🆔 Player/Kingdom Error",
                 value=self._format_result_lines(invalid_id_results, "🆔"),
+                inline=False,
+            )
+
+        if skipped_results:
+            embed.add_field(
+                name="⏭️ Skipped Without API Request",
+                value=self._format_result_lines(skipped_results, "⏭️"),
                 inline=False,
             )
 
@@ -605,21 +638,26 @@ class GiftCodeHandler:
             text=(
                 f"🎮 Check in-game mail for successful claims • "
                 f"Retry policy: {self.REDEEM_MAX_RETRIES} transient retries; "
-                "429 retries until the rate limit clears"
+                f"up to {self.REDEEM_RATE_LIMIT_MAX_RETRIES} rate-limit retries"
             )
         )
 
         await interaction.followup.send(embed=embed)
         logger.info(
-            "Bulk redemption completed: success=%s, already_redeemed=%s, api_rejected=%s, invalid_id=%s",
+            "Bulk redemption completed: success=%s, already_redeemed=%s, "
+            "api_rejected=%s, invalid_id=%s, skipped=%s",
             success_count,
             already_redeemed_count,
             api_rejected_count,
             invalid_id_count,
+            skipped_count,
         )
 
     def _categorize_redemption_status(self, result: Dict) -> str:
         """Map API/database redemption result into a single status category."""
+        if result.get("skipped", False):
+            return self.STATUS_SKIPPED
+
         if result.get("success", False):
             return self.STATUS_SUCCESS
 
@@ -630,10 +668,29 @@ class GiftCodeHandler:
         ):
             return self.STATUS_ALREADY_REDEEMED
 
-        if result.get("error_code") in {"INVALID_ID", "INVALID_USER_ID", "INVALID_PLAYER_ID"}:
+        if result.get("error_code") in {
+            "INVALID_ID",
+            "INVALID_USER_ID",
+            "INVALID_PLAYER_ID",
+            "KINGDOM_MISMATCH",
+            "MISSING_KINGDOM",
+            "PLAYER_LOOKUP_FAILED",
+        }:
             return self.STATUS_INVALID_ID
 
         return self.STATUS_API_REJECTED
+
+    @staticmethod
+    def _is_global_code_rejection(result: Dict[str, Any]) -> bool:
+        """Return whether one response proves the code is unusable for every player."""
+        if result.get("global_code_error") is True:
+            return True
+
+        return result.get("error_code") in {
+            "GIFT_CODE_EXPIRED",
+            "GIFT_CODE_NOT_FOUND",
+            "GIFT_CODE_CLAIM_LIMIT_REACHED",
+        }
 
     def _is_retryable_redemption_result(self, result: Dict) -> bool:
         """Return whether a failed redemption looks transient enough to retry."""
@@ -645,7 +702,19 @@ class GiftCodeHandler:
             raw_code = result["error_details"].get("err_code")
 
         code = str(raw_code or "").upper()
-        retryable_codes = {"API_ERROR", "UNEXPECTED_ERROR", "UNKNOWN_ERROR", "429", "500", "502", "503", "504"}
+        retryable_codes = {
+            "API_ERROR",
+            "UNEXPECTED_ERROR",
+            "UNKNOWN_ERROR",
+            "TIMEOUT_RETRY",
+            "RATE_LIMITED",
+            "40019",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+        }
         if code in retryable_codes:
             return True
 
@@ -659,6 +728,7 @@ class GiftCodeHandler:
         message = str(result.get("message") or "").lower()
         retryable_phrases = (
             "rate limit",
+            "too frequent",
             "too many requests",
             "timeout",
             "timed out",
@@ -679,13 +749,14 @@ class GiftCodeHandler:
             raw_code = result["error_details"].get("err_code")
 
         code = str(raw_code or "").upper()
-        if code == "429":
+        if code in {"RATE_LIMITED", "40019", "429"}:
             return True
 
         message = str(result.get("message") or "").lower()
         return (
             "429" in message
             or "rate limit" in message
+            or "too frequent" in message
             or "too many requests" in message
         )
 
@@ -713,6 +784,132 @@ class GiftCodeHandler:
             "status_category": GiftCodeHandler.STATUS_INVALID_ID,
             "should_log": False,
         }
+
+    @staticmethod
+    def _player_lookup_failure_result(player: Any, message: str) -> Dict[str, Any]:
+        return {
+            "player_id": str(player.player_id),
+            "player_name": getattr(player, "player_name", None),
+            "success": False,
+            "message": message,
+            "error_code": "PLAYER_LOOKUP_FAILED",
+            "status_category": GiftCodeHandler.STATUS_INVALID_ID,
+            "should_log": False,
+        }
+
+    @staticmethod
+    def _skipped_after_global_error_result(
+        player: Any,
+        global_error: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        reason = str(global_error.get("message") or "The gift code was rejected.")
+        return {
+            "player_id": str(player.player_id),
+            "player_name": getattr(player, "player_name", None),
+            "success": False,
+            "message": f"Skipped without an API request: {reason}",
+            "error_code": "SKIPPED_GLOBAL_CODE_ERROR",
+            "status_category": GiftCodeHandler.STATUS_SKIPPED,
+            "skipped": True,
+            "should_log": False,
+        }
+
+    @staticmethod
+    def _cached_redemption_player(player: Any) -> dict[str, Any] | None:
+        """Build a redemption profile from the registered player's database values."""
+        player_id = str(player.player_id)
+        cached_kingdom = getattr(player, "kingdom", None)
+        if cached_kingdom in (None, "", 0, "0"):
+            return None
+
+        return {
+            "playerId": player_id,
+            "playerUid": getattr(player, "player_uid", None),
+            "name": getattr(player, "player_name", None),
+            "kingdom": str(cached_kingdom),
+            "level": getattr(player, "castle_level", None),
+        }
+
+    async def _fetch_redemption_player_from_jeab(
+        self,
+        player: Any,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Fetch the current player profile from Jeab."""
+        player_id = str(player.player_id)
+
+        if self._kingshot_data_service is None:
+            return None, self._player_lookup_failure_result(
+                player,
+                "Jeab player lookup is unavailable.",
+            )
+
+        try:
+            response = await self._kingshot_data_service.get_player_by_fid(player_id)
+            data = response.get("data") if isinstance(response, dict) else None
+            if isinstance(response, dict) and response.get("success") is True and isinstance(data, dict):
+                if data.get("error"):
+                    return None, self._player_lookup_failure_result(
+                        player,
+                        f"Jeab could not resolve this player: {data['error']}",
+                    )
+
+                kingdom = data.get("kid")
+                if kingdom not in (None, "", 0, "0"):
+                    return {
+                        "playerId": str(data.get("fid") or player_id),
+                        "playerUid": str(data["uid"]) if data.get("uid") is not None else None,
+                        "name": data.get("name") or getattr(player, "player_name", None),
+                        "kingdom": str(kingdom),
+                        "level": data.get("stove_lv") or data.get("lv"),
+                    }, None
+
+                lookup_error = "Jeab returned no kingdom for this player."
+            else:
+                lookup_error = str(
+                    (response.get("error_message") if isinstance(response, dict) else None)
+                    or (response.get("message") if isinstance(response, dict) else None)
+                    or "Jeab player lookup failed."
+                )
+        except Exception as exc:
+            lookup_error = f"Jeab player lookup failed: {exc}"
+            logger.warning(
+                "Jeab player lookup crashed for player %s: %s",
+                player_id,
+                exc,
+                exc_info=True,
+            )
+
+        return None, self._player_lookup_failure_result(
+            player,
+            lookup_error,
+        )
+
+    async def _resolve_redemption_player(
+        self,
+        player: Any,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Use the database kingdom, fetching Jeab only when it is missing."""
+        cached_profile = self._cached_redemption_player(player)
+        if cached_profile is not None:
+            return cached_profile, None
+
+        return await self._fetch_redemption_player_from_jeab(player)
+
+    @staticmethod
+    def _is_kingdom_mismatch_result(result: Dict[str, Any]) -> bool:
+        """Return whether CenturyGame rejected the supplied player/kingdom pair."""
+        raw_code = result.get("error_code")
+        if isinstance(result.get("error_details"), dict):
+            upstream_code = result["error_details"].get("err_code")
+        else:
+            upstream_code = None
+
+        api_status = " ".join(str(result.get("api_status") or "").strip().rstrip(".").upper().split())
+        return (
+            str(raw_code or "").upper() == "KINGDOM_MISMATCH"
+            or str(upstream_code or "") == "40020"
+            or api_status == "USER INFO ERROR"
+        )
 
     def _build_metadata_rows_from_result(
         self,
@@ -810,7 +1007,7 @@ class GiftCodeHandler:
         guild_id: int | None,
         channel_id: int | None,
     ) -> list[dict[str, Any]]:
-        """Redeem one code for many players with one prefetch and bulk persistence."""
+        """Redeem one code in bounded batches and stop on global code errors."""
         already_redeemed = await self._gift_code_service.get_redeemed_players(None, gift_code)
         indexed_results: list[tuple[int, dict[str, Any]]] = []
         pending: list[tuple[int, Any, int]] = []
@@ -830,35 +1027,129 @@ class GiftCodeHandler:
 
             pending.append((index, player, player_id_int))
 
-        semaphore = asyncio.Semaphore(self.REDEEM_CONCURRENCY)
-
         async def redeem_one(index: int, player: Any, player_id_int: int) -> tuple[int, dict[str, Any]]:
+            cached_profile = self._cached_redemption_player(player)
+            player_profile, lookup_failure = await self._resolve_redemption_player(player)
+            if lookup_failure is not None:
+                return index, lookup_failure
+
+            assert player_profile is not None
             result = await self._redeem_with_retries(
                 player_id_int=player_id_int,
+                kingdom_id=str(player_profile["kingdom"]),
                 gift_code=gift_code,
                 player_id_for_logs=str(player.player_id),
-                semaphore=semaphore,
             )
 
-            player_profile = result.get("player_profile") or {}
+            # A transfer makes the database kingdom stale. Only refresh Jeab after
+            # CenturyGame rejects a cached player/kingdom pair, then retry once with
+            # the newly reported kingdom.
+            if cached_profile is not None and self._is_kingdom_mismatch_result(result):
+                refreshed_profile, refresh_failure = await self._fetch_redemption_player_from_jeab(player)
+                if refreshed_profile is not None:
+                    cached_kingdom = str(player_profile["kingdom"])
+                    refreshed_kingdom = str(refreshed_profile["kingdom"])
+                    player_profile = refreshed_profile
+
+                    if refreshed_kingdom != cached_kingdom:
+                        logger.info(
+                            "Player %s moved from kingdom %s to %s; retrying gift code '%s' once",
+                            player.player_id,
+                            cached_kingdom,
+                            refreshed_kingdom,
+                            gift_code,
+                        )
+                        first_attempts = int(result.get("attempts") or 1)
+                        result = await self._redeem_with_retries(
+                            player_id_int=player_id_int,
+                            kingdom_id=refreshed_kingdom,
+                            gift_code=gift_code,
+                            player_id_for_logs=str(player.player_id),
+                        )
+                        total_attempts = first_attempts + int(result.get("attempts") or 1)
+                        result = {
+                            **result,
+                            "attempts": total_attempts,
+                            "retries": max(0, total_attempts - 1),
+                            "kingdom_refreshed": True,
+                            "previous_kingdom": cached_kingdom,
+                            "refreshed_kingdom": refreshed_kingdom,
+                        }
+                    else:
+                        logger.warning(
+                            "CenturyGame rejected kingdom %s for player %s, but Jeab returned the same kingdom",
+                            cached_kingdom,
+                            player.player_id,
+                        )
+                else:
+                    logger.warning(
+                        "CenturyGame rejected cached kingdom %s for player %s and Jeab refresh failed: %s",
+                        player_profile["kingdom"],
+                        player.player_id,
+                        refresh_failure.get("message") if refresh_failure else "unknown error",
+                    )
+
             normalized_result = {
                 "player_id": str(player.player_id),
-                "player_name": player_profile.get("name") or player.player_name,
+                "player_name": player_profile.get("name") or getattr(player, "player_name", None),
                 "success": result.get("success", False),
                 "message": result.get("message", "Unknown error"),
                 "error_code": result.get("error_code"),
+                "api_status": result.get("api_status"),
+                "global_code_error": result.get("global_code_error", False),
                 "already_redeemed": result.get("already_redeemed", False),
                 "already_redeemed_by_api": result.get("already_redeemed_by_api", False),
                 "status_category": self._categorize_redemption_status(result),
-                "player_profile": result.get("player_profile"),
+                "player_profile": player_profile,
                 "attempts": result.get("attempts"),
                 "retries": result.get("retries", 0),
+                "redemption_attempted": True,
                 "should_log": True,
             }
             return index, normalized_result
 
-        if pending:
-            indexed_results.extend(await asyncio.gather(*(redeem_one(*item) for item in pending)))
+        next_pending_index = 0
+        global_error: dict[str, Any] | None = None
+
+        # Probe one usable player before scheduling bulk work. A bad, expired, or
+        # exhausted code therefore costs one redemption request, not 500+.
+        while next_pending_index < len(pending):
+            probe_result = await redeem_one(*pending[next_pending_index])
+            indexed_results.append(probe_result)
+            next_pending_index += 1
+
+            if self._is_global_code_rejection(probe_result[1]):
+                global_error = probe_result[1]
+                break
+            if probe_result[1].get("redemption_attempted"):
+                break
+
+        if global_error is None:
+            while next_pending_index < len(pending):
+                batch = pending[next_pending_index : next_pending_index + self.REDEEM_CONCURRENCY]
+                batch_results = await asyncio.gather(*(redeem_one(*item) for item in batch))
+                indexed_results.extend(batch_results)
+                next_pending_index += len(batch)
+
+                global_error = next(
+                    (result for _, result in batch_results if self._is_global_code_rejection(result)),
+                    None,
+                )
+                if global_error is not None:
+                    break
+
+        if global_error is not None and next_pending_index < len(pending):
+            skipped_count = len(pending) - next_pending_index
+            logger.warning(
+                "Stopping bulk redemption for code '%s' after global rejection %s; skipping %s queued players",
+                gift_code,
+                global_error.get("error_code"),
+                skipped_count,
+            )
+            indexed_results.extend(
+                (index, self._skipped_after_global_error_result(player, global_error))
+                for index, player, _ in pending[next_pending_index:]
+            )
 
         results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
         await self._persist_bulk_redemption_results(
@@ -873,9 +1164,9 @@ class GiftCodeHandler:
     async def _redeem_with_retries(
         self,
         player_id_int: int,
+        kingdom_id: str,
         gift_code: str,
         player_id_for_logs: str,
-        semaphore: asyncio.Semaphore | None = None,
     ) -> Dict:
         """Redeem a code with retry for transient/API failures only."""
         standard_max_attempts = self.REDEEM_MAX_RETRIES + 1
@@ -889,11 +1180,11 @@ class GiftCodeHandler:
         while True:
             attempt += 1
             try:
-                if semaphore is None:
-                    last_result = await self._gift_code_service.redeem_gift_code_remote(player_id_int, gift_code)
-                else:
-                    async with semaphore:
-                        last_result = await self._gift_code_service.redeem_gift_code_remote(player_id_int, gift_code)
+                last_result = await self._gift_code_service.redeem_gift_code_remote(
+                    player_id_int,
+                    gift_code,
+                    kingdom_id=kingdom_id,
+                )
             except Exception as exc:
                 logger.error(
                     "Redeem attempt %s/%s crashed for player %s and code '%s': %s",
@@ -911,11 +1202,13 @@ class GiftCodeHandler:
                 }
 
             is_rate_limited = self._is_rate_limited_redemption_result(last_result)
-            max_attempts_label = "unbounded" if is_rate_limited else str(standard_max_attempts)
+            max_attempts = (
+                self.REDEEM_RATE_LIMIT_MAX_RETRIES + 1
+                if is_rate_limited
+                else standard_max_attempts
+            )
 
-            if not self._is_retryable_redemption_result(last_result) or (
-                not is_rate_limited and attempt >= standard_max_attempts
-            ):
+            if not self._is_retryable_redemption_result(last_result) or attempt >= max_attempts:
                 normalized_result = dict(last_result)
                 normalized_result.setdefault("attempts", attempt)
                 normalized_result.setdefault("retries", max(0, attempt - 1))
@@ -938,7 +1231,7 @@ class GiftCodeHandler:
                 "Redeem attempt %s/%s failed for player %s and code '%s' with retryable status. "
                 "Retrying in %.1fs (error_code=%s, message=%s)",
                 attempt,
-                max_attempts_label,
+                max_attempts,
                 player_id_for_logs,
                 gift_code,
                 retry_delay,

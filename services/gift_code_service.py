@@ -21,12 +21,21 @@ class IGiftCodeService(ABC):
 
     @abstractmethod
     async def redeem_gift_code(
-        self, session: AsyncSession | None, player_id: int, gift_code: str
+        self,
+        session: AsyncSession | None,
+        player_id: int,
+        gift_code: str,
+        kingdom_id: str | int | None = None,
     ) -> Dict[str, Any]:
         """Redeem a gift code for a player."""
 
     @abstractmethod
-    async def redeem_gift_code_remote(self, player_id: int, gift_code: str) -> Dict[str, Any]:
+    async def redeem_gift_code_remote(
+        self,
+        player_id: int,
+        gift_code: str,
+        kingdom_id: str | int | None = None,
+    ) -> Dict[str, Any]:
         """Redeem a gift code for a player through the remote API only."""
 
     @abstractmethod
@@ -139,7 +148,13 @@ class GiftCodeService(IGiftCodeService):
 
         return await self._with_session(session, _inner)
 
-    async def redeem_gift_code(self, session: AsyncSession | None, player_id: int, gift_code: str) -> Dict[str, Any]:
+    async def redeem_gift_code(
+        self,
+        session: AsyncSession | None,
+        player_id: int,
+        gift_code: str,
+        kingdom_id: str | int | None = None,
+    ) -> Dict[str, Any]:
         """
         Redeem a gift code for a player.
         """
@@ -150,19 +165,6 @@ class GiftCodeService(IGiftCodeService):
                 gift_code=gift_code,
             )
             if existing_redemption:
-                player_profile: Optional[Dict[str, Any]] = None
-                try:
-                    api_client = await self.ensure_client()
-                    player_resp = await api_client.get_player(str(player_id))
-                    player_profile = self._extract_player_profile(player_resp, str(player_id))
-                except Exception as lookup_error:
-                    logger.debug(
-                        "Skipping player metadata refresh for already-redeemed code '%s' and player %s: %s",
-                        gift_code,
-                        player_id,
-                        lookup_error,
-                    )
-
                 logger.info(
                     "Gift code '%s' already redeemed for player %s at %s. Skipping API call.",
                     gift_code,
@@ -175,87 +177,169 @@ class GiftCodeService(IGiftCodeService):
                     "error_code": "ALREADY_REDEEMED",
                     "already_redeemed": True,
                     "already_redeemed_at": existing_redemption.created_at.isoformat(),
-                    "player_profile": player_profile,
                 }
 
-            return await self.redeem_gift_code_remote(player_id=player_id, gift_code=gift_code)
+            return await self.redeem_gift_code_remote(
+                player_id=player_id,
+                gift_code=gift_code,
+                kingdom_id=kingdom_id,
+            )
 
         return await self._with_session(session, _inner)
 
-    async def redeem_gift_code_remote(self, player_id: int, gift_code: str) -> Dict[str, Any]:
-        """Redeem a gift code through the upstream API without database checks or writes."""
-        logger.info("Redeeming gift code '%s' for player ID: %s", gift_code, player_id)
-        player_profile: Optional[Dict[str, Any]] = None
+    async def redeem_gift_code_remote(
+        self,
+        player_id: int,
+        gift_code: str,
+        kingdom_id: str | int | None = None,
+    ) -> Dict[str, Any]:
+        """Redeem a gift code through the current kingdom-aware upstream API."""
+        if kingdom_id in (None, "", 0, "0"):
+            return {
+                "success": False,
+                "message": "Player kingdom is required for gift-code redemption.",
+                "error_code": "MISSING_KINGDOM",
+            }
+
+        logger.info(
+            "Redeeming gift code '%s' for player ID %s in kingdom %s",
+            gift_code,
+            player_id,
+            kingdom_id,
+        )
 
         try:
-            # Ensure client is available
             api_client = await self.ensure_client()
-
-            # The API requires an active session with cookies from the get_player call
-            # Otherwise we'll receive a 'NOT LOGIN' error during redemption
-            player_resp = await api_client.get_player(str(player_id))
-            player_profile = self._extract_player_profile(player_resp, str(player_id))
-            if player_resp.get("code") != 0:
-                logger.warning("Failed to get_player before redeeming for %s: %s", player_id, player_resp)
-
-            response_data = await api_client.redeem_code(str(player_id), gift_code)
+            response_data = await api_client.redeem_code(str(player_id), str(kingdom_id), gift_code)
             code = response_data.get("code")
-            msg = response_data.get("msg", "Unknown error occurred")
+            raw_message = str(response_data.get("msg", "Unknown error occurred"))
+            api_status = " ".join(raw_message.strip().rstrip(".").upper().split())
+            raw_error_code = str(response_data.get("err_code", ""))
 
-            if code == 0:
+            if code == 0 or api_status == "SUCCESS":
                 logger.info("Successfully redeemed gift code '%s' for player %s", gift_code, player_id)
                 return {
                     "success": True,
-                    "message": msg,
+                    "message": "Gift code redeemed successfully.",
                     "data": response_data.get("data"),
-                    "player_profile": player_profile,
+                    "api_status": api_status,
                 }
 
-            err_code = str(response_data.get("err_code", ""))
-
-            # Check if the error indicates the code was already redeemed
-            already_redeemed_phrases = [
-                "already redeemed",
-                "already been redeemed",
-                "already used",
-                "already claimed",
-                "exceeded the limit",
-                "have already received",
-                "collected",
-                "same type exchange",
-                "time error",
-                "received.",
-            ]
-            is_already_redeemed = any(phrase in msg.lower() for phrase in already_redeemed_phrases)
-
-            if is_already_redeemed:
+            if api_status == "SAME TYPE EXCHANGE" or raw_error_code == "40011":
                 logger.info(
-                    "Gift code '%s' was already redeemed for player %s (detected from API response)",
+                    "Successfully redeemed gift code '%s' for player %s via same-type exchange",
+                    gift_code,
+                    player_id,
+                )
+                return {
+                    "success": True,
+                    "message": "Gift code redeemed successfully (same-type exchange).",
+                    "data": response_data.get("data"),
+                    "api_status": api_status,
+                    "error_details": {"err_code": raw_error_code},
+                }
+
+            if api_status == "RECEIVED" or raw_error_code == "40008":
+                logger.info(
+                    "Gift code '%s' was already redeemed for player %s",
                     gift_code,
                     player_id,
                 )
                 return {
                     "success": False,
-                    "message": msg,
+                    "message": "Gift code was already redeemed for this player.",
                     "error_code": "ALREADY_REDEEMED_BY_API",
-                    "error_details": {"err_code": err_code},
+                    "error_details": {"err_code": raw_error_code},
+                    "api_status": api_status,
                     "already_redeemed_by_api": True,
-                    "player_profile": player_profile,
+                }
+
+            status_mapping = {
+                "TIME ERROR": ("GIFT_CODE_EXPIRED", "Gift code has expired.", True),
+                "CDK NOT FOUND": (
+                    "GIFT_CODE_NOT_FOUND",
+                    "Gift code was not found or is incorrect.",
+                    True,
+                ),
+                "USED": (
+                    "GIFT_CODE_CLAIM_LIMIT_REACHED",
+                    "Gift code claim limit has been reached.",
+                    True,
+                ),
+                "TIMEOUT RETRY": (
+                    "TIMEOUT_RETRY",
+                    "The gift-code server requested a retry.",
+                    False,
+                ),
+                "TOO FREQUENT": (
+                    "RATE_LIMITED",
+                    "The player is temporarily rate limited.",
+                    False,
+                ),
+                "USER INFO ERROR": (
+                    "KINGDOM_MISMATCH",
+                    "The kingdom does not match this player.",
+                    False,
+                ),
+                "ROLE NOT EXIST": ("INVALID_PLAYER_ID", "Player ID does not exist.", False),
+                "STOVE_LV ERROR": (
+                    "CASTLE_LEVEL_TOO_LOW",
+                    "The player's Town Center level is too low for this code.",
+                    False,
+                ),
+                "RECHARGE_MONEY ERROR": (
+                    "SPEND_REQUIREMENT_NOT_MET",
+                    "The player does not meet this code's spending requirement.",
+                    False,
+                ),
+                "RECHARGE_MONEY_VIP ERROR": (
+                    "VIP_REQUIREMENT_NOT_MET",
+                    "The player does not meet this code's VIP requirement.",
+                    False,
+                ),
+                "SIGN ERROR": (
+                    "SIGN_ERROR",
+                    "The gift-code API rejected the request signature.",
+                    False,
+                ),
+                "NOT LOGIN": (
+                    "SESSION_REJECTED",
+                    "The gift-code API rejected the session.",
+                    False,
+                ),
+            }
+            mapped = status_mapping.get(api_status)
+            if mapped is not None:
+                error_code, message, global_code_error = mapped
+                logger.warning(
+                    "Gift-code API rejected code '%s' for player %s: %s (code: %s)",
+                    gift_code,
+                    player_id,
+                    api_status,
+                    raw_error_code,
+                )
+                return {
+                    "success": False,
+                    "message": message,
+                    "error_code": error_code,
+                    "error_details": {"err_code": raw_error_code},
+                    "api_status": api_status,
+                    "global_code_error": global_code_error,
                 }
 
             logger.warning(
                 "Failed to redeem gift code '%s' for player %s: %s (code: %s)",
                 gift_code,
                 player_id,
-                msg,
-                err_code,
+                raw_message,
+                raw_error_code,
             )
             return {
                 "success": False,
-                "message": msg,
-                "error_code": err_code,
-                "error_details": {"err_code": err_code},
-                "player_profile": player_profile,
+                "message": raw_message,
+                "error_code": raw_error_code or "API_REJECTED",
+                "error_details": {"err_code": raw_error_code},
+                "api_status": api_status,
             }
 
         except ValueError as e:
@@ -270,7 +354,6 @@ class GiftCodeService(IGiftCodeService):
                 "success": False,
                 "message": "Error communicating with the API.",
                 "error_code": "API_ERROR",
-                "player_profile": player_profile,
             }
         except Exception as e:
             logger.error(
@@ -284,26 +367,7 @@ class GiftCodeService(IGiftCodeService):
                 "success": False,
                 "message": "An unexpected error occurred.",
                 "error_code": "UNEXPECTED_ERROR",
-                "player_profile": player_profile,
             }
-
-    @staticmethod
-    def _extract_player_profile(player_resp: Dict[str, Any], fallback_player_id: str) -> Optional[Dict[str, Any]]:
-        """Normalize get_player API data into the internal player metadata shape."""
-        if not isinstance(player_resp, dict) or player_resp.get("code") != 0:
-            return None
-
-        raw_data = player_resp.get("data") or {}
-        if not isinstance(raw_data, dict):
-            return None
-
-        return {
-            "playerId": str(raw_data.get("fid") or fallback_player_id),
-            "playerUid": str(raw_data.get("uid")) if raw_data.get("uid") is not None else None,
-            "name": raw_data.get("nickname"),
-            "kingdom": raw_data.get("kid"),
-            "level": raw_data.get("stove_lv"),
-        }
 
     async def get_available_gift_codes(self) -> Dict[str, Any]:
         """

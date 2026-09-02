@@ -60,6 +60,41 @@ Important response behavior:
 - Privacy settings can hide fields such as VIP, gear, or profile details.
 - Power may appear as top-level `power`, or in `stats["8"]` for sparse responses.
 
+### Gift-code kingdom resolution
+
+Gift-code redemption uses the in-game Governor ID as `fid`, but the Century Games
+redemption API also requires the player's current kingdom. The bot normally reads `kid`
+from the player's `registered_players` database record and does not call Jeab. If no
+kingdom is stored, it calls `GET /v1/players/by-fid/{fid}` before redemption.
+
+Players can transfer kingdoms, making the database value stale. When Century Games
+returns `USER INFO ERROR`/`40020` for a request made with a cached kingdom, the bot
+refreshes the player through Jeab. If Jeab reports a different `kid`, the bot retries the
+redemption once with that kingdom and updates cached `uid`, name, kingdom, and Town
+Center metadata. It does not retry when Jeab returns the same kingdom or the refresh
+fails, preventing a lookup/retry loop.
+
+The current Century Games redemption request is a signed form POST to
+`https://kingshot-giftcode.centurygame.com/api/gift_code` with `fid`, `kid`, `cdk`, and a
+10-digit Unix-seconds `time`. The former `/api/player` login call no longer exists, and
+`captcha_code` is no longer part of this request.
+
+Bulk redemption first resolves and probes one usable player. These code-wide responses
+stop the run immediately and mark every untouched player as skipped without another
+Century Games request:
+
+| API status | Bot result |
+|---|---|
+| `TIME ERROR` | gift code expired |
+| `CDK NOT FOUND` | gift code missing or incorrect |
+| `USED` | global claim limit reached |
+
+Other current statuses are handled per player: `SAME TYPE EXCHANGE` is success,
+`RECEIVED` is already claimed, `USER INFO ERROR` is a kingdom mismatch, `ROLE NOT EXIST`
+is an invalid player, and `TOO FREQUENT` is a bounded rate-limit retry. After the probe,
+requests run in batches of three; a global code error found later stops subsequent
+batches.
+
 ## Alliance Endpoints
 
 ```text

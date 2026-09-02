@@ -13,17 +13,28 @@ class FakeGiftCodeService:
         del session, gift_code
         return {"111"}
 
-    async def redeem_gift_code_remote(self, player_id, gift_code):
-        self.remote_calls.append((player_id, gift_code))
+    async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+        self.remote_calls.append((player_id, gift_code, kingdom_id))
         return {
             "success": True,
             "message": "OK",
-            "player_profile": {
-                "playerId": str(player_id),
-                "playerUid": f"uid-{player_id}",
+        }
+
+
+class FakeKingshotDataService:
+    def __init__(self):
+        self.player_calls = []
+
+    async def get_player_by_fid(self, player_id):
+        self.player_calls.append(str(player_id))
+        return {
+            "success": True,
+            "data": {
+                "fid": int(player_id),
+                "uid": f"uid-{player_id}",
                 "name": f"Player {player_id}",
-                "kingdom": 830,
-                "level": 30,
+                "kid": 830,
+                "stove_lv": 30,
             },
         }
 
@@ -42,18 +53,19 @@ class FakeTrackingService:
         return rows
 
 
-def make_handler(gift_code_service=None, tracking_service=None):
+def make_handler(gift_code_service=None, tracking_service=None, kingshot_data_service=None):
     return GiftCodeHandler(
         gift_code_service=gift_code_service or FakeGiftCodeService(),
         player_info_service=SimpleNamespace(),
         bot=SimpleNamespace(),
         config=SimpleNamespace(admin_user_ids=[]),
         interaction_tracking_service=tracking_service or FakeTrackingService(),
+        kingshot_data_service=kingshot_data_service or FakeKingshotDataService(),
     )
 
 
 @pytest.mark.asyncio
-async def test_auto_redemption_does_not_announce_when_every_result_failed(monkeypatch):
+async def test_auto_redemption_announces_when_every_result_failed(monkeypatch):
     class FakeChannel:
         def __init__(self):
             self.sent_embeds = []
@@ -77,7 +89,8 @@ async def test_auto_redemption_does_not_announce_when_every_result_failed(monkey
         ],
     )
 
-    assert channel.sent_embeds == []
+    assert len(channel.sent_embeds) == 1
+    assert channel.sent_embeds[0].title == "❌ Auto-Redemption Failed"
 
 
 @pytest.mark.asyncio
@@ -112,12 +125,20 @@ async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatc
 async def test_bulk_redemption_prefetches_and_persists_in_batches():
     gift_service = FakeGiftCodeService()
     tracking = FakeTrackingService()
-    handler = make_handler(gift_service, tracking)
+    kingshot = FakeKingshotDataService()
+    handler = make_handler(gift_service, tracking, kingshot)
 
     players = [
         SimpleNamespace(player_id="111", player_name="Already", enabled=True),
         SimpleNamespace(player_id="bad-id", player_name="Bad", enabled=True),
-        SimpleNamespace(player_id="222", player_name="Pending", enabled=True),
+        SimpleNamespace(
+            player_id="222",
+            player_uid="db-uid-222",
+            player_name="Pending",
+            kingdom="830",
+            castle_level="30",
+            enabled=True,
+        ),
     ]
 
     results = await handler._run_bulk_redemption(
@@ -128,26 +149,208 @@ async def test_bulk_redemption_prefetches_and_persists_in_batches():
         channel_id=789,
     )
 
-    assert gift_service.remote_calls == [(222, "CODE")]
+    assert gift_service.remote_calls == [(222, "CODE", "830")]
     assert [result["status_category"] for result in results] == [
         handler.STATUS_ALREADY_REDEEMED,
         handler.STATUS_INVALID_ID,
         handler.STATUS_SUCCESS,
     ]
+    assert kingshot.player_calls == []
     assert len(tracking.log_rows) == 1
     assert tracking.log_rows[0]["player_id"] == "222"
     assert tracking.log_rows[0]["gift_code"] == "CODE"
     assert tracking.log_rows[0]["guild_id"] == 456
     assert len(tracking.metadata_rows) == 1
     assert tracking.metadata_rows[0]["player_id"] == "222"
+    assert tracking.metadata_rows[0]["player_uid"] == "db-uid-222"
+
+
+@pytest.mark.asyncio
+async def test_global_code_error_stops_after_probe_and_skips_remaining_players():
+    class InvalidCodeGiftService(FakeGiftCodeService):
+        async def get_redeemed_players(self, session, gift_code):
+            del session, gift_code
+            return set()
+
+        async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+            self.remote_calls.append((player_id, gift_code, kingdom_id))
+            return {
+                "success": False,
+                "message": "Gift code was not found or is incorrect.",
+                "error_code": "GIFT_CODE_NOT_FOUND",
+                "api_status": "CDK NOT FOUND",
+                "global_code_error": True,
+            }
+
+    gift_service = InvalidCodeGiftService()
+    tracking = FakeTrackingService()
+    kingshot = FakeKingshotDataService()
+    handler = make_handler(gift_service, tracking, kingshot)
+    players = [
+        SimpleNamespace(
+            player_id=str(player_id),
+            player_name=f"Player {player_id}",
+            kingdom="830",
+            enabled=True,
+        )
+        for player_id in range(222, 232)
+    ]
+
+    results = await handler._run_bulk_redemption(
+        gift_code="WRONG-CODE",
+        registered_players=players,
+        actor_user_id=123,
+        guild_id=456,
+        channel_id=789,
+    )
+
+    assert gift_service.remote_calls == [(222, "WRONG-CODE", "830")]
+    assert kingshot.player_calls == []
+    assert results[0]["status_category"] == handler.STATUS_API_REJECTED
+    assert [result["status_category"] for result in results[1:]] == [handler.STATUS_SKIPPED] * 9
+    assert len(tracking.log_rows) == 1
+    assert tracking.log_rows[0]["error_code"] == "GIFT_CODE_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_cached_kingdom_does_not_call_jeab():
+    class UnexpectedKingshotDataService:
+        async def get_player_by_fid(self, player_id):
+            raise AssertionError(f"Jeab should not be called for cached player {player_id}")
+
+    gift_service = FakeGiftCodeService()
+    handler = make_handler(
+        gift_code_service=gift_service,
+        kingshot_data_service=UnexpectedKingshotDataService(),
+    )
+    player = SimpleNamespace(
+        player_id="222",
+        player_uid="uid-222",
+        player_name="Cached Player",
+        kingdom="831",
+        castle_level="30",
+        enabled=True,
+    )
+
+    results = await handler._run_bulk_redemption(
+        gift_code="CODE",
+        registered_players=[player],
+        actor_user_id=123,
+        guild_id=456,
+        channel_id=789,
+    )
+
+    assert gift_service.remote_calls == [(222, "CODE", "831")]
+    assert results[0]["status_category"] == handler.STATUS_SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_missing_cached_kingdom_is_resolved_through_jeab():
+    gift_service = FakeGiftCodeService()
+    kingshot = FakeKingshotDataService()
+    handler = make_handler(gift_code_service=gift_service, kingshot_data_service=kingshot)
+    player = SimpleNamespace(player_id="222", player_name="Player", kingdom=None, enabled=True)
+
+    results = await handler._run_bulk_redemption(
+        gift_code="CODE",
+        registered_players=[player],
+        actor_user_id=123,
+        guild_id=456,
+        channel_id=789,
+    )
+
+    assert kingshot.player_calls == ["222"]
+    assert gift_service.remote_calls == [(222, "CODE", "830")]
+    assert results[0]["status_category"] == handler.STATUS_SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_cached_kingdom_mismatch_refreshes_jeab_and_retries_once():
+    class TransferredPlayerGiftCodeService(FakeGiftCodeService):
+        async def get_redeemed_players(self, session, gift_code):
+            del session, gift_code
+            return set()
+
+        async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+            self.remote_calls.append((player_id, gift_code, kingdom_id))
+            if kingdom_id == "829":
+                return {
+                    "success": False,
+                    "message": "The kingdom does not match this player.",
+                    "error_code": "KINGDOM_MISMATCH",
+                    "api_status": "USER INFO ERROR",
+                    "error_details": {"err_code": "40020"},
+                }
+            return {"success": True, "message": "OK"}
+
+    gift_service = TransferredPlayerGiftCodeService()
+    tracking = FakeTrackingService()
+    kingshot = FakeKingshotDataService()
+    handler = make_handler(gift_service, tracking, kingshot)
+    player = SimpleNamespace(
+        player_id="222",
+        player_uid="old-uid",
+        player_name="Cached Player",
+        kingdom="829",
+        castle_level="29",
+        enabled=True,
+    )
+
+    results = await handler._run_bulk_redemption(
+        gift_code="CODE",
+        registered_players=[player],
+        actor_user_id=123,
+        guild_id=456,
+        channel_id=789,
+    )
+
+    assert gift_service.remote_calls == [(222, "CODE", "829"), (222, "CODE", "830")]
+    assert kingshot.player_calls == ["222"]
+    assert results[0]["status_category"] == handler.STATUS_SUCCESS
+    assert results[0]["attempts"] == 2
+    assert tracking.metadata_rows[0]["kingdom"] == "830"
     assert tracking.metadata_rows[0]["player_uid"] == "uid-222"
+
+
+@pytest.mark.asyncio
+async def test_cached_kingdom_mismatch_does_not_retry_when_jeab_returns_same_kingdom():
+    class MismatchGiftCodeService(FakeGiftCodeService):
+        async def get_redeemed_players(self, session, gift_code):
+            del session, gift_code
+            return set()
+
+        async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+            self.remote_calls.append((player_id, gift_code, kingdom_id))
+            return {
+                "success": False,
+                "message": "The kingdom does not match this player.",
+                "error_code": "KINGDOM_MISMATCH",
+                "api_status": "USER INFO ERROR",
+            }
+
+    gift_service = MismatchGiftCodeService()
+    kingshot = FakeKingshotDataService()
+    handler = make_handler(gift_code_service=gift_service, kingshot_data_service=kingshot)
+    player = SimpleNamespace(player_id="222", player_name="Player", kingdom="830", enabled=True)
+
+    results = await handler._run_bulk_redemption(
+        gift_code="CODE",
+        registered_players=[player],
+        actor_user_id=123,
+        guild_id=456,
+        channel_id=789,
+    )
+
+    assert gift_service.remote_calls == [(222, "CODE", "830")]
+    assert kingshot.player_calls == ["222"]
+    assert results[0]["status_category"] == handler.STATUS_INVALID_ID
 
 
 @pytest.mark.asyncio
 async def test_transient_redemption_failures_retry(monkeypatch):
     class RetryGiftCodeService(FakeGiftCodeService):
-        async def redeem_gift_code_remote(self, player_id, gift_code):
-            self.remote_calls.append((player_id, gift_code))
+        async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+            self.remote_calls.append((player_id, gift_code, kingdom_id))
             if len(self.remote_calls) == 1:
                 return {
                     "success": False,
@@ -167,6 +370,7 @@ async def test_transient_redemption_failures_retry(monkeypatch):
 
     result = await handler._redeem_with_retries(
         player_id_int=222,
+        kingdom_id="830",
         gift_code="CODE",
         player_id_for_logs="222",
     )
@@ -174,21 +378,19 @@ async def test_transient_redemption_failures_retry(monkeypatch):
     assert result["success"] is True
     assert result["attempts"] == 2
     assert result["retries"] == 1
-    assert gift_service.remote_calls == [(222, "CODE"), (222, "CODE")]
+    assert gift_service.remote_calls == [(222, "CODE", "830"), (222, "CODE", "830")]
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_retries_until_cleared(monkeypatch):
+async def test_rate_limit_retries_use_bounded_budget(monkeypatch):
     class RateLimitedGiftCodeService(FakeGiftCodeService):
-        async def redeem_gift_code_remote(self, player_id, gift_code):
-            self.remote_calls.append((player_id, gift_code))
-            if len(self.remote_calls) <= 20:
-                return {
-                    "success": False,
-                    "message": "API rate limit exceeded (429 Too Many Requests).",
-                    "error_code": "429",
-                }
-            return {"success": True, "message": "OK"}
+        async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+            self.remote_calls.append((player_id, gift_code, kingdom_id))
+            return {
+                "success": False,
+                "message": "The player is temporarily rate limited.",
+                "error_code": "RATE_LIMITED",
+            }
 
     async def no_sleep(delay):
         del delay
@@ -201,21 +403,22 @@ async def test_rate_limit_retries_until_cleared(monkeypatch):
 
     result = await handler._redeem_with_retries(
         player_id_int=222,
+        kingdom_id="830",
         gift_code="CODE",
         player_id_for_logs="222",
     )
 
-    assert result["success"] is True
-    assert result["attempts"] == 21
-    assert result["retries"] == 20
-    assert gift_service.remote_calls == [(222, "CODE")] * 21
+    assert result["success"] is False
+    assert result["attempts"] == 4
+    assert result["retries"] == 3
+    assert gift_service.remote_calls == [(222, "CODE", "830")] * 4
 
 
 @pytest.mark.asyncio
 async def test_non_rate_limit_transient_failures_keep_standard_budget(monkeypatch):
     class FailingGiftCodeService(FakeGiftCodeService):
-        async def redeem_gift_code_remote(self, player_id, gift_code):
-            self.remote_calls.append((player_id, gift_code))
+        async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
+            self.remote_calls.append((player_id, gift_code, kingdom_id))
             return {
                 "success": False,
                 "message": "HTTP Error 503",
@@ -233,6 +436,7 @@ async def test_non_rate_limit_transient_failures_keep_standard_budget(monkeypatc
 
     result = await handler._redeem_with_retries(
         player_id_int=222,
+        kingdom_id="830",
         gift_code="CODE",
         player_id_for_logs="222",
     )
@@ -240,4 +444,4 @@ async def test_non_rate_limit_transient_failures_keep_standard_budget(monkeypatc
     assert result["success"] is False
     assert result["attempts"] == 3
     assert result["retries"] == 2
-    assert gift_service.remote_calls == [(222, "CODE")] * 3
+    assert gift_service.remote_calls == [(222, "CODE", "830")] * 3

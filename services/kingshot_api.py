@@ -51,8 +51,15 @@ class KingshotAPIClient:
 
         body = urllib.parse.urlencode(params_with_sign)
         headers = {
+            "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/x-www-form-urlencoded",
             "Content-Length": str(len(body)),
+            "Origin": HOSTNAME,
+            "Referer": f"{HOSTNAME}/",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+            ),
         }
 
         url = f"{HOSTNAME}/api{path}"
@@ -88,19 +95,13 @@ class KingshotAPIClient:
 
         return {"code": 1, "msg": "Max retries exceeded.", "err_code": 500}
 
-    async def get_player(self, player_id: str) -> Dict[str, Any]:
-        """Fetch player information."""
-        timestamp = str(int(time.time() * 1000))
-        params = {"fid": str(player_id), "time": timestamp}
-        return await self._request("/player", params)
-
-    async def redeem_code(self, player_id: str, gift_code: str, captcha_code: str = "") -> Dict[str, Any]:
-        """Redeem a gift code."""
-        timestamp = str(int(time.time() * 1000))
+    async def redeem_code(self, player_id: str, kingdom_id: str, gift_code: str) -> Dict[str, Any]:
+        """Redeem a gift code using the current kingdom-aware API payload."""
+        timestamp = str(int(time.time()))
         params = {
             "fid": str(player_id),
             "cdk": gift_code,
-            "captcha_code": captcha_code,
+            "kid": str(kingdom_id),
             "time": timestamp,
         }
         return await self._request("/gift_code", params)
