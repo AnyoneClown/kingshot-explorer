@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -52,14 +53,24 @@ class FakeTrackingService:
         self.log_rows.extend(rows)
         return rows
 
+    async def track_user(self, **kwargs):
+        del kwargs
 
-def make_handler(gift_code_service=None, tracking_service=None, kingshot_data_service=None):
+
+def make_handler(
+    gift_code_service=None,
+    tracking_service=None,
+    kingshot_data_service=None,
+    player_registry_service=None,
+    config=None,
+):
     return GiftCodeHandler(
         gift_code_service=gift_code_service or FakeGiftCodeService(),
         player_info_service=SimpleNamespace(),
         bot=SimpleNamespace(),
-        config=SimpleNamespace(admin_user_ids=[]),
+        config=config or SimpleNamespace(admin_user_ids=[]),
         interaction_tracking_service=tracking_service or FakeTrackingService(),
+        player_registry_service=player_registry_service,
         kingshot_data_service=kingshot_data_service or FakeKingshotDataService(),
     )
 
@@ -119,6 +130,125 @@ async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatc
 
     assert len(channel.sent_embeds) == 1
     assert "✅ **Success**: 1" in channel.sent_embeds[0].fields[1].value
+
+
+@pytest.mark.asyncio
+async def test_manual_result_is_posted_as_normal_channel_message():
+    class FakeChannel:
+        id = 789
+
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    channel = FakeChannel()
+    handler = make_handler()
+
+    await handler._send_redemption_results_to_channel(
+        channel=channel,
+        requester_user_id=123,
+        gift_code="CODE",
+        results=[
+            {
+                "player_id": "222",
+                "player_name": "Player",
+                "success": True,
+                "message": "OK",
+                "status_category": handler.STATUS_SUCCESS,
+            }
+        ],
+    )
+
+    assert len(channel.sent) == 1
+    assert channel.sent[0]["content"].startswith("<@123>")
+    assert channel.sent[0]["embed"].title == "✅ All Gift Codes Redeemed Successfully!"
+
+
+@pytest.mark.asyncio
+async def test_manual_redeem_starts_background_job_and_rejects_duplicate(monkeypatch):
+    class FakeResponse:
+        def __init__(self):
+            self.deferred = False
+
+        async def defer(self, **kwargs):
+            self.deferred = True
+            self.defer_kwargs = kwargs
+
+        def is_done(self):
+            return self.deferred
+
+    class FakeFollowup:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    class FakeChannel:
+        id = 789
+
+        async def send(self, **kwargs):
+            del kwargs
+
+    class FakeRegistry:
+        async def get_registered_players(self, enabled_only=True):
+            assert enabled_only is True
+            return [SimpleNamespace(player_id="222", kingdom="830", enabled=True)]
+
+    def make_interaction():
+        return SimpleNamespace(
+            id=456,
+            created_at=None,
+            response=FakeResponse(),
+            followup=FakeFollowup(),
+            user=SimpleNamespace(
+                id=123,
+                name="Admin",
+                discriminator="0",
+                display_name="Admin",
+            ),
+            guild=SimpleNamespace(id=456, name="Guild"),
+            channel=FakeChannel(),
+        )
+
+    handler = make_handler(
+        player_registry_service=FakeRegistry(),
+        config=SimpleNamespace(admin_user_ids=[123]),
+    )
+    job_started = asyncio.Event()
+    release_job = asyncio.Event()
+    captured = {}
+
+    async def fake_job(**kwargs):
+        captured.update(kwargs)
+        job_started.set()
+        await release_job.wait()
+
+    monkeypatch.setattr(handler, "_run_manual_redemption_job", fake_job)
+
+    first_interaction = make_interaction()
+    await handler._handle_redeem_gift_code_slash(first_interaction, " CODE ")
+    await job_started.wait()
+
+    assert first_interaction.response.deferred is True
+    assert first_interaction.followup.sent[0]["embed"].title == "🎁 Redemption Job Started"
+    assert first_interaction.followup.sent[0]["ephemeral"] is True
+    assert captured["gift_code"] == "CODE"
+    assert captured["actor_user_id"] == 123
+
+    second_interaction = make_interaction()
+    await handler._handle_redeem_gift_code_slash(second_interaction, "OTHER")
+
+    assert second_interaction.followup.sent[0]["embed"].title == "⏳ Redemption Job Already Running"
+
+    task = handler._manual_redemption_task
+    assert task is not None
+    release_job.set()
+    await task
+    await asyncio.sleep(0)
+    assert handler._manual_redemption_task is None
 
 
 @pytest.mark.asyncio

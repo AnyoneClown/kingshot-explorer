@@ -135,6 +135,9 @@ class GiftCodeHandler:
         self._polling_loop = None
         self._poll_backoff_until: datetime | None = None
         self._poll_backoff_delta = timedelta(minutes=2)
+        self._manual_redemption_start_lock = asyncio.Lock()
+        self._manual_redemption_task: asyncio.Task[None] | None = None
+        self._manual_redemption_code: str | None = None
         logger.info("GiftCodeHandler initialized")
 
     def _can_poll(self) -> bool:
@@ -161,7 +164,7 @@ class GiftCodeHandler:
     def register_commands(self):
         """Register all gift code commands with the bot."""
 
-        @self._bot.tree.command(name="redeem", description="Redeem a gift code for all registered players")
+        @self._bot.tree.command(name="redeem", description="Start a gift-code redemption job")
         @app_commands.describe(gift_code="The gift code to redeem (e.g., KINGSHOTXMAS)")
         async def redeem_gift_code(interaction: discord.Interaction, gift_code: str):
             """Redeem a gift code for all registered players."""
@@ -507,17 +510,57 @@ class GiftCodeHandler:
 
         logger.info(f"Bulk redeem command for code '{gift_code}' requested by {user_info} in {guild_info}")
 
-        # Get all registered players
-        try:
-            await self._tracking_service.track_user(
-                session=None,
-                user_id=interaction.user.id,
-                username=interaction.user.name,
-                discriminator=interaction.user.discriminator,
-                display_name=interaction.user.display_name,
+        channel = interaction.channel
+        if channel is None or not hasattr(channel, "send"):
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Channel Unavailable",
+                    description="The bot cannot post the redemption job result in this channel.",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
             )
+            return
 
-            registered_players = await self._player_registry_service.get_registered_players(enabled_only=True)
+        gift_code = gift_code.strip()
+        async with self._manual_redemption_start_lock:
+            active_task = self._manual_redemption_task
+            if active_task is not None and not active_task.done():
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="⏳ Redemption Job Already Running",
+                        description=(
+                            f"The bot is already redeeming `{self._manual_redemption_code}`. "
+                            "Wait for its channel summary before starting another job."
+                        ),
+                        color=discord.Color.orange(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                await self._tracking_service.track_user(
+                    session=None,
+                    user_id=interaction.user.id,
+                    username=interaction.user.name,
+                    discriminator=interaction.user.discriminator,
+                    display_name=interaction.user.display_name,
+                )
+                registered_players = await self._player_registry_service.get_registered_players(
+                    enabled_only=True
+                )
+            except Exception as exc:
+                logger.error("Could not prepare the manual redemption job: %s", exc, exc_info=True)
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="❌ Redemption Job Not Started",
+                        description="The bot could not load the enabled player list.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
 
             if not registered_players:
                 await interaction.followup.send(
@@ -525,38 +568,111 @@ class GiftCodeHandler:
                         title="📭 No Enabled Players",
                         description="Use `/addplayer <player_id>` to enable at least one player before redeeming.",
                         color=discord.Color.orange(),
-                    )
+                    ),
+                    ephemeral=True,
                 )
                 return
 
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="🎁 Redemption Job Started",
+                    description=(
+                        f"Started redeeming `{gift_code}` for {len(registered_players)} enabled players.\n"
+                        "The final summary will be posted in this channel when the job finishes."
+                    ),
+                    color=discord.Color.brand_green(),
+                ),
+                ephemeral=True,
+            )
+
+            task = asyncio.create_task(
+                self._run_manual_redemption_job(
+                    gift_code=gift_code,
+                    registered_players=registered_players,
+                    actor_user_id=interaction.user.id,
+                    guild_id=interaction.guild.id if interaction.guild else None,
+                    channel=channel,
+                ),
+                name="manual-gift-code-redemption",
+            )
+            self._manual_redemption_task = task
+            self._manual_redemption_code = gift_code
+            task.add_done_callback(self._manual_redemption_finished)
+
+    def _manual_redemption_finished(self, task: asyncio.Task[None]) -> None:
+        """Release the single manual-job slot and surface unexpected task failures."""
+        if self._manual_redemption_task is task:
+            self._manual_redemption_task = None
+            self._manual_redemption_code = None
+
+        if task.cancelled():
+            logger.warning("Manual gift-code redemption task was cancelled")
+            return
+
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Manual gift-code redemption task crashed: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _run_manual_redemption_job(
+        self,
+        *,
+        gift_code: str,
+        registered_players: list[Any],
+        actor_user_id: int,
+        guild_id: int | None,
+        channel: Any,
+    ) -> None:
+        """Run a manual redemption independently from the slash-command webhook."""
+        try:
             results = await self._run_bulk_redemption(
                 gift_code=gift_code,
                 registered_players=registered_players,
-                actor_user_id=interaction.user.id,
-                guild_id=interaction.guild.id if interaction.guild else None,
-                channel_id=interaction.channel.id if interaction.channel else None,
+                actor_user_id=actor_user_id,
+                guild_id=guild_id,
+                channel_id=getattr(channel, "id", None),
             )
-
-            # Format and send results
-            await self._send_redemption_results_slash(interaction, gift_code, results)
-
-        except Exception as e:
-            logger.error(f"Error in bulk redemption: {e}", exc_info=True)
-            await interaction.followup.send(
-                embed=self._build_status_embed(
-                    title="❌ Redemption Failed",
-                    description="An unexpected error occurred while processing redemption. Please try again later.",
-                    color=discord.Color.red(),
+            await self._send_redemption_results_to_channel(
+                channel=channel,
+                requester_user_id=actor_user_id,
+                gift_code=gift_code,
+                results=results,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Error in manual redemption job: %s", exc, exc_info=True)
+            try:
+                await channel.send(
+                    content=f"<@{actor_user_id}>",
+                    embed=self._build_status_embed(
+                        title="❌ Redemption Job Failed",
+                        description=(
+                            f"The background redemption job for `{gift_code}` failed unexpectedly. "
+                            "Review the bot logs before retrying."
+                        ),
+                        color=discord.Color.red(),
+                    ),
                 )
-            )
+            except Exception as response_error:
+                logger.error(
+                    "Could not post the manual redemption failure to channel %s: %s",
+                    getattr(channel, "id", None),
+                    response_error,
+                    exc_info=True,
+                )
 
-    async def _send_redemption_results_slash(
+    async def _send_redemption_results_to_channel(
         self,
-        interaction: discord.Interaction,
+        channel: Any,
+        requester_user_id: int,
         gift_code: str,
         results: List[Dict],
-    ):
-        """Send formatted redemption results."""
+    ) -> None:
+        """Post formatted manual-job results as a normal channel message."""
         success_results = [r for r in results if r.get("status_category") == self.STATUS_SUCCESS]
         already_redeemed_results = [r for r in results if r.get("status_category") == self.STATUS_ALREADY_REDEEMED]
         api_rejected_results = [r for r in results if r.get("status_category") == self.STATUS_API_REJECTED]
@@ -642,7 +758,7 @@ class GiftCodeHandler:
             )
         )
 
-        await interaction.followup.send(embed=embed)
+        await channel.send(content=f"<@{requester_user_id}>", embed=embed)
         logger.info(
             "Bulk redemption completed: success=%s, already_redeemed=%s, "
             "api_rejected=%s, invalid_id=%s, skipped=%s",

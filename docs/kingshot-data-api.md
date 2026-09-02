@@ -77,7 +77,9 @@ fails, preventing a lookup/retry loop.
 The current Century Games redemption request is a signed form POST to
 `https://kingshot-giftcode.centurygame.com/api/gift_code` with `fid`, `kid`, `cdk`, and a
 10-digit Unix-seconds `time`. The former `/api/player` login call no longer exists, and
-`captcha_code` is no longer part of this request.
+`captcha_code` is no longer part of this request. A shared client-side limiter keeps the
+start of every Century Games HTTP request at least one second after the previous request,
+including requests scheduled by concurrent redemption batches and transport retries.
 
 Bulk redemption first resolves and probes one usable player. These code-wide responses
 stop the run immediately and mark every untouched player as skipped without another
@@ -94,6 +96,13 @@ Other current statuses are handled per player: `SAME TYPE EXCHANGE` is success,
 is an invalid player, and `TOO FREQUENT` is a bounded rate-limit retry. After the probe,
 requests run in batches of three; a global code error found later stops subsequent
 batches.
+
+`/redeem` starts this work as a background job instead of keeping the slash-command
+webhook open. The requester immediately receives an ephemeral start confirmation with
+the queued player count. Completion or failure is posted as a normal message in the
+original channel and mentions the requester. Only one manual redemption job can run at
+a time; another `/redeem` is rejected until the active job posts its result. Jobs are
+in-memory and do not survive a bot restart.
 
 ## Alliance Endpoints
 

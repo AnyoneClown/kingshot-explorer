@@ -11,6 +11,7 @@ dependencies = [
     "discord.py==2.6.4",
     "greenlet==3.3.0",
     "httpx==0.28.1",
+    "langchain-nvidia-ai-endpoints==1.0.4",
     "nvidia-riva-client==2.19.0",
     "openai==2.6.1",
     "psycopg2-binary==2.9.10",

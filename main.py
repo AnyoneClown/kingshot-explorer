@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from openai import AsyncOpenAI
 
 from config import BotConfig
@@ -77,6 +78,7 @@ class TranslatorBot:
         # Initialize services
         logger.info("Initializing services...")
         self.nvidia_client = None
+        self.nvidia_chat_client = None
         self.translation_service = None
         self.chatbot_service = None
         self.event_scheduler_service = None
@@ -105,9 +107,17 @@ class TranslatorBot:
                 self.nvidia_client,
                 model=config.nvidia_model,
             )
+            self.nvidia_chat_client = ChatNVIDIA(
+                model=config.nvidia_chat_model,
+                api_key=config.nvidia_api_key,
+                base_url=config.nvidia_base_url,
+                temperature=1,
+                top_p=0.95,
+                max_completion_tokens=16384,
+                model_kwargs={"chat_template_kwargs": {"enable_thinking": True}},
+            )
             self.chatbot_service = ChatbotService(
-                self.nvidia_client,
-                model=config.nvidia_model,
+                self.nvidia_chat_client,
                 max_chat_response_chars=config.max_chat_response_chars,
             )
             self.event_scheduler_service = EventSchedulerService(self.db_manager)

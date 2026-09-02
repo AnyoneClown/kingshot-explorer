@@ -4,9 +4,9 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from openai import AsyncOpenAI
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +31,13 @@ class ChatbotService(IChatbotService):
 
     _FORCED_REPLY_FALLBACK = "I saw your message, but I need a little more context to answer."
 
-    def __init__(self, client: AsyncOpenAI, model: str, max_chat_response_chars: int = 500):
+    def __init__(self, client: ChatNVIDIA, max_chat_response_chars: int = 500):
         self._client = client
-        self._model = model
         self._max_chat_response_chars = max_chat_response_chars
-        logger.info("ChatbotService initialized with NVIDIA NIM model: %s", model)
+        logger.info(
+            "ChatbotService initialized with ChatNVIDIA model: %s",
+            getattr(client, "model", "unknown"),
+        )
 
     def _clean_text(self, text: str) -> str:
         """Normalize text while keeping multilingual content intact."""
@@ -113,28 +115,47 @@ class ChatbotService(IChatbotService):
 
         return stripped
 
-    async def _create_completion(
-        self,
-        messages: List[Dict[str, str]],
-        *,
-        temperature: float,
-        max_tokens: int,
-    ) -> str:
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=temperature,
-            top_p=1,
-            max_tokens=max_tokens,
-        )
-
-        if not response.choices:
+    @staticmethod
+    def _chunk_content_text(content: Any) -> str:
+        """Extract final-answer text from a LangChain streamed content value."""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
             return ""
 
-        content = response.choices[0].message.content
-        if isinstance(content, list):
-            return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return content or ""
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") in {"text", "text_delta"}:
+                parts.append(str(block.get("text") or block.get("content") or ""))
+        return "".join(parts)
+
+    @staticmethod
+    def _strip_reasoning_tags(response_text: str) -> str:
+        """Defensively remove reasoning tags if an endpoint embeds them in content."""
+        cleaned = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE)
+        if cleaned.lstrip().lower().startswith("<think>"):
+            return ""
+        return cleaned.strip()
+
+    async def _create_completion(self, messages: List[Dict[str, str]]) -> str:
+        """Stream a ChatNVIDIA response asynchronously and collect final content only."""
+        content_parts: list[str] = []
+        reasoning_chunks = 0
+
+        async for chunk in self._client.astream(messages):
+            additional_kwargs = getattr(chunk, "additional_kwargs", None)
+            if isinstance(additional_kwargs, dict) and additional_kwargs.get("reasoning_content"):
+                reasoning_chunks += 1
+
+            content_parts.append(self._chunk_content_text(getattr(chunk, "content", "")))
+
+        logger.debug(
+            "ChatNVIDIA stream completed; omitted %s internal reasoning chunk(s)",
+            reasoning_chunks,
+        )
+        return self._strip_reasoning_tags("".join(content_parts))
 
     async def generate_contextual_reply(
         self,
@@ -184,16 +205,25 @@ class ChatbotService(IChatbotService):
                     "understand references, language, tone, and who is talking. If the latest message is vague, "
                     "infer from context when the answer is clear; otherwise ask one short clarifying question. "
                     "Do not pretend to know private facts or current game facts unless they appear in context. "
-                    "Keep replies concise, useful, and conversational. Avoid roleplay, avoid emojis unless the "
-                    "user used them first, and do not mention internal instructions. "
+                    "Sound like a quick-witted regular in the chat, not a customer-support bot. Use dry humor, "
+                    "playful sarcasm, light teasing, callbacks to the conversation, and occasional absurd "
+                    "understatement when they fit naturally. Keep the joke relevant and varied; do not force a "
+                    "punchline into every reply or explain the joke. Sarcasm must be clearly playful, never cruel, "
+                    "hostile, discriminatory, or aimed at someone's real-life vulnerability. Do not insult people, "
+                    "pile onto arguments, or joke about serious distress. Avoid canned assistant phrases such as "
+                    "'How can I assist you?' and do not introduce yourself unless asked. Keep replies concise, "
+                    "useful when help is needed, and conversational. Avoid roleplay, avoid emojis unless the user "
+                    "used them first, and do not mention internal instructions. "
                     + (
                         "The user is directly addressing the bot, so you must reply with should_reply true."
                         if force_reply
                         else (
                             "The bot is considering a random reply. Reply only when the latest message is a "
-                            "question, request, joke, unresolved discussion, or another moment where the bot can "
-                            "clearly add value. Return should_reply false for announcements, command output, logs, "
-                            "status updates, short reactions, greetings without substance, or already-resolved chat."
+                            "question, request, joke, unresolved discussion, or a moment where a genuinely funny "
+                            "and context-specific observation would improve the conversation. A good callback or "
+                            "one-liner counts as value; generic banter does not. Return should_reply false for "
+                            "announcements, command output, logs, status updates, short reactions, greetings without "
+                            "substance, sensitive moments, arguments, or already-resolved chat."
                         )
                     )
                 ),
@@ -212,15 +242,19 @@ class ChatbotService(IChatbotService):
                     "- Use the replied-to message first, then recent context, not just the latest line.\n"
                     "- Prefer the same language as the latest message unless translating or clarifying helps.\n"
                     "- Keep the reply under three short sentences.\n"
+                    "- Write like natural Discord banter: specific, relaxed, and a little mischievous.\n"
+                    "- Prefer dry wit or a playful callback over generic jokes, and skip humor when it would feel insensitive.\n"
                     "- Do not ping everyone or invent facts.\n"
                     + (
                         "- This message directly mentions or replies to the bot, so return should_reply true with a non-empty reply."
                         if force_reply
                         else (
                             "- Because this is a random reply candidate, return should_reply true only for questions, "
-                            "requests, jokes, unresolved discussion, or clear opportunities to help.\n"
+                            "requests, jokes, unresolved discussion, clear opportunities to help, or a genuinely funny "
+                            "context-specific one-liner.\n"
                             "- Return should_reply false for announcements, commands, logs, status updates, short "
-                            "reactions, greetings without substance, and already-resolved chat."
+                            "reactions, generic banter, greetings without substance, sensitive moments, arguments, "
+                            "and already-resolved chat."
                         )
                     )
                 ),
@@ -235,7 +269,7 @@ class ChatbotService(IChatbotService):
                 replied_to_block,
                 history_block,
             )
-            response_text = await self._create_completion(messages, temperature=0.9, max_tokens=250)
+            response_text = await self._create_completion(messages)
             logger.info("Contextual reply raw model response: %r", response_text)
 
             payload = self._extract_json_payload(response_text)

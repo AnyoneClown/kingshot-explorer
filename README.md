@@ -55,6 +55,7 @@ BOT_PROFILE=local
 NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_MODEL=openai/gpt-oss-120b
+NVIDIA_CHAT_MODEL=nvidia/nemotron-3-ultra-550b-a55b
 ENABLE_VOICE_REPLIES=false
 NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
 NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
@@ -243,7 +244,11 @@ player through the configured KingShot Data API and retries once with the new ki
 It validates a code with one player before starting bounded bulk batches, so expired,
 unknown, or globally exhausted codes do not produce hundreds of redundant requests.
 Completion announcements include all-failure and early-abort outcomes as well as
-successful runs.
+successful runs. Century Games requests are globally paced with at least one second
+between request starts to avoid burst-driven rate limits. `/redeem` immediately starts a
+single background job and acknowledges it privately; the final result is posted as a
+normal message in the command channel, independent of Discord's interaction webhook
+lifetime.
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
@@ -269,6 +274,14 @@ main.py      Application entrypoint
 - Keep AUTO_REDEEM_CHANNELS empty if you do not want announcement messages.
 - `/configure` can turn contextual AI replies on or off for a server, including direct mentions/replies and random chat replies.
 - Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
+
+Contextual replies use `langchain-nvidia-ai-endpoints` with `ChatNVIDIA.astream()` and
+the `NVIDIA_CHAT_MODEL`. The default is `nvidia/nemotron-3-ultra-550b-a55b` with thinking
+enabled, temperature `1`, top-p `0.95`, and a 16,384-token completion ceiling. Internal
+reasoning chunks are discarded; only final answer content is parsed and posted to Discord.
+`NVIDIA_MODEL` remains the model setting for translation and KingShot RAG requests.
+The chat persona favors concise, context-specific dry humor and playful sarcasm while
+avoiding hostile teasing, sensitive topics, and generic bot-like filler.
 
 ## License
 

@@ -4,32 +4,26 @@ from types import SimpleNamespace
 from services.chatbot_service import ChatbotService
 
 
-class FakeCompletions:
+class FakeClient:
     def __init__(self, responses):
+        self.model = "nvidia/nemotron-3-ultra-550b-a55b"
         self._responses = list(responses)
         self.calls = []
 
-    async def create(self, **kwargs):
-        self.calls.append(kwargs)
-        content = self._responses.pop(0)
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=content),
-                )
-            ]
-        )
-
-
-class FakeClient:
-    def __init__(self, responses):
-        self.chat = SimpleNamespace(completions=FakeCompletions(responses))
+    async def astream(self, messages):
+        self.calls.append({"messages": messages})
+        response = self._responses.pop(0)
+        chunks = response if isinstance(response, list) else [{"content": response}]
+        for chunk in chunks:
+            yield SimpleNamespace(
+                content=chunk.get("content", ""),
+                additional_kwargs=chunk.get("additional_kwargs", {}),
+            )
 
 
 def test_generate_contextual_reply_returns_none_when_model_declines():
     service = ChatbotService(
         FakeClient(['{"should_reply":false,"reply":""}']),
-        model="openai/gpt-oss-120b",
     )
 
     result = asyncio.run(
@@ -45,7 +39,6 @@ def test_generate_contextual_reply_returns_none_when_model_declines():
 def test_generate_contextual_reply_truncates_long_output():
     service = ChatbotService(
         FakeClient(['{"should_reply":true,"reply":"1234567890"}']),
-        model="openai/gpt-oss-120b",
         max_chat_response_chars=5,
     )
 
@@ -59,9 +52,57 @@ def test_generate_contextual_reply_truncates_long_output():
     assert result == "12345"
 
 
+def test_generate_contextual_reply_streams_final_content_and_omits_reasoning():
+    client = FakeClient(
+        [
+            [
+                {
+                    "content": "",
+                    "additional_kwargs": {"reasoning_content": "private reasoning"},
+                },
+                {"content": '{"should_reply":true,'},
+                {"content": '"reply":"Streamed answer"}'},
+            ]
+        ]
+    )
+    service = ChatbotService(client)
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "Can you help?",
+            [{"author": "Bob", "content": "Need an answer"}],
+            force_reply=True,
+        )
+    )
+
+    assert result == "Streamed answer"
+    assert "private reasoning" not in result
+
+
+def test_generate_contextual_reply_removes_reasoning_tags_from_content():
+    service = ChatbotService(
+        FakeClient(
+            [
+                "<think>private reasoning</think>"
+                '{"should_reply":true,"reply":"Visible answer"}'
+            ]
+        )
+    )
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "Can you help?",
+            [],
+            force_reply=True,
+        )
+    )
+
+    assert result == "Visible answer"
+
+
 def test_generate_contextual_reply_includes_structured_context_and_reply_target():
     client = FakeClient(['{"should_reply":true,"reply":"Use rally chat"}'])
-    service = ChatbotService(client, model="openai/gpt-oss-120b")
+    service = ChatbotService(client)
 
     result = asyncio.run(
         service.generate_contextual_reply(
@@ -90,7 +131,7 @@ def test_generate_contextual_reply_includes_structured_context_and_reply_target(
         )
     )
 
-    sent_messages = client.chat.completions.calls[0]["messages"]
+    sent_messages = client.calls[0]["messages"]
     prompt_text = "\n".join(message["content"] for message in sent_messages)
 
     assert result == "Use rally chat"
@@ -102,7 +143,7 @@ def test_generate_contextual_reply_includes_structured_context_and_reply_target(
 
 def test_generate_contextual_reply_includes_strict_random_reply_policy():
     client = FakeClient(['{"should_reply":false,"reply":""}'])
-    service = ChatbotService(client, model="openai/gpt-oss-120b")
+    service = ChatbotService(client)
 
     result = asyncio.run(
         service.generate_contextual_reply(
@@ -112,18 +153,21 @@ def test_generate_contextual_reply_includes_strict_random_reply_policy():
         )
     )
 
-    sent_messages = client.chat.completions.calls[0]["messages"]
+    sent_messages = client.calls[0]["messages"]
     prompt_text = "\n".join(message["content"] for message in sent_messages)
 
     assert result is None
     assert "The bot is considering a random reply" in prompt_text
     assert "Return should_reply false for announcements, commands, logs" in prompt_text
+    assert "quick-witted regular in the chat" in prompt_text
+    assert "dry humor, playful sarcasm" in prompt_text
+    assert "genuinely funny context-specific one-liner" in prompt_text
+    assert "skip humor when it would feel insensitive" in prompt_text
 
 
 def test_generate_contextual_reply_force_reply_uses_text_when_model_declines():
     service = ChatbotService(
         FakeClient(['{"should_reply":false,"reply":"What do you need help with?"}']),
-        model="openai/gpt-oss-120b",
     )
 
     result = asyncio.run(
@@ -140,7 +184,6 @@ def test_generate_contextual_reply_force_reply_uses_text_when_model_declines():
 def test_generate_contextual_reply_force_reply_uses_plain_text_when_model_omits_json():
     service = ChatbotService(
         FakeClient(["You just said: JUST SAY WHAT DID I SAY JUST NOW"]),
-        model="openai/gpt-oss-120b",
     )
 
     result = asyncio.run(
@@ -161,7 +204,6 @@ def test_generate_contextual_reply_recovers_truncated_json_reply():
     )
     service = ChatbotService(
         FakeClient(['{"should_reply":true,"reply":"' + expected_reply]),
-        model="openai/gpt-oss-120b",
     )
 
     result = asyncio.run(
@@ -178,7 +220,6 @@ def test_generate_contextual_reply_recovers_truncated_json_reply():
 def test_generate_contextual_reply_random_candidate_ignores_plain_text_without_json():
     service = ChatbotService(
         FakeClient(["This is a plain text answer"]),
-        model="openai/gpt-oss-120b",
     )
 
     result = asyncio.run(
@@ -195,7 +236,6 @@ def test_generate_contextual_reply_random_candidate_ignores_plain_text_without_j
 def test_generate_contextual_reply_force_reply_falls_back_when_model_returns_empty_reply():
     service = ChatbotService(
         FakeClient(['{"should_reply":false,"reply":""}']),
-        model="openai/gpt-oss-120b",
     )
 
     result = asyncio.run(

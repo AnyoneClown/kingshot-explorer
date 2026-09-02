@@ -109,7 +109,11 @@ class StatusHandler:
         embed.add_field(name="Gift Polling", value=self._component_value(gift_polling_state), inline=True)
         embed.add_field(name="Guilds", value=str(len(self._bot.guilds)), inline=True)
         if self._config.bot_profile == "local":
-            embed.add_field(name="AI Model", value=f"`{self._config.nvidia_model}`", inline=True)
+            embed.add_field(
+                name="AI Chat Model",
+                value=f"`{self._config.nvidia_chat_model}`",
+                inline=True,
+            )
             embed.add_field(name="Chat Context", value=f"{self._config.chat_history_limit} messages", inline=True)
             embed.add_field(name="Random Replies", value=f"{self._config.random_reply_chance:.0%}", inline=True)
             embed.add_field(

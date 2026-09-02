@@ -105,7 +105,7 @@ async def test_global_status_reports_local_workers_as_disabled():
     assert fields["KingShot Data API"] == "OK - Reachable"
     assert fields["Scheduler"] == "INFO - Disabled"
     assert fields["Gift Polling"] == "INFO - Disabled"
-    assert "AI Model" not in fields
+    assert "AI Chat Model" not in fields
     assert embed.color == discord.Color.green()
 
 
@@ -129,7 +129,7 @@ async def test_local_status_distinguishes_disabled_and_stopped_workers():
 
     assert fields["Scheduler"] == "ISSUE - Stopped"
     assert fields["Gift Polling"] == "INFO - Disabled"
-    assert fields["AI Model"] == "`openai/gpt-oss-120b`"
+    assert fields["AI Chat Model"] == "`nvidia/nemotron-3-ultra-550b-a55b`"
     assert embed.color == discord.Color.orange()
 
 

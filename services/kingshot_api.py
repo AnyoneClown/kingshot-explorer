@@ -8,6 +8,7 @@ import aiohttp
 
 SALT = "mN4!pQs6JrYwV9"
 HOSTNAME = "https://kingshot-giftcode.centurygame.com"
+MIN_REQUEST_INTERVAL_SECONDS = 1.0
 
 
 class KingshotAPIClient:
@@ -15,6 +16,8 @@ class KingshotAPIClient:
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._request_slot_lock = asyncio.Lock()
+        self._last_request_started_at: Optional[float] = None
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession()
@@ -44,6 +47,20 @@ class KingshotAPIClient:
         string_to_sign = query_string + SALT
         return hashlib.md5(string_to_sign.encode("utf-8")).hexdigest()
 
+    async def _wait_for_request_slot(self) -> None:
+        """Keep all CenturyGame HTTP request starts at least one second apart."""
+        async with self._request_slot_lock:
+            now = time.monotonic()
+            if self._last_request_started_at is not None:
+                wait_seconds = MIN_REQUEST_INTERVAL_SECONDS - (
+                    now - self._last_request_started_at
+                )
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                    now = time.monotonic()
+
+            self._last_request_started_at = now
+
     async def _request(self, path: str, params: Dict[str, str]) -> Dict[str, Any]:
         """Make a signed POST request to the API."""
         params_with_sign = params.copy()
@@ -68,6 +85,7 @@ class KingshotAPIClient:
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                await self._wait_for_request_slot()
                 async with session.post(
                     url, data=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
