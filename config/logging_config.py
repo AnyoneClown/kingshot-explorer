@@ -8,16 +8,14 @@ from pathlib import Path
 
 
 class BotContextFilter(logging.Filter):
-    """Attach bot instance/profile metadata to every log record."""
+    """Attach bot instance metadata to every log record."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.bot_instance = os.getenv("BOT_INSTANCE") or os.getenv("BOT_PROFILE") or "bot"
-        self.bot_profile = os.getenv("BOT_PROFILE", "unknown")
+        self.bot_instance = os.getenv("BOT_INSTANCE", "bot")
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.bot_instance = self.bot_instance
-        record.bot_profile = self.bot_profile
         return True
 
 

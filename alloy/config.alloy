@@ -8,7 +8,7 @@ discovery.docker "bots" {
 
   filter {
     name   = "name"
-    values = ["discord-translator-bot-local", "discord-translator-bot-global"]
+    values = ["discord-translator-bot-local"]
   }
 }
 

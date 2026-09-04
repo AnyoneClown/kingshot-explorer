@@ -40,12 +40,8 @@ class StatusHandler:
         self._kingshot_data_service = kingshot_data_service
         self._started_at = started_at
         self._database_health_service = database_health_service or DatabaseHealthService()
-        self._scheduler_enabled = (
-            config.bot_profile == "local" if scheduler_enabled is None else scheduler_enabled
-        )
-        self._gift_polling_enabled = (
-            config.bot_profile == "local" if gift_polling_enabled is None else gift_polling_enabled
-        )
+        self._scheduler_enabled = True if scheduler_enabled is None else scheduler_enabled
+        self._gift_polling_enabled = True if gift_polling_enabled is None else gift_polling_enabled
         logger.info("StatusHandler initialized")
 
     def register_commands(self):
@@ -108,19 +104,18 @@ class StatusHandler:
         embed.add_field(name="Scheduler", value=self._component_value(scheduler_state), inline=True)
         embed.add_field(name="Gift Polling", value=self._component_value(gift_polling_state), inline=True)
         embed.add_field(name="Guilds", value=str(len(self._bot.guilds)), inline=True)
-        if self._config.bot_profile == "local":
-            embed.add_field(
-                name="AI Chat Model",
-                value=f"`{self._config.nvidia_chat_model}`",
-                inline=True,
-            )
-            embed.add_field(name="Chat Context", value=f"{self._config.chat_history_limit} messages", inline=True)
-            embed.add_field(name="Random Replies", value=f"{self._config.random_reply_chance:.0%}", inline=True)
-            embed.add_field(
-                name="Auto-Redeem Channels",
-                value=str(len(self._config.auto_redeem_channels)),
-                inline=True,
-            )
+        embed.add_field(
+            name="AI Chat Model",
+            value=f"`{self._config.nvidia_chat_model}`",
+            inline=True,
+        )
+        embed.add_field(name="Chat Context", value=f"{self._config.chat_history_limit} messages", inline=True)
+        embed.add_field(name="Random Replies", value=f"{self._config.random_reply_chance:.0%}", inline=True)
+        embed.add_field(
+            name="Auto-Redeem Channels",
+            value=str(len(self._config.auto_redeem_channels)),
+            inline=True,
+        )
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 

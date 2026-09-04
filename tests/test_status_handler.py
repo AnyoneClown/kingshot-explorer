@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import discord
@@ -65,12 +65,11 @@ class FakeWorker:
         return self.running
 
 
-def make_config(*, profile="local"):
+def make_config():
     return BotConfig(
         discord_token="token",
         database_url="postgresql+asyncpg://user:pass@localhost/test",
-        nvidia_api_key="key" if profile == "local" else None,
-        bot_profile=profile,
+        nvidia_api_key="key",
     )
 
 
@@ -88,29 +87,7 @@ async def render_status(handler: StatusHandler):
 
 
 @pytest.mark.asyncio
-async def test_global_status_reports_local_workers_as_disabled():
-    handler = StatusHandler(
-        FakeBot(),
-        make_config(profile="global"),
-        FakeDatabaseHealth(),
-        kingshot_data_service=FakeDataHealth(
-            {"success": True, "data": {"status": "ok", "connected": True}}
-        ),
-        started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
-    )
-
-    embed = await render_status(handler)
-    fields = field_values(embed)
-
-    assert fields["KingShot Data API"] == "OK - Reachable"
-    assert fields["Scheduler"] == "INFO - Disabled"
-    assert fields["Gift Polling"] == "INFO - Disabled"
-    assert "AI Chat Model" not in fields
-    assert embed.color == discord.Color.green()
-
-
-@pytest.mark.asyncio
-async def test_local_status_distinguishes_disabled_and_stopped_workers():
+async def test_status_distinguishes_disabled_and_stopped_workers():
     handler = StatusHandler(
         FakeBot(),
         make_config(),
@@ -181,7 +158,7 @@ async def test_database_and_data_api_checks_run_concurrently():
 
     handler = StatusHandler(
         FakeBot(),
-        make_config(profile="global"),
+        make_config(),
         CoordinatedDatabaseHealth(),
         kingshot_data_service=CoordinatedDataHealth(),
         started_at=datetime.now(timezone.utc),
@@ -210,8 +187,8 @@ async def test_database_health_service_sanitizes_connection_errors():
     assert await service.check_database() == (False, "Unavailable")
 
 
-def test_global_profile_registers_status_command():
-    app = TranslatorBot(make_config(profile="global"))
+def test_bot_registers_status_command():
+    app = TranslatorBot(make_config())
 
     assert app.status_handler is not None
     assert app.bot.tree.get_command("status") is not None

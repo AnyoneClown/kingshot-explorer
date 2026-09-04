@@ -12,8 +12,7 @@ class BotConfig:
 
     discord_token: str
     database_url: str
-    nvidia_api_key: str | None
-    bot_profile: str = "local"
+    nvidia_api_key: str
     command_prefix: str = "!"
     translator_role_name: str = "Translator"
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
@@ -42,10 +41,7 @@ class BotConfig:
 
     def __post_init__(self):
         """Initialize mutable default values."""
-        self.bot_profile = self.bot_profile.strip().lower()
-        if self.bot_profile not in {"local", "global"}:
-            raise ValueError("BOT_PROFILE must be either 'local' or 'global'")
-        if self.bot_profile == "local" and not self.nvidia_api_key:
+        if not self.nvidia_api_key:
             raise ValueError("NVIDIA_API_KEY not found in environment variables")
         if self.admin_user_ids is None:
             self.admin_user_ids = set()
@@ -79,8 +75,9 @@ class BotConfig:
         if not database_url:
             raise ValueError("COCKROACHDB_URL not found in environment variables")
 
-        bot_profile = os.getenv("BOT_PROFILE", "local").strip().lower()
         nvidia_api_key = os.getenv("NVIDIA_API_KEY")
+        if not nvidia_api_key:
+            raise ValueError("NVIDIA_API_KEY not found in environment variables")
 
         # Parse bot admin users from env. ADMIN_USER_ID is kept for single-admin setups.
         admin_users_str = ",".join(
@@ -126,7 +123,6 @@ class BotConfig:
             discord_token=discord_token,
             database_url=database_url,
             nvidia_api_key=nvidia_api_key,
-            bot_profile=bot_profile,
             command_prefix=os.getenv("COMMAND_PREFIX", "!"),
             translator_role_name=os.getenv("TRANSLATOR_ROLE", "Translator"),
             nvidia_base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),

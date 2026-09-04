@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     uv sync --frozen --no-dev --no-install-project
 
-# Copy the source code into the container (will be overridden by volume in dev).
+# Copy the source code into the container.
 COPY . .
 
 # Create logs directory and set permissions before switching user

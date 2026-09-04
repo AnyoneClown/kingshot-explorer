@@ -142,7 +142,6 @@ celerybeat.pid
 .env
 .env.grafana
 .env.local
-.env.prod
 .envrc
 .venv
 env/
