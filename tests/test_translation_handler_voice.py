@@ -175,3 +175,18 @@ def test_ai_replies_can_be_disabled_per_guild_including_direct_triggers():
 
     assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=False)) is False
     assert asyncio.run(handler._should_attempt_reply(message, direct_trigger=True)) is False
+
+
+def test_content_for_ai_uses_discord_resolved_mention_names():
+    message = SimpleNamespace(
+        content="<@123> ask <@&456> in <#789>",
+        clean_content="@Alice ask @Rally Leaders in #strategy",
+    )
+
+    assert TranslationHandler._content_for_ai(message) == "@Alice ask @Rally Leaders in #strategy"
+
+
+def test_content_for_ai_falls_back_to_raw_content_for_test_messages():
+    message = SimpleNamespace(content="  hello <@123>  ")
+
+    assert TranslationHandler._content_for_ai(message) == "hello <@123>"

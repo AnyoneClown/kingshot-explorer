@@ -310,7 +310,7 @@ Current project usage:
 
 - `/stats` uses the default KingShot API for the profile image, then enriches fields from `GET /v1/players/by-fid/{fid}`.
 - `/scout` uses `GET /v1/leaderboards/kingdom/20?kid={kid}&limit={limit}&resolve=true`, then enriches returned entries with `GET /v1/players/by-fid/{fid}` and sends stats-style embeds. The command defaults to 5 players and caps the limit at 15.
-- `/addalliance` uses `/v1/alliances/{aid}?kid={kid}` and only imports members that include `fid`.
+- `/addalliance kid:<kid> alliance:<tag>` loads alliance-power leaderboard type `1`, resolves each ranked alliance's three-character tag and full name from its roster, and exposes the top 15 as native Discord autocomplete choices ordered by power. Each choice is displayed as `[TAG] Name - N members` and carries `aid` as its hidden value. Ready choices can be returned within Discord's short autocomplete deadline while unresolved entries continue loading from the same request batch; only the completed snapshot receives the normal ten-minute cache lifetime. After selection, the bot loads `/v1/alliances/{aid}?kid={kid}`; roster UIDs are resolved through the local cache or player endpoint when no `fid` is present.
 
 ## Client Etiquette
 

@@ -232,7 +232,7 @@ Gift code related commands include:
 
 - /redeem
 - /addplayer
-- /addalliance
+- `/addalliance kid:<id> alliance:<tag>` (top 15 by power, shown as `[TAG] Name - N members`)
 - /removeplayer
 - /listplayers
 - /playerlist (alias)
@@ -282,6 +282,8 @@ reasoning chunks are discarded; only final answer content is parsed and posted t
 `NVIDIA_MODEL` remains the model setting for translation and KingShot RAG requests.
 The chat persona favors concise, context-specific dry humor and playful sarcasm while
 avoiding hostile teasing, sensitive topics, and generic bot-like filler.
+Discord user, role, and channel mentions are resolved to readable names before the current
+message, reply target, and recent conversation history are sent to the chat model.
 
 ## License
 

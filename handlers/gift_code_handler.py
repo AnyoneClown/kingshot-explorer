@@ -2,6 +2,8 @@ import asyncio
 import socket
 import logging
 import random
+import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -105,6 +107,12 @@ class GiftCodeHandler:
     REDEEM_RATE_LIMIT_DELAY_SECONDS = 60.0
     REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
     REDEEM_CONCURRENCY = 3
+    ALLIANCE_CACHE_TTL_SECONDS = 10 * 60
+    ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS = 2.4
+    ALLIANCE_AUTOCOMPLETE_MAX_CHOICES = 15
+    ALLIANCE_KID_PREWARM_DEBOUNCE_SECONDS = 0.35
+    ALLIANCE_CHOICE_NAME_MAX_LENGTH = 100
+    ALLIANCE_COMPLETION_RETRY_SECONDS = 30.0
 
     def __init__(
         self,
@@ -138,6 +146,23 @@ class GiftCodeHandler:
         self._manual_redemption_start_lock = asyncio.Lock()
         self._manual_redemption_task: asyncio.Task[None] | None = None
         self._manual_redemption_code: str | None = None
+        self._alliance_cache: Dict[
+            int,
+            tuple[float, List[Dict[str, Any]], bool],
+        ] = {}
+        self._alliance_refresh_tasks: Dict[
+            int,
+            asyncio.Task[Optional[List[Dict[str, Any]]]],
+        ] = {}
+        self._alliance_completion_tasks: Dict[
+            int,
+            asyncio.Task[Optional[List[Dict[str, Any]]]],
+        ] = {}
+        self._alliance_completion_retry_after: Dict[int, float] = {}
+        self._alliance_prewarm_tasks: Dict[
+            int,
+            tuple[int, asyncio.Task[None]],
+        ] = {}
         logger.info("GiftCodeHandler initialized")
 
     def _can_poll(self) -> bool:
@@ -176,14 +201,35 @@ class GiftCodeHandler:
             """Add a player to gift code list using API name."""
             await self._handle_add_player_slash(interaction, player_ids)
 
-        @self._bot.tree.command(name="addalliance", description="Add all alliance members to gift code redemption list")
+        @self._bot.tree.command(name="addalliance", description="Add an alliance to gift code auto-redemption")
         @app_commands.describe(
-            aid="Alliance ID",
             kid="Kingdom ID",
+            alliance="Top-15 alliance tag by power (may take a moment to load)",
         )
-        async def add_alliance(interaction: discord.Interaction, aid: str, kid: int):
-            """Add alliance roster members to the gift code list."""
-            await self._handle_add_alliance_slash(interaction, aid.strip(), kid)
+        async def add_alliance(
+            interaction: discord.Interaction,
+            kid: int,
+            alliance: str,
+        ):
+            """Add an alliance selected from the kingdom's autocomplete results."""
+            await self._handle_add_alliance_choice_slash(interaction, kid, alliance)
+
+        @add_alliance.autocomplete("alliance")
+        async def alliance_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ) -> List[app_commands.Choice[str]]:
+            """Offer alliances from the kingdom option without exposing their IDs."""
+            kid = getattr(interaction.namespace, "kid", None)
+            return await self._get_alliance_autocomplete_choices(kid, current)
+
+        @add_alliance.autocomplete("kid")
+        async def kid_autocomplete(
+            interaction: discord.Interaction,
+            current: int,
+        ) -> List[app_commands.Choice[int]]:
+            """Accept a positive kingdom ID while warming its alliance cache."""
+            return await self._get_kid_autocomplete_choices(interaction, current)
 
         @self._bot.tree.command(name="removeplayer", description="Remove a player from gift code redemption list")
         @app_commands.describe(player_id="The player ID to remove")
@@ -1393,6 +1439,429 @@ class GiftCodeHandler:
         """Split lines into fixed-size pages."""
         return [lines[idx : idx + page_size] for idx in range(0, len(lines), page_size)]
 
+    @staticmethod
+    def _normalize_ranked_alliances(payload: Any) -> List[Dict[str, Any]]:
+        """Validate and consistently order ranked-alliance API rows."""
+        if not isinstance(payload, list):
+            return []
+
+        alliances_by_aid: Dict[str, Dict[str, Any]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+
+            aid = str(row.get("aid", "")).strip()
+            abbr = row.get("abbr")
+            if (
+                not aid.isdigit()
+                or int(aid) <= 0
+                or not isinstance(abbr, str)
+                or len(abbr.strip()) != 3
+                or not abbr.strip().isalnum()
+            ):
+                continue
+
+            power: Optional[int]
+            rank: Optional[int]
+            try:
+                power = int(row["power"]) if row.get("power") is not None else None
+            except (TypeError, ValueError):
+                power = None
+            try:
+                rank = int(row["rank"]) if row.get("rank") is not None else None
+            except (TypeError, ValueError):
+                rank = None
+
+            name: Optional[str] = None
+            raw_name = row.get("name")
+            if isinstance(raw_name, str):
+                printable_name = "".join(
+                    " " if unicodedata.category(character) == "Cc" else character
+                    for character in raw_name
+                )
+                normalized_name = " ".join(printable_name.split())
+                if normalized_name:
+                    name = normalized_name
+
+            member_count: Optional[int] = None
+            raw_member_count = row.get("member_count")
+            if not isinstance(raw_member_count, bool):
+                try:
+                    normalized_member_count = int(raw_member_count)
+                except (TypeError, ValueError):
+                    normalized_member_count = -1
+                if 0 <= normalized_member_count <= 10_000:
+                    member_count = normalized_member_count
+
+            alliances_by_aid.setdefault(
+                aid,
+                {
+                    "aid": aid,
+                    "abbr": abbr.strip(),
+                    "power": power,
+                    "rank": rank,
+                    "name": name,
+                    "member_count": member_count,
+                },
+            )
+
+        return sorted(
+            alliances_by_aid.values(),
+            key=lambda alliance: (
+                alliance["power"] is None,
+                -(alliance["power"] or 0),
+                alliance["rank"] is None,
+                alliance["rank"] or 0,
+                alliance["abbr"].casefold(),
+                int(alliance["aid"]),
+            ),
+        )
+
+    def _get_cached_alliances(
+        self,
+        kid: int,
+    ) -> tuple[Optional[List[Dict[str, Any]]], bool, bool]:
+        """Return a cached snapshot plus its freshness and resolution state."""
+        cached = self._alliance_cache.get(kid)
+        if cached is None:
+            return None, False, False
+
+        cached_at, alliances, resolution_complete = cached
+        is_fresh = time.monotonic() - cached_at < self.ALLIANCE_CACHE_TTL_SECONDS
+        return alliances, is_fresh, resolution_complete
+
+    def _cancel_alliance_prewarm(self, user_id: int) -> None:
+        """Cancel a user's pending debounce before it starts an API lookup."""
+        pending = self._alliance_prewarm_tasks.pop(user_id, None)
+        if pending is not None and not pending[1].done():
+            pending[1].cancel()
+
+    def _schedule_alliance_prewarm(self, user_id: int, kid: int) -> None:
+        """Debounce KID typing and warm only the user's latest kingdom."""
+        cached, is_fresh, resolution_complete = self._get_cached_alliances(kid)
+        if cached is not None:
+            if not resolution_complete or not is_fresh:
+                self._start_alliance_completion(kid)
+            self._cancel_alliance_prewarm(user_id)
+            return
+
+        pending = self._alliance_prewarm_tasks.get(user_id)
+        if pending is not None:
+            pending_kid, pending_task = pending
+            if pending_kid == kid and not pending_task.done():
+                return
+            if not pending_task.done():
+                pending_task.cancel()
+
+        async def prewarm() -> None:
+            await asyncio.sleep(self.ALLIANCE_KID_PREWARM_DEBOUNCE_SECONDS)
+            cached_after_delay, fresh_after_delay, complete_after_delay = (
+                self._get_cached_alliances(kid)
+            )
+            if cached_after_delay is None:
+                self._start_alliance_refresh(kid)
+            elif not complete_after_delay or not fresh_after_delay:
+                self._start_alliance_completion(kid)
+
+        task = asyncio.create_task(
+            prewarm(),
+            name=f"alliance-prewarm-{user_id}-{kid}",
+        )
+        self._alliance_prewarm_tasks[user_id] = (kid, task)
+
+        def cleanup(finished: asyncio.Task[None]) -> None:
+            current = self._alliance_prewarm_tasks.get(user_id)
+            if current is not None and current[1] is finished:
+                self._alliance_prewarm_tasks.pop(user_id, None)
+
+        task.add_done_callback(cleanup)
+
+    def _start_alliance_refresh(
+        self,
+        kid: int,
+    ) -> asyncio.Task[Optional[List[Dict[str, Any]]]]:
+        """Return the one in-flight bounded alliance lookup for a kingdom."""
+        existing = self._alliance_refresh_tasks.get(kid)
+        if existing is not None and not existing.done():
+            return existing
+
+        completion = self._alliance_completion_tasks.get(kid)
+        if completion is not None and not completion.done():
+            return completion
+
+        task = asyncio.create_task(
+            self._refresh_alliance_cache(kid, exhaustive=False),
+            name=f"alliance-autocomplete-{kid}",
+        )
+        self._alliance_refresh_tasks[kid] = task
+        return task
+
+    def _start_alliance_completion(
+        self,
+        kid: int,
+    ) -> Optional[asyncio.Task[Optional[List[Dict[str, Any]]]]]:
+        """Continue one kingdom's retained service batch without duplicate requests."""
+        existing = self._alliance_completion_tasks.get(kid)
+        if existing is not None and not existing.done():
+            return existing
+
+        retry_after = self._alliance_completion_retry_after.get(kid, 0.0)
+        if time.monotonic() < retry_after:
+            return None
+
+        self._alliance_completion_retry_after.pop(kid, None)
+        task = asyncio.create_task(
+            self._refresh_alliance_cache(kid, exhaustive=True),
+            name=f"alliance-autocomplete-completion-{kid}",
+        )
+        self._alliance_completion_tasks[kid] = task
+        return task
+
+    async def _refresh_alliance_cache(
+        self,
+        kid: int,
+        *,
+        exhaustive: bool,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Fetch and cache one bounded or exhaustive ranked-alliance snapshot."""
+        current_task = asyncio.current_task()
+        task_registry = (
+            self._alliance_completion_tasks if exhaustive else self._alliance_refresh_tasks
+        )
+        try:
+            if self._kingshot_data_service is None:
+                return None
+
+            result = await self._kingshot_data_service.get_ranked_alliances(
+                kid,
+                limit=self.ALLIANCE_AUTOCOMPLETE_MAX_CHOICES,
+                exhaustive=exhaustive,
+            )
+            if not result.get("success"):
+                logger.warning(
+                    "Could not %s ranked alliances for kingdom %s: %s",
+                    "finish loading" if exhaustive else "load",
+                    kid,
+                    result.get("error_message", "KingShot Data API request failed."),
+                )
+                if exhaustive:
+                    self._alliance_completion_retry_after[kid] = (
+                        time.monotonic() + self.ALLIANCE_COMPLETION_RETRY_SECONDS
+                    )
+                return None
+
+            payload = result.get("data")
+            if not isinstance(payload, list):
+                logger.warning("Ranked alliances for kingdom %s were not a list", kid)
+                if exhaustive:
+                    self._alliance_completion_retry_after[kid] = (
+                        time.monotonic() + self.ALLIANCE_COMPLETION_RETRY_SECONDS
+                    )
+                return None
+
+            alliances = self._normalize_ranked_alliances(payload)
+            resolution_complete = result.get("resolution_complete", True) is True
+            if not alliances:
+                logger.warning(
+                    "Ranked alliance lookup returned no usable choices for kingdom %s; "
+                    "leaving the cache empty",
+                    kid,
+                )
+            else:
+                self._alliance_cache[kid] = (
+                    time.monotonic(),
+                    alliances,
+                    resolution_complete,
+                )
+
+            if resolution_complete:
+                self._alliance_completion_retry_after.pop(kid, None)
+            elif not exhaustive:
+                self._start_alliance_completion(kid)
+            else:
+                self._alliance_completion_retry_after[kid] = (
+                    time.monotonic() + self.ALLIANCE_COMPLETION_RETRY_SECONDS
+                )
+            return alliances
+        except Exception as exc:
+            logger.error(
+                "Error loading ranked alliances for kingdom %s: %s",
+                kid,
+                exc,
+                exc_info=True,
+            )
+            if exhaustive:
+                self._alliance_completion_retry_after[kid] = (
+                    time.monotonic() + self.ALLIANCE_COMPLETION_RETRY_SECONDS
+                )
+            return None
+        finally:
+            if task_registry.get(kid) is current_task:
+                task_registry.pop(kid, None)
+
+    async def _get_alliances_for_autocomplete(
+        self,
+        kid: int,
+    ) -> List[Dict[str, Any]]:
+        """Serve fresh/stale cache data without exceeding Discord's response window."""
+        started_at = time.monotonic()
+        cached, is_fresh, resolution_complete = self._get_cached_alliances(kid)
+        if cached is not None:
+            if not resolution_complete or not is_fresh:
+                self._start_alliance_completion(kid)
+            return cached
+
+        refresh = self._alliance_completion_tasks.get(kid)
+        if refresh is None or refresh.done():
+            refresh = self._start_alliance_refresh(kid)
+        try:
+            alliances = await asyncio.wait_for(
+                asyncio.shield(refresh),
+                timeout=self.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - started_at
+            logger.warning(
+                "Alliance autocomplete timed out for kingdom %s after %.2fs "
+                "(budget %.2fs, cache miss, lookup continues=%s)",
+                kid,
+                elapsed,
+                self.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS,
+                not refresh.done(),
+            )
+            return []
+
+        cached, _, resolution_complete = self._get_cached_alliances(kid)
+        if cached is not None and resolution_complete:
+            return cached
+
+        completion = self._alliance_completion_tasks.get(kid)
+        remaining = self.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS - (
+            time.monotonic() - started_at
+        )
+        if completion is not None and not completion.done() and remaining > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(completion), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "Serving %s partial alliance choices for kingdom %s while exhaustive "
+                    "resolution continues",
+                    len(cached or alliances or []),
+                    kid,
+                )
+
+        latest, _, _ = self._get_cached_alliances(kid)
+        return latest if latest is not None else alliances or []
+
+    async def _get_alliance_autocomplete_choices(
+        self,
+        kid: Any,
+        current: str,
+    ) -> List[app_commands.Choice[str]]:
+        """Build Discord autocomplete choices for a valid kingdom option."""
+        if isinstance(kid, bool):
+            return []
+        try:
+            normalized_kid = int(kid)
+        except (TypeError, ValueError):
+            return []
+        if normalized_kid <= 0:
+            return []
+
+        alliances = await self._get_alliances_for_autocomplete(normalized_kid)
+        needle = str(current or "").strip().casefold()
+        if needle:
+            alliances = [
+                alliance
+                for alliance in alliances
+                if needle in alliance["abbr"].casefold()
+                or (
+                    isinstance(alliance.get("name"), str)
+                    and needle in alliance["name"].casefold()
+                )
+            ]
+
+        return [
+            app_commands.Choice(
+                name=self._format_alliance_choice_name(alliance),
+                value=alliance["aid"],
+            )
+            for alliance in alliances[: self.ALLIANCE_AUTOCOMPLETE_MAX_CHOICES]
+        ]
+
+    @classmethod
+    def _format_alliance_choice_name(cls, alliance: Dict[str, Any]) -> str:
+        """Render one safe Discord choice label while preserving its suffix."""
+        tag = str(alliance.get("abbr") or "???")
+        full_name = alliance.get("name")
+        if not isinstance(full_name, str) or not full_name:
+            full_name = "Unknown Alliance"
+
+        member_count = alliance.get("member_count")
+        count_text = (
+            str(member_count)
+            if isinstance(member_count, int) and not isinstance(member_count, bool)
+            else "?"
+        )
+        prefix = f"[{tag}] "
+        suffix = f" - {count_text} members"
+        available_name_length = cls.ALLIANCE_CHOICE_NAME_MAX_LENGTH - len(prefix) - len(suffix)
+        if len(full_name) > available_name_length:
+            full_name = full_name[: max(1, available_name_length - 1)].rstrip() + "…"
+
+        return f"{prefix}{full_name}{suffix}"
+
+    async def _get_kid_autocomplete_choices(
+        self,
+        interaction: discord.Interaction,
+        current: Any,
+    ) -> List[app_commands.Choice[int]]:
+        """Echo a positive KID immediately and debounce its cache prewarm."""
+        user_id = getattr(getattr(interaction, "user", None), "id", None)
+        if isinstance(current, bool):
+            if isinstance(user_id, int):
+                self._cancel_alliance_prewarm(user_id)
+            return []
+
+        try:
+            kid = int(current)
+        except (TypeError, ValueError):
+            if isinstance(user_id, int):
+                self._cancel_alliance_prewarm(user_id)
+            return []
+
+        if kid <= 0:
+            if isinstance(user_id, int):
+                self._cancel_alliance_prewarm(user_id)
+            return []
+
+        if isinstance(user_id, int):
+            self._schedule_alliance_prewarm(user_id, kid)
+        return [app_commands.Choice(name=str(kid), value=kid)]
+
+    @staticmethod
+    def _find_alliance_selection(
+        alliances: List[Dict[str, Any]],
+        selection: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a hidden autocomplete ID or an exact manually entered tag."""
+        value = selection.strip()
+        if value.isdigit():
+            if int(value) <= 0:
+                return None
+            matches = [alliance for alliance in alliances if alliance["aid"] == value]
+        elif len(value) == 3:
+            normalized_tag = value.casefold()
+            matches = [
+                alliance
+                for alliance in alliances
+                if alliance["abbr"].casefold() == normalized_tag
+            ]
+        else:
+            return None
+
+        return matches[0] if len(matches) == 1 else None
+
     @classmethod
     def _extract_alliance_members(cls, payload: Any) -> List[Dict[str, Any]]:
         """Extract alliance member dictionaries from known API response shapes."""
@@ -1717,9 +2186,136 @@ class GiftCodeHandler:
                 )
             )
 
-    async def _handle_add_alliance_slash(self, interaction: discord.Interaction, aid: str, kid: int):
-        """Handle adding all fid-bearing alliance roster members to the redemption list."""
+    async def _handle_add_alliance_choice_slash(
+        self,
+        interaction: discord.Interaction,
+        kid: int,
+        alliance: str,
+    ) -> None:
+        """Validate a native autocomplete selection, then import its roster."""
         await interaction.response.defer(thinking=True)
+
+        if isinstance(kid, bool) or kid <= 0:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Invalid Kingdom",
+                    description="Enter a positive kingdom ID.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        if self._kingshot_data_service is None:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ KingShot Data API Not Configured",
+                    description="Alliance discovery requires the KingShot Data API service.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        selection = alliance.strip() if isinstance(alliance, str) else ""
+        cached, is_fresh, resolution_complete = self._get_cached_alliances(kid)
+        refresh: Optional[asyncio.Task[Optional[List[Dict[str, Any]]]]] = None
+        if cached is None:
+            refresh = self._alliance_completion_tasks.get(kid)
+            if refresh is None or refresh.done():
+                refresh = self._start_alliance_refresh(kid)
+            loaded = await refresh
+            cached, is_fresh, resolution_complete = self._get_cached_alliances(kid)
+            completion = self._alliance_completion_tasks.get(kid)
+            if cached is None and completion is not None and not completion.done():
+                loaded = await completion
+                cached, is_fresh, resolution_complete = self._get_cached_alliances(kid)
+            if cached is None:
+                if loaded == []:
+                    await interaction.followup.send(
+                        embed=self._build_status_embed(
+                            title="No Alliances Found",
+                            description=(
+                                f"No readable 3-character alliance tags were found "
+                                f"in kingdom `{kid}`."
+                            ),
+                            color=discord.Color.orange(),
+                        )
+                    )
+                    return
+                await interaction.followup.send(
+                    embed=self._build_status_embed(
+                        title="❌ Could Not Inspect Kingdom",
+                        description="Could not load alliances from the KingShot Data API.",
+                        color=discord.Color.red(),
+                    )
+                )
+                return
+
+        alliances = cached
+        refresh = self._alliance_completion_tasks.get(kid)
+        if not resolution_complete or not is_fresh:
+            refresh = self._start_alliance_completion(kid)
+
+        selected = self._find_alliance_selection(alliances, selection)
+        if selected is None and refresh is not None:
+            refreshed = await refresh
+            if refreshed:
+                alliances = refreshed
+                selected = self._find_alliance_selection(alliances, selection)
+
+        if not alliances:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="No Alliances Found",
+                    description=f"No readable 3-character alliance tags were found in kingdom `{kid}`.",
+                    color=discord.Color.orange(),
+                )
+            )
+            return
+
+        if selected is None:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Invalid Alliance",
+                    description=(
+                        "Choose an alliance from the autocomplete list for this kingdom, "
+                        "or enter its exact 3-character tag."
+                    ),
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        aid = str(selected.get("aid", "")).strip()
+        if not aid.isdigit() or int(aid) <= 0:
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Invalid Alliance",
+                    description="The selected alliance does not have a valid internal ID.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        await self._handle_add_alliance_slash(
+            interaction,
+            aid=aid,
+            kid=kid,
+            defer_response=False,
+            alliance_label=selected["abbr"],
+        )
+
+    async def _handle_add_alliance_slash(
+        self,
+        interaction: discord.Interaction,
+        aid: str,
+        kid: int,
+        *,
+        defer_response: bool = True,
+        alliance_label: Optional[str] = None,
+    ):
+        """Handle adding all fid-bearing alliance roster members to the redemption list."""
+        if defer_response:
+            await interaction.response.defer(thinking=True)
 
         if not aid or kid <= 0:
             await interaction.followup.send(
@@ -1868,7 +2464,7 @@ class GiftCodeHandler:
             if players_to_add:
                 await self._player_registry_service.add_registered_players(players_to_add)
 
-            alliance_name = self._extract_alliance_name(payload) or f"Alliance {aid}"
+            alliance_name = alliance_label or self._extract_alliance_name(payload) or f"Alliance {aid}"
             embed = discord.Embed(
                 title=f"✅ Added {len(added_players)} Alliance Member(s)",
                 description=f"Roster imported from **{alliance_name}** in kingdom `{kid}`.",

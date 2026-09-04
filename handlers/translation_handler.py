@@ -394,7 +394,7 @@ class TranslationHandler:
             reply_context = await self._collect_reply_context(message)
             async with message.channel.typing():
                 reply_text = await self._chatbot_service.generate_contextual_reply(
-                    message.content,
+                    self._content_for_ai(message),
                     history,
                     force_reply=direct_trigger,
                     reply_context=reply_context,
@@ -608,6 +608,14 @@ class TranslationHandler:
         bot_id = getattr(bot_user, "id", None)
         return author == bot_user or getattr(author, "id", None) == bot_id
 
+    @staticmethod
+    def _content_for_ai(message: discord.Message) -> str:
+        """Return content with Discord mention tokens resolved to readable names."""
+        clean_content = getattr(message, "clean_content", None)
+        if isinstance(clean_content, str):
+            return clean_content.strip()
+        return str(getattr(message, "content", "") or "").strip()
+
     async def _collect_conversation_context(self, message: discord.Message) -> List[Dict[str, object]]:
         """Collect recent messages above the current one for context."""
         history_limit = self._config.chat_history_limit if self._config else 25
@@ -617,7 +625,7 @@ class TranslationHandler:
             if previous.author.bot and previous.author != self._bot.user:
                 continue
 
-            content = (previous.content or "").strip()
+            content = self._content_for_ai(previous)
             if not content:
                 continue
 
@@ -652,7 +660,7 @@ class TranslationHandler:
         if replied_to is None:
             return None
 
-        content = (replied_to.content or "").strip()
+        content = self._content_for_ai(replied_to)
         if not content:
             return None
 

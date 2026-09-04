@@ -41,9 +41,12 @@ class ChatbotService(IChatbotService):
 
     def _clean_text(self, text: str) -> str:
         """Normalize text while keeping multilingual content intact."""
-        text = re.sub(r"<a?:\w+:\d+>", "", text)
-        text = re.sub(r"<@!?\d+>", "", text)
-        text = re.sub(r"<#\d+>", "", text)
+        # Discord messages normally arrive pre-resolved as @name/#channel by the
+        # handler. Preserve meaningful placeholders if raw tokens reach this layer.
+        text = re.sub(r"<a?:(\w+):\d+>", r":\1:", text)
+        text = re.sub(r"<@&(\d+)>", r"@role-\1", text)
+        text = re.sub(r"<@!?(\d+)>", r"@user-\1", text)
+        text = re.sub(r"<#(\d+)>", r"#channel-\1", text)
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 

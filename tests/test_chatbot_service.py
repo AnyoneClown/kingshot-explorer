@@ -141,6 +141,24 @@ def test_generate_contextual_reply_includes_structured_context_and_reply_target(
     assert "The user is directly addressing the bot" in prompt_text
 
 
+def test_generate_contextual_reply_preserves_raw_discord_mentions_as_placeholders():
+    client = FakeClient(['{"should_reply":true,"reply":"Alice is in strategy chat"}'])
+    service = ChatbotService(client)
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "<@123> ask <@&456> in <#789> <:wave:987>",
+            [],
+            force_reply=True,
+        )
+    )
+
+    prompt_text = "\n".join(message["content"] for message in client.calls[0]["messages"])
+
+    assert result == "Alice is in strategy chat"
+    assert "@user-123 ask @role-456 in #channel-789 :wave:" in prompt_text
+
+
 def test_generate_contextual_reply_includes_strict_random_reply_policy():
     client = FakeClient(['{"should_reply":false,"reply":""}'])
     service = ChatbotService(client)
