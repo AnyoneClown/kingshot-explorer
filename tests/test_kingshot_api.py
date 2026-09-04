@@ -1,6 +1,10 @@
 import pytest
 
-from services.kingshot_api import KingshotAPIClient
+from services.kingshot_api import (
+    MAX_REQUESTS_PER_MINUTE,
+    MIN_REQUEST_INTERVAL_SECONDS,
+    KingshotAPIClient,
+)
 
 
 @pytest.mark.asyncio
@@ -31,7 +35,7 @@ async def test_redeem_code_uses_kingdom_and_unix_seconds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_century_requests_are_started_at_least_one_second_apart(monkeypatch):
+async def test_century_requests_are_paced_to_advertised_minute_limit(monkeypatch):
     client = KingshotAPIClient()
     clock = [100.0]
     sleeps = []
@@ -46,5 +50,7 @@ async def test_century_requests_are_started_at_least_one_second_apart(monkeypatc
     await client._wait_for_request_slot()
     await client._wait_for_request_slot()
 
-    assert sleeps == [1.0]
-    assert client._last_request_started_at == 101.0
+    assert MAX_REQUESTS_PER_MINUTE == 30
+    assert MIN_REQUEST_INTERVAL_SECONDS == 2.0
+    assert sleeps == [2.0]
+    assert client._last_request_started_at == 102.0

@@ -77,8 +77,9 @@ fails, preventing a lookup/retry loop.
 The current Century Games redemption request is a signed form POST to
 `https://kingshot-giftcode.centurygame.com/api/gift_code` with `fid`, `kid`, `cdk`, and a
 10-digit Unix-seconds `time`. The former `/api/player` login call no longer exists, and
-`captcha_code` is no longer part of this request. A shared client-side limiter keeps the
-start of every Century Games HTTP request at least one second after the previous request,
+`captcha_code` is no longer part of this request. The endpoint advertises a limit of 30
+requests per 60-second window. A shared client-side limiter therefore keeps the start of
+every Century Games HTTP request at least two seconds after the previous request,
 including requests scheduled by concurrent redemption batches and transport retries.
 
 Bulk redemption first resolves and probes one usable player. These code-wide responses

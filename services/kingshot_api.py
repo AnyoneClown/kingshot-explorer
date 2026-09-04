@@ -8,7 +8,9 @@ import aiohttp
 
 SALT = "mN4!pQs6JrYwV9"
 HOSTNAME = "https://kingshot-giftcode.centurygame.com"
-MIN_REQUEST_INTERVAL_SECONDS = 1.0
+# The endpoint advertises X-RateLimit-Limit: 30 for its 60-second window.
+MAX_REQUESTS_PER_MINUTE = 30
+MIN_REQUEST_INTERVAL_SECONDS = 60.0 / MAX_REQUESTS_PER_MINUTE
 
 
 class KingshotAPIClient:
@@ -48,7 +50,7 @@ class KingshotAPIClient:
         return hashlib.md5(string_to_sign.encode("utf-8")).hexdigest()
 
     async def _wait_for_request_slot(self) -> None:
-        """Keep all CenturyGame HTTP request starts at least one second apart."""
+        """Pace CenturyGame HTTP request starts to the advertised minute limit."""
         async with self._request_slot_lock:
             now = time.monotonic()
             if self._last_request_started_at is not None:

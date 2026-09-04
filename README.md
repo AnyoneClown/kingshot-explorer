@@ -244,8 +244,8 @@ player through the configured KingShot Data API and retries once with the new ki
 It validates a code with one player before starting bounded bulk batches, so expired,
 unknown, or globally exhausted codes do not produce hundreds of redundant requests.
 Completion announcements include all-failure and early-abort outcomes as well as
-successful runs. Century Games requests are globally paced with at least one second
-between request starts to avoid burst-driven rate limits. `/redeem` immediately starts a
+successful runs. Century Games advertises a 30-request-per-minute limit, so requests are
+globally paced with at least two seconds between starts. `/redeem` immediately starts a
 single background job and acknowledges it privately; the final result is posted as a
 normal message in the command channel, independent of Discord's interaction webhook
 lifetime.
