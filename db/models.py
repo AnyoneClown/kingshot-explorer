@@ -1,9 +1,9 @@
 """Database models for the bot."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, List, Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import JSON, BigInteger, Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import UserDefinedType
@@ -224,6 +224,32 @@ class GuildConfiguration(Base):
             f"use_voice_replies={self.use_voice_replies}, "
             f"use_random_replies={self.use_random_replies})>"
         )
+
+
+class AlliancePowerTracking(Base):
+    """One alliance selected for power tracking per Discord guild."""
+
+    __tablename__ = "alliance_power_tracking"
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kingdom_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    alliance_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AlliancePowerSnapshot(Base):
+    """Daily alliance power and member observations shared across guilds."""
+
+    __tablename__ = "alliance_power_snapshots"
+
+    kingdom_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    alliance_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    snapshot_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    alliance_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    alliance_tag: Mapped[str] = mapped_column(String(32), nullable=False)
+    total_power: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    members: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
 class KingshotEntity(Base):

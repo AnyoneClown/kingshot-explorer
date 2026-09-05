@@ -1,5 +1,6 @@
 """Handlers module for Discord bot commands and events."""
 
+from .alliance_power_handler import AlliancePowerHandler
 from .database_handler import DatabaseHandler
 from .event_handler import EventHandler
 from .gift_code_handler import GiftCodeHandler
@@ -12,6 +13,7 @@ from .status_handler import StatusHandler
 from .translation_handler import TranslationHandler
 
 __all__ = [
+    "AlliancePowerHandler",
     "TranslationHandler",
     "EventHandler",
     "PlayerInfoHandler",

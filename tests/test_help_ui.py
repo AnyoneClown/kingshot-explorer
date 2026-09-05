@@ -63,6 +63,22 @@ def make_bot(*, local=False):
 
 
 @pytest.mark.asyncio
+async def test_power_trends_help_is_available_in_servers_and_opens_existing_report():
+    bot, calls = make_bot()
+
+    @bot.tree.command(name="alliance")
+    async def alliance(ctx: discord.Interaction, kid: int | None = None, alliance: str | None = None):
+        calls.append(("alliance", kid, alliance))
+
+    handler = HelpHandler(bot, {1})
+    ctx = interaction(2)
+    assert "Alliance" in handler.available_groups(ctx)
+    assert "Alliance" not in handler.available_groups(interaction(guild=False))
+    await handler.open_command(ctx, name="alliance", label="Power trends")
+    assert calls == [("alliance", None, None)]
+
+
+@pytest.mark.asyncio
 async def test_help_only_shows_registered_features_and_available_admin_actions():
     bot, _ = make_bot()
     handler = HelpHandler(bot, {1})

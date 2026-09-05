@@ -17,6 +17,7 @@ from config import BotConfig
 from config.logging_config import setup_logging
 from db import init_db
 from handlers import (
+    AlliancePowerHandler,
     DatabaseHandler,
     EventHandler,
     GiftCodeHandler,
@@ -29,6 +30,7 @@ from handlers import (
     TranslationHandler,
 )
 from services import (
+    AlliancePowerService,
     EventSchedulerService,
     GiftCodeService,
     GuildConfigurationService,
@@ -115,6 +117,7 @@ class TranslatorBot:
             base_url=config.ks_data_base_url,
             timeout_seconds=config.ks_data_timeout_seconds,
         )
+        self.alliance_power_service = AlliancePowerService(self.db_manager, self.kingshot_data_service)
         self.kingshot_rag_service = KingshotRAGService(
             self.db_manager,
             self.nvidia_client,
@@ -175,6 +178,13 @@ class TranslatorBot:
             self.guild_configuration_service,
             admin_user_ids=config.admin_user_ids,
         )
+        self.alliance_power_handler = AlliancePowerHandler(
+            self.alliance_power_service,
+            self.bot,
+            config.admin_user_ids,
+            alliance_choices=self.gift_code_handler._get_alliance_autocomplete_choices,
+            kid_choices=self.gift_code_handler._get_kid_autocomplete_choices,
+        )
         self.kingshot_rag_handler = KingshotRAGHandler(self.kingshot_rag_service, self.bot)
         self.database_handler = DatabaseHandler(self.bot)
 
@@ -183,6 +193,7 @@ class TranslatorBot:
             config,
             event_handler=self.event_handler,
             gift_code_handler=self.gift_code_handler,
+            alliance_power_handler=self.alliance_power_handler,
             database_health_service=self.database_health_service,
             kingshot_data_service=self.kingshot_data_service,
             started_at=self.started_at,
@@ -230,6 +241,7 @@ class TranslatorBot:
 
             self.gift_code_handler.start_polling_task()
             logger.info("Auto gift code polling task started")
+            self.alliance_power_handler.start_polling_task()
 
         @self.bot.event
         async def on_command_error(ctx, error):
@@ -271,6 +283,7 @@ class TranslatorBot:
         self.translation_handler.register_events()
         self.event_handler.register_commands()
         self.gift_code_handler.register_commands()
+        self.alliance_power_handler.register_commands()
         self.guild_config_handler.register_commands()
         self.kingshot_rag_handler.register_commands()
         self.database_handler.register_commands()

@@ -12,6 +12,7 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 - Gift code polling and auto-redemption for registered players.
 - Searchable player lists with enabled/disabled filters and direct profile lookup.
 - Single-message scout reports and paginated KVK history with comparison actions.
+- Daily alliance and member power snapshots with daily and weekly trend reports.
 - Live manual-redemption progress with compact results and browsable failure details.
 - Timezone-aware event forms, save previews, and edit/cancel controls.
 - Unified player profile storage in a single players table.
@@ -213,6 +214,29 @@ Additional commands are provided by translation, event, player info, KVK, and da
 - `/configure` is an ephemeral guild configuration panel available only to bot admins listed in `ADMIN_USER_ID` or `ADMIN_USER_IDS`. It can toggle voice replies and random AI chat replies.
 - `/scout` shows a ranked Mystic Trial leaderboard summary for a kingdom. Select a player and choose **View player**, or use **Previous / Next**, to load their profile in the same message. It defaults to 5 players and caps the limit at 15.
 - `/status` returns a private health summary for Discord, the database, KingShot Data API, and background workers.
+- `/alliance` shows this server's tracked alliance power trends. A configured bot admin
+  starts tracking with `/alliance kid:830 alliance:<selection>` using native autocomplete.
+  Each server tracks one alliance; selecting another replaces that server's selection.
+  **Members** opens paginated individual power changes. **Stop tracking** stops collection
+  for this server and preserves saved history.
+
+Power tracking saves the first complete snapshot each UTC day and checks hourly for
+missing snapshots, including after restarts. It sums the current roster's member power;
+roster changes therefore affect the total. Daily and weekly changes compare exact UTC
+dates (one and seven days earlier), not rolling 24-hour periods. Missing baselines show
+as new history, and failed or incomplete captures preserve the last complete snapshot.
+There is no historical backfill: trends build from the first capture. Snapshots are
+shared when multiple servers track the same alliance, and only alliances tracked by
+servers the bot has joined are collected. Viewing a report does not register players
+for gift redemption.
+
+Before running this feature, apply the database migration. For Docker:
+
+```bash
+docker compose build translator-bot-local
+docker compose run --rm --no-deps translator-bot-local alembic upgrade head
+docker compose up -d translator-bot-local
+```
 
 ### Interactive workflows
 

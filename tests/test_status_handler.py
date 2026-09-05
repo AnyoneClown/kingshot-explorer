@@ -192,3 +192,5 @@ def test_bot_registers_status_command():
 
     assert app.status_handler is not None
     assert app.bot.tree.get_command("status") is not None
+    assert app.bot.tree.get_command("alliance") is not None
+    assert app.alliance_power_handler.service is app.alliance_power_service

@@ -24,6 +24,12 @@ GROUPS = {
             ("kvk_compare", "Compare kingdoms", "/kvk_compare kingdom_a:830 kingdom_b:831"),
         ),
     ),
+    "Alliance": (
+        "Track daily and weekly member power. A configured bot admin can start tracking with "
+        "/alliance kid:830 alliance:<selection>. Choose the alliance from autocomplete; "
+        "history starts with the first complete daily snapshot.",
+        (("alliance", "Power trends", "/alliance"),),
+    ),
     "Gifts": (
         "Find active codes and manage the players enrolled for redemption. "
         "Bulk redemption requires a configured bot admin.",
@@ -156,7 +162,7 @@ class HelpHandler:
                 action for action in actions
                 if self._bot.tree.get_command(action[0]) is not None
                 and (action[0] not in ADMIN_COMMANDS or is_admin)
-                and (category not in {"Events", "Settings", "Gifts"} or interaction.guild is not None)
+                and (category not in {"Events", "Settings", "Gifts", "Alliance"} or interaction.guild is not None)
             )
             if available:
                 groups[category] = (description, available)
