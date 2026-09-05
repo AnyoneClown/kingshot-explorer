@@ -4,13 +4,16 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 
 ## Features
 
-- Slash command based bot architecture.
+- Slash commands with interactive Discord panels and a private `/help` guide.
 - Auto-translation and manual translation features.
 - NVIDIA NIM powered translation plus contextual chat replies.
 - Event scheduling with background task execution.
 - Player info lookups and KVK command support.
 - Gift code polling and auto-redemption for registered players.
-- Paginated player list output for large registrations.
+- Searchable player lists with enabled/disabled filters and direct profile lookup.
+- Single-message scout reports and paginated KVK history with comparison actions.
+- Live manual-redemption progress with compact results and browsable failure details.
+- Timezone-aware event forms, save previews, and edit/cancel controls.
 - Unified player profile storage in a single players table.
 - Clear redemption result categories:
     - Success
@@ -199,15 +202,43 @@ unknown, or globally exhausted codes do not produce hundreds of redundant reques
 Completion announcements include all-failure and early-abort outcomes as well as
 successful runs. Century Games advertises a 30-request-per-minute limit, so requests are
 globally paced with at least two seconds between starts. `/redeem` immediately starts a
-single background job and acknowledges it privately; the final result is posted as a
-normal message in the command channel, independent of Discord's interaction webhook
-lifetime.
+single background job and acknowledges it privately. A normal channel message shows
+processed players, outcome counts, and rate-limit waiting status, then becomes the
+final summary, independent of Discord's interaction webhook lifetime. Failed and
+skipped players can be inspected with the Details button. An already-claimed code
+is reported as already claimed, not as a failed redemption.
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
 - `/configure` is an ephemeral guild configuration panel available only to bot admins listed in `ADMIN_USER_ID` or `ADMIN_USER_IDS`. It can toggle voice replies and random AI chat replies.
-- `/scout` fetches players from KingShot Mystic Trial leaderboard type 20 for a kingdom and returns stats-style embeds enriched by Governor ID. It defaults to 5 players and caps the limit at 15.
+- `/scout` shows a ranked Mystic Trial leaderboard summary for a kingdom. Select a player and choose **View player**, or use **Previous / Next**, to load their profile in the same message. It defaults to 5 players and caps the limit at 15.
 - `/status` returns a private health summary for Discord, the database, KingShot Data API, and background workers.
+
+### Interactive workflows
+
+- `/help` privately groups the features available on the current bot. Buttons open
+  the existing workflows; actions requiring input open a form. Admin actions appear
+  only for configured bot admins. Player and KVK reports are posted in the channel.
+  **Import alliance** explains the native `/addalliance` workflow: enter `kid`, then
+  select `alliance` from autocomplete so kingdom and alliance suggestions remain available.
+- `/kvk` paginates every match returned by the service. **Compare kingdom** opens a
+  form with the current kingdom already selected. Comparison results also paginate
+  their direct match history.
+- `/listplayers` supports name/ID search, enabled/disabled filters, and **View player**.
+  `/giftcodes` paginates active codes and provides **Redeem selected code** to bot admins.
+- `/schedule` without arguments opens a form. Enter the event date/time, an IANA
+  timezone such as `Europe/Kyiv`, the message, reminder lead time, and optional repeat
+  interval. Slash-command arguments remain available, with `time_zone` defaulting to
+  `UTC`. Both routes show a private preview; nothing is saved until **Save reminder**.
+- `/events` provides **Edit reminder**, **Cancel event**, and **Create event** controls
+  for bot admins. `/cancel event_id:123` uses the stable ID shown on the event card,
+  rather than its position in the list. Editing changes the stored reminder time
+  directly. Recurring reminders keep the same UTC time; local time may change with
+  daylight saving. Ambiguous or nonexistent local times must be corrected before saving.
+
+Interactive panels belong to the person who opened them. Expired controls are
+disabled; rerun the command to open a fresh panel. Missing data is labeled unavailable,
+and status messages use both text and color.
 
 ## Project Layout
 

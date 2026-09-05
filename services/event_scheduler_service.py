@@ -1,11 +1,12 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from itertools import count
 from typing import Callable, Dict, List, Optional
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, update
 
 from db.models import ScheduledReminder
 from db.session import DatabaseManager
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ScheduledEvent:
-    """A scheduled Discord reminder."""
+    """A Discord reminder; event_time is its trigger time, not the original event time."""
 
     id: Optional[int]
     event_time: datetime
@@ -56,6 +57,23 @@ class IEventSchedulerService(ABC):
         """Check and return events that are due."""
         pass
 
+    @abstractmethod
+    async def cancel_event(self, channel_id: int, event_id: int) -> bool:
+        """Cancel an active reminder by its stable ID within the channel."""
+        pass
+
+    @abstractmethod
+    async def update_event(
+        self,
+        channel_id: int,
+        event_id: int,
+        event_time: datetime,
+        message: str,
+        repeat_every_days: Optional[int] = None,
+    ) -> bool:
+        """Update an active reminder without changing its ID or mention targets."""
+        pass
+
 
 class EventSchedulerService(IEventSchedulerService):
     """Service responsible for scheduling and managing timed events."""
@@ -69,6 +87,7 @@ class EventSchedulerService(IEventSchedulerService):
         self._db_manager = db_manager
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self._scheduled_events: Dict[int, List[ScheduledEvent]] = {}
+        self._event_ids = count(1)
         logger.info("EventSchedulerService initialized")
 
     async def schedule_event(
@@ -92,12 +111,8 @@ class EventSchedulerService(IEventSchedulerService):
         Returns:
             True if scheduled successfully
         """
-        if event_time <= self._now():
-            logger.warning(f"Attempted to schedule event in the past for channel {channel_id}")
-            return False
-
-        if repeat_every_days is not None and repeat_every_days < 1:
-            logger.warning(f"Attempted to schedule event with invalid recurrence: {repeat_every_days}")
+        event_time = self._ensure_utc(event_time)
+        if not self._valid_schedule(event_time, message, repeat_every_days):
             return False
 
         if self._db_manager:
@@ -121,7 +136,7 @@ class EventSchedulerService(IEventSchedulerService):
 
         self._scheduled_events[channel_id].append(
             ScheduledEvent(
-                id=None,
+                id=next(self._event_ids),
                 event_time=event_time,
                 role_names=role_names,
                 message=message,
@@ -218,42 +233,80 @@ class EventSchedulerService(IEventSchedulerService):
 
         return due_events
 
-    async def cancel_event(self, channel_id: int, index: int) -> bool:
-        """
-        Cancel a scheduled event by index.
-
-        Args:
-            channel_id: Discord channel ID
-            index: Index of the event in the channel's event list
-
-        Returns:
-            True if cancelled successfully
-        """
+    async def cancel_event(self, channel_id: int, event_id: int) -> bool:
+        """Cancel by stable ID so reordered or outdated lists cannot target another event."""
         if self._db_manager:
-            events = await self.get_events_for_channel(channel_id)
-            if not (0 <= index < len(events)):
-                return False
-
-            event = events[index]
-            if event.id is None:
-                return False
-
             async with self._db_manager.session() as session:
-                reminder = await session.get(ScheduledReminder, event.id)
-                if not reminder or reminder.channel_id != channel_id or not reminder.is_active:
-                    return False
+                result = await session.execute(
+                    update(ScheduledReminder)
+                    .where(
+                        ScheduledReminder.id == event_id,
+                        ScheduledReminder.channel_id == channel_id,
+                        ScheduledReminder.is_active.is_(True),
+                    )
+                    .values(is_active=False)
+                    .returning(ScheduledReminder.id)
+                )
+                return result.scalar_one_or_none() is not None
 
-                reminder.is_active = False
-            return True
-
-        if channel_id in self._scheduled_events:
-            events = self._scheduled_events[channel_id]
-            if 0 <= index < len(events):
+        events = self._scheduled_events.get(channel_id, [])
+        for index, event in enumerate(events):
+            if event.id == event_id:
                 events.pop(index)
                 if not events:
                     del self._scheduled_events[channel_id]
                 return True
         return False
+
+    async def update_event(
+        self,
+        channel_id: int,
+        event_id: int,
+        event_time: datetime,
+        message: str,
+        repeat_every_days: Optional[int] = None,
+    ) -> bool:
+        """Update a channel's active reminder, preserving identity and mention targets."""
+        event_time = self._ensure_utc(event_time)
+        if not self._valid_schedule(event_time, message, repeat_every_days):
+            return False
+        if self._db_manager:
+            async with self._db_manager.session() as session:
+                result = await session.execute(
+                    update(ScheduledReminder)
+                    .where(
+                        ScheduledReminder.id == event_id,
+                        ScheduledReminder.channel_id == channel_id,
+                        ScheduledReminder.is_active.is_(True),
+                    )
+                    .values(
+                        reminder_time=event_time,
+                        message=message,
+                        repeat_every_days=repeat_every_days,
+                    )
+                    .returning(ScheduledReminder.id)
+                )
+                return result.scalar_one_or_none() is not None
+        events = self._scheduled_events.get(channel_id, [])
+        for index, event in enumerate(events):
+            if event.id == event_id:
+                events[index] = replace(
+                    event,
+                    event_time=event_time,
+                    message=message,
+                    repeat_every_days=repeat_every_days,
+                )
+                events.sort(key=lambda item: item.event_time)
+                return True
+        return False
+
+    def _valid_schedule(self, event_time: datetime, message: str, repeat_every_days: Optional[int]) -> bool:
+        return (
+            event_time > self._now()
+            and bool(message.strip())
+            and len(message) <= 1900
+            and (repeat_every_days is None or 1 <= repeat_every_days <= 365)
+        )
 
     def _advance_recurring_event(self, event: ScheduledEvent, current_time: datetime) -> ScheduledEvent:
         """Advance a recurring event to the next future trigger time."""

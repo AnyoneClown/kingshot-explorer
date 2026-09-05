@@ -21,6 +21,7 @@ from handlers import (
     EventHandler,
     GiftCodeHandler,
     GuildConfigHandler,
+    HelpHandler,
     KingshotRAGHandler,
     KVKHandler,
     PlayerInfoHandler,
@@ -186,6 +187,7 @@ class TranslatorBot:
             kingshot_data_service=self.kingshot_data_service,
             started_at=self.started_at,
         )
+        self.help_handler = HelpHandler(self.bot, admin_user_ids=config.admin_user_ids)
         logger.info("All handlers initialized")
 
         # Setup bot
@@ -274,6 +276,7 @@ class TranslatorBot:
         self.database_handler.register_commands()
         self.database_handler.register_events()
         self.status_handler.register_commands()
+        self.help_handler.register_commands()
         logger.info("All command handlers registered")
 
     def run(self):

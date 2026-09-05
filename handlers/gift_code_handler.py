@@ -5,13 +5,14 @@ import random
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from config.bot_config import BotConfig
+from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 from services.gift_code_service import IGiftCodeService
 from services.player_info_service import IPlayerInfoService
 from services.interaction_tracking_service import InteractionTrackingService
@@ -21,75 +22,254 @@ from services.kingshot_data_service import KingshotDataService
 logger = logging.getLogger(__name__)
 
 
-class PlayerListPaginationView(discord.ui.View):
-    """Single-message pagination for registered player list embeds."""
+class PlayerSearchModal(discord.ui.Modal, title="Find a player"):
+    query = discord.ui.TextInput(label="Player name or ID", required=False, max_length=100)
 
-    def __init__(
-        self,
-        pages: List[List[str]],
-        total_players: int,
-        enabled_count: int,
-        disabled_count: int,
-        author_id: int,
-        timeout: float = 180.0,
-    ):
-        super().__init__(timeout=timeout)
-        self.pages = pages
-        self.total_players = total_players
-        self.enabled_count = enabled_count
-        self.disabled_count = disabled_count
-        self.author_id = author_id
+    def __init__(self, view: "PlayerListPaginationView"):
+        super().__init__(timeout=180)
+        self.player_view = view
+        self.query.default = view.query
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.player_view
+        if not await view.interaction_check(interaction):
+            return
+        if view.is_finished():
+            await interaction.response.send_message("This player list has expired. Run /listplayers again.", ephemeral=True)
+            return
+        view.query = str(self.query).strip()
+        view.current_page = 0
+        view.refresh()
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await send_ui_error(interaction, error)
+
+
+class PlayerListPaginationView(OwnedView):
+    """Search and filter registered players in a single message."""
+
+    PAGE_SIZE = 10
+
+    def __init__(self, handler: "GiftCodeHandler", players: list[Any], author_id: int):
+        super().__init__(author_id)
+        self.handler = handler
+        self.players = players
+        self.query = ""
+        self.status = "all"
         self.current_page = 0
-        self.message: Optional[discord.Message] = None
-        self._update_button_state()
+        self.selected_player = None
+        self.refresh()
 
-    def _update_button_state(self) -> None:
-        is_first = self.current_page == 0
-        is_last = self.current_page >= len(self.pages) - 1
-        self.prev_button.disabled = is_first
-        self.next_button.disabled = is_last
+    def refresh(self) -> None:
+        query = self.query.casefold()
+        self.filtered_players = [
+            player for player in self.players
+            if (self.status == "all" or bool(player.enabled) == (self.status == "enabled"))
+            and (query in str(player.player_id).casefold()
+                 or query in str(player.player_name or "").casefold())
+        ]
+        self.page_count = max(1, (len(self.filtered_players) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.current_page = min(max(0, self.current_page), self.page_count - 1)
+        start = self.current_page * self.PAGE_SIZE
+        page = self.filtered_players[start:start + self.PAGE_SIZE]
+        self.selected_player = page[0] if page else None
+        self.player_select.options = [
+            discord.SelectOption(
+                label=f"{player.player_name or 'Unnamed player'} · {player.player_id}"[:100],
+                value=str(index), default=index == 0,
+            ) for index, player in enumerate(page)
+        ] or [discord.SelectOption(label="No matching players", value="none")]
+        self.player_select.disabled = not page
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page == self.page_count - 1
+        self.clear_button.disabled = not self.query
+        self.view_player.disabled = not page or self.handler._bot.tree.get_command("stats") is None
+        for option in self.status_select.options:
+            option.default = option.value == self.status
 
     def build_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title="📋 Player Profiles",
-            description=(
-                f"**Total:** {self.total_players} | **Enabled:** {self.enabled_count} | "
-                f"**Disabled:** {self.disabled_count}\n"
-                f"**Page:** {self.current_page + 1}/{len(self.pages)}"
-            ),
-            color=discord.Color.blue(),
+        enabled = sum(bool(player.enabled) for player in self.players)
+        lines = self.handler._build_player_lines(self.filtered_players[
+            self.current_page * self.PAGE_SIZE:(self.current_page + 1) * self.PAGE_SIZE
+        ])
+        description = (
+            f"**{len(self.filtered_players)} matches** · {len(self.players)} total · "
+            f"{enabled} enabled · {len(self.players) - enabled} disabled\n"
+            f"Filter: **{self.status.title()}**"
         )
-        embed.add_field(name="Players", value="\n".join(self.pages[self.current_page]), inline=False)
+        if self.query:
+            description += f" · Search: {discord.utils.escape_markdown(self.query)}"
+        embed = discord.Embed(
+            title="📋 Player Profiles", color=EmbedColors.INFO,
+            description=description + "\n\n" + ("\n".join(lines) or "No players match. Clear the search or change the filter."),
+        )
+        embed.set_footer(text=f"Page {self.current_page + 1}/{self.page_count} · Select a player, then View player")
         return embed
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "Only the command user can control this pagination.", ephemeral=True
-            )
-            return False
-        return True
+    @discord.ui.select(placeholder="Select a player", row=0)
+    async def player_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        index = int(select.values[0])
+        self.selected_player = self.filtered_players[self.current_page * self.PAGE_SIZE + index]
+        for option in select.options:
+            option.default = option.value == select.values[0]
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="←", style=discord.ButtonStyle.secondary)
+    @discord.ui.select(placeholder="Redemption status", row=1, options=[
+        discord.SelectOption(label="All players", value="all"),
+        discord.SelectOption(label="Enabled", value="enabled"),
+        discord.SelectOption(label="Disabled", value="disabled"),
+    ])
+    async def status_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.status = select.values[0]
+        self.current_page = 0
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=2)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page -= 1
-        self._update_button_state()
+        self.refresh()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="→", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=2)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page += 1
-        self._update_button_state()
+        self.refresh()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    async def on_timeout(self) -> None:
-        self.prev_button.disabled = True
-        self.next_button.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except Exception:
-                logger.debug("Failed to disable pagination buttons after timeout", exc_info=True)
+    @discord.ui.button(label="Search", style=discord.ButtonStyle.secondary, row=2)
+    async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PlayerSearchModal(self))
+
+    @discord.ui.button(label="Clear search", style=discord.ButtonStyle.secondary, row=2)
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.query = ""
+        self.current_page = 0
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="View player", style=discord.ButtonStyle.primary, row=2)
+    async def view_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        command = self.handler._bot.tree.get_command("stats")
+        if command is None or self.selected_player is None:
+            await interaction.response.send_message("Player statistics are unavailable in this bot profile.", ephemeral=True)
+            return
+        await command.callback(interaction, player_id=str(self.selected_player.player_id))
+
+
+class GiftCodesView(OwnedView):
+    PAGE_SIZE = 10
+
+    def __init__(self, handler: "GiftCodeHandler", codes: list[dict], author_id: int, can_redeem: bool):
+        super().__init__(author_id)
+        self.handler = handler
+        self.codes = codes
+        self.current_page = 0
+        self.selected_index = 0
+        if not can_redeem:
+            self.remove_item(self.redeem_button)
+        self.refresh()
+
+    def refresh(self):
+        start = self.current_page * self.PAGE_SIZE
+        self.selected_index = start
+        self.code_select.options = [
+            discord.SelectOption(label=str(code["code"])[:100], value=str(index), default=index == start)
+            for index, code in enumerate(self.codes[start:start + self.PAGE_SIZE], start)
+        ]
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = start + self.PAGE_SIZE >= len(self.codes)
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="🎁 Active Gift Codes", color=EmbedColors.INFO,
+                              description="Select a code to redeem for all enabled players. Manual redemption requires a bot admin.")
+        start = self.current_page * self.PAGE_SIZE
+        for code in self.codes[start:start + self.PAGE_SIZE]:
+            expiry = "Expiration unavailable"
+            if code.get("expiresAt"):
+                try:
+                    dt = datetime.fromisoformat(code["expiresAt"].replace("Z", "+00:00"))
+                    expiry = f"Expires <t:{int(dt.timestamp())}:R>"
+                except (ValueError, TypeError):
+                    pass
+            embed.add_field(name=str(code["code"])[:256], value=expiry, inline=False)
+        embed.set_footer(text=f"Page {self.current_page + 1}/{(len(self.codes) + self.PAGE_SIZE - 1) // self.PAGE_SIZE} · Auto-redemption runs when new codes appear")
+        return embed
+
+    @discord.ui.select(placeholder="Select a gift code", row=0)
+    async def code_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.selected_index = int(select.values[0])
+        for option in select.options:
+            option.default = option.value == select.values[0]
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = min((len(self.codes) - 1) // self.PAGE_SIZE, self.current_page + 1)
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Redeem selected code", style=discord.ButtonStyle.primary, row=1)
+    async def redeem_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handler._handle_redeem_gift_code_slash(interaction, str(self.codes[self.selected_index]["code"]))
+
+
+class RedemptionResultsView(OwnedView):
+    PAGE_SIZE = 4
+
+    def __init__(self, summary: discord.Embed, issues: list[dict], author_id: int):
+        super().__init__(author_id)
+        self.summary = summary
+        self.issues = issues
+        self.current_page = 0
+        self.expanded = False
+        self.refresh()
+
+    def refresh(self):
+        self.details_button.label = "Back to summary" if self.expanded else f"Details ({len(self.issues)})"
+        self.prev_button.disabled = not self.expanded or self.current_page == 0
+        self.next_button.disabled = not self.expanded or (self.current_page + 1) * self.PAGE_SIZE >= len(self.issues)
+
+    def build_embed(self) -> discord.Embed:
+        if not self.expanded:
+            return self.summary
+        embed = discord.Embed(title="Redemption · Failure and skipped details", color=EmbedColors.WARNING,
+                              description="Player errors, rejected requests, and players skipped without a request.")
+        start = self.current_page * self.PAGE_SIZE
+        for result in self.issues[start:start + self.PAGE_SIZE]:
+            status = "Skipped" if result.get("status_category") == "skipped" else "Failed"
+            name = str(result.get("player_name") or "Unnamed player")[:80]
+            player_id = str(result.get("player_id") or "Unavailable")
+            embed.add_field(name=f"{status} · {name} · {player_id}"[:256],
+                            value=str(result.get("message") or "Details unavailable")[:1024], inline=False)
+        embed.set_footer(text=f"Page {self.current_page + 1}/{(len(self.issues) + self.PAGE_SIZE - 1) // self.PAGE_SIZE}")
+        return embed
+
+    @discord.ui.button(label="Details", style=discord.ButtonStyle.secondary)
+    async def details_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.expanded = not self.expanded
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = min((len(self.issues) - 1) // self.PAGE_SIZE, self.current_page + 1)
+        self.refresh()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 class GiftCodeHandler:
@@ -179,7 +359,7 @@ class GiftCodeHandler:
         embed = self._build_status_embed(
             title="⛔ Admin Only",
             description="Only configured bot admins can use this command.",
-            color=discord.Color.orange(),
+            color=EmbedColors.WARNING,
         )
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -414,15 +594,19 @@ class GiftCodeHandler:
         if global_code_error is not None:
             title = "❌ Gift Code Rejected"
             description = str(global_code_error.get("message") or "The gift code was rejected.")
-            color = discord.Color.red()
+            color = EmbedColors.ERROR
+        elif total_players and already_redeemed_count == total_players:
+            title = "✅ Everyone Has Already Claimed This Code"
+            description = "Auto-redemption checked every enabled player; no new claims were needed."
+            color = EmbedColors.SUCCESS
         elif success_count > 0:
             title = "🎁 New Gift Code Found!"
             description = "Auto-redemption completed for a newly discovered gift code."
-            color = discord.Color.brand_green()
+            color = EmbedColors.SUCCESS
         else:
             title = "❌ Auto-Redemption Failed"
             description = "Auto-redemption completed without a successful claim."
-            color = discord.Color.red()
+            color = EmbedColors.ERROR
 
         embed = discord.Embed(
             title=title,
@@ -473,49 +657,26 @@ class GiftCodeHandler:
                 embed = self._build_status_embed(
                     title="❌ Could Not Fetch Gift Codes",
                     description="The gift code list could not be retrieved.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
                 embed.add_field(name="Details", value=str(response.get("message", "Unknown error")), inline=False)
                 await interaction.followup.send(embed=embed)
                 return
 
-            codes = response.get("data", [])
+            codes = [code for code in response.get("data", []) if isinstance(code, dict) and code.get("code")]
 
             if not codes:
                 await interaction.followup.send(
                     embed=self._build_status_embed(
                         title="📋 No Active Gift Codes",
                         description="No currently active gift codes were found.",
-                        color=discord.Color.blue(),
+                        color=EmbedColors.INFO,
                     )
                 )
                 return
 
-            embed = discord.Embed(
-                title="🎁 Active Gift Codes",
-                description="List of available gift codes to redeem",
-                color=discord.Color.green(),
-            )
-
-            for code in codes:
-                code_str = code.get("code", "UNKNOWN")
-                expires_at = code.get("expiresAt")
-
-                value = "`" + code_str + "`"
-                if expires_at:
-                    try:
-                        # Attempt to parse ISO string and format
-                        dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-                        value += f"\nExpires: <t:{int(dt.timestamp())}:R>"
-                    except ValueError:
-                        value += f"\nExpires: {expires_at}"
-                else:
-                    value += "\nNo expiration"
-
-                embed.add_field(name="Gift Code", value=value, inline=False)
-
-            embed.set_footer(text="Use /redeem to run manual redemptions or wait for auto-redeem")
-            await interaction.followup.send(embed=embed)
+            view = GiftCodesView(self, codes, interaction.user.id, self._is_bot_admin(interaction))
+            view.message = await interaction.followup.send(embed=view.build_embed(), view=view, wait=True)
 
         except Exception as e:
             logger.error(f"Error listing gift codes: {e}", exc_info=True)
@@ -523,7 +684,7 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Unexpected Error",
                     description="An unexpected error occurred while fetching gift codes.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
             )
 
@@ -562,13 +723,16 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Channel Unavailable",
                     description="The bot cannot post the redemption job result in this channel.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 ),
                 ephemeral=True,
             )
             return
 
         gift_code = gift_code.strip()
+        if not gift_code or len(gift_code) > 200:
+            await interaction.followup.send("Enter a gift code between 1 and 200 characters.", ephemeral=True)
+            return
         async with self._manual_redemption_start_lock:
             active_task = self._manual_redemption_task
             if active_task is not None and not active_task.done():
@@ -579,7 +743,7 @@ class GiftCodeHandler:
                             f"The bot is already redeeming `{self._manual_redemption_code}`. "
                             "Wait for its channel summary before starting another job."
                         ),
-                        color=discord.Color.orange(),
+                        color=EmbedColors.WARNING,
                     ),
                     ephemeral=True,
                 )
@@ -602,7 +766,7 @@ class GiftCodeHandler:
                     embed=self._build_status_embed(
                         title="❌ Redemption Job Not Started",
                         description="The bot could not load the enabled player list.",
-                        color=discord.Color.red(),
+                        color=EmbedColors.ERROR,
                     ),
                     ephemeral=True,
                 )
@@ -613,7 +777,7 @@ class GiftCodeHandler:
                     embed=self._build_status_embed(
                         title="📭 No Enabled Players",
                         description="Use `/addplayer <player_id>` to enable at least one player before redeeming.",
-                        color=discord.Color.orange(),
+                        color=EmbedColors.WARNING,
                     ),
                     ephemeral=True,
                 )
@@ -624,9 +788,9 @@ class GiftCodeHandler:
                     title="🎁 Redemption Job Started",
                     description=(
                         f"Started redeeming `{gift_code}` for {len(registered_players)} enabled players.\n"
-                        "The final summary will be posted in this channel when the job finishes."
+                        "Watch the progress card in this channel; it becomes the final summary when the job finishes."
                     ),
-                    color=discord.Color.brand_green(),
+                    color=EmbedColors.SUCCESS,
                 ),
                 ephemeral=True,
             )
@@ -672,44 +836,95 @@ class GiftCodeHandler:
         guild_id: int | None,
         channel: Any,
     ) -> None:
-        """Run a manual redemption independently from the slash-command webhook."""
+        """Update a normal message so long jobs survive interaction token expiry."""
+        message = None
+        update_lock = asyncio.Lock()
+        last_update = 0.0
+        last_phase = ""
+
+        async def progress(results: list[dict], phase: str) -> None:
+            nonlocal last_update, last_phase
+            if message is None:
+                return
+            async with update_lock:
+                now = asyncio.get_running_loop().time()
+                if phase == last_phase and now - last_update < 5:
+                    return
+                last_update, last_phase = now, phase
+                try:
+                    await message.edit(embed=self._build_redemption_progress(
+                        gift_code, len(registered_players), results, phase,
+                    ))
+                except Exception:
+                    logger.warning("Could not update redemption progress", exc_info=True)
+
         try:
+            message = await channel.send(embed=self._build_redemption_progress(
+                gift_code, len(registered_players), [], "Checking prior claims",
+            ))
             results = await self._run_bulk_redemption(
                 gift_code=gift_code,
                 registered_players=registered_players,
                 actor_user_id=actor_user_id,
                 guild_id=guild_id,
                 channel_id=getattr(channel, "id", None),
+                progress=progress,
             )
             await self._send_redemption_results_to_channel(
                 channel=channel,
                 requester_user_id=actor_user_id,
                 gift_code=gift_code,
                 results=results,
+                message=message,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error("Error in manual redemption job: %s", exc, exc_info=True)
             try:
-                await channel.send(
+                payload = dict(
                     content=f"<@{actor_user_id}>",
                     embed=self._build_status_embed(
                         title="❌ Redemption Job Failed",
                         description=(
-                            f"The background redemption job for `{gift_code}` failed unexpectedly. "
-                            "Review the bot logs before retrying."
+                            f"The background redemption job for `{gift_code}` stopped unexpectedly. "
+                            "Some players may have received rewards; check in-game mail before retrying."
                         ),
-                        color=discord.Color.red(),
+                        color=EmbedColors.ERROR,
                     ),
                 )
+                if message is not None:
+                    try:
+                        await message.edit(**payload, view=None)
+                        return
+                    except discord.HTTPException:
+                        pass
+                await channel.send(**payload)
             except Exception as response_error:
-                logger.error(
-                    "Could not post the manual redemption failure to channel %s: %s",
-                    getattr(channel, "id", None),
-                    response_error,
-                    exc_info=True,
-                )
+                logger.error("Could not post the manual redemption failure: %s", response_error, exc_info=True)
+
+    def _build_redemption_progress(
+        self, gift_code: str, total: int, results: list[dict], phase: str,
+    ) -> discord.Embed:
+        return discord.Embed(
+            title="🎁 Redemption in Progress",
+            description=(f"**Gift code:** `{gift_code}`\n**Processed:** {len(results)}/{total} players\n"
+                         f"**Status:** {phase}\n\n" + self._redemption_counts(results)),
+            color=EmbedColors.INFO,
+        )
+
+    def _redemption_counts(self, results: list[dict]) -> str:
+        labels = (
+            (self.STATUS_SUCCESS, "✅ Success"),
+            (self.STATUS_ALREADY_REDEEMED, "🔄 Already Claimed"),
+            (self.STATUS_API_REJECTED, "🚫 API Rejected"),
+            (self.STATUS_INVALID_ID, "🆔 Player/Kingdom Error"),
+            (self.STATUS_SKIPPED, "⏭️ Skipped"),
+        )
+        return "\n".join(
+            f"**{label}:** {sum(result.get('status_category') == status for result in results)}"
+            for status, label in labels
+        )
 
     async def _send_redemption_results_to_channel(
         self,
@@ -717,103 +932,46 @@ class GiftCodeHandler:
         requester_user_id: int,
         gift_code: str,
         results: List[Dict],
+        message: discord.Message | None = None,
     ) -> None:
-        """Post formatted manual-job results as a normal channel message."""
-        success_results = [r for r in results if r.get("status_category") == self.STATUS_SUCCESS]
-        already_redeemed_results = [r for r in results if r.get("status_category") == self.STATUS_ALREADY_REDEEMED]
-        api_rejected_results = [r for r in results if r.get("status_category") == self.STATUS_API_REJECTED]
-        invalid_id_results = [r for r in results if r.get("status_category") == self.STATUS_INVALID_ID]
-        skipped_results = [r for r in results if r.get("status_category") == self.STATUS_SKIPPED]
-
-        success_count = len(success_results)
-        already_redeemed_count = len(already_redeemed_results)
-        api_rejected_count = len(api_rejected_results)
-        invalid_id_count = len(invalid_id_results)
-        skipped_count = len(skipped_results)
-        total_count = len(results)
-        global_code_error = next(
-            (result for result in results if self._is_global_code_rejection(result)),
-            None,
-        )
-
-        # Create embed
-        if global_code_error is not None:
-            color = discord.Color.red()
-            title = "❌ Gift Code Rejected"
-        elif success_count == total_count:
-            color = discord.Color.green()
-            title = "✅ All Gift Codes Redeemed Successfully!"
-        elif success_count > 0:
-            color = discord.Color.gold()
-            title = "⚠️ Gift Code Redemption Completed"
+        """Replace the progress card with a compact summary and paginated issues."""
+        success_count = sum(result.get("status_category") == self.STATUS_SUCCESS for result in results)
+        already_count = sum(result.get("status_category") == self.STATUS_ALREADY_REDEEMED for result in results)
+        issues = [result for result in results if result.get("status_category") not in {
+            self.STATUS_SUCCESS, self.STATUS_ALREADY_REDEEMED,
+        }]
+        global_error = next((result for result in results if self._is_global_code_rejection(result)), None)
+        if global_error is not None:
+            title, color = "❌ Gift Code Rejected", EmbedColors.ERROR
+        elif results and already_count == len(results):
+            title, color = "✅ Everyone Has Already Claimed This Code", EmbedColors.SUCCESS
+        elif results and success_count == len(results):
+            title, color = "✅ All Gift Codes Redeemed Successfully!", EmbedColors.SUCCESS
+        elif not issues:
+            title, color = "✅ Gift Code Redemption Completed", EmbedColors.SUCCESS
+        elif success_count + already_count:
+            title, color = "⚠️ Gift Code Redemption Completed", EmbedColors.WARNING
         else:
-            color = discord.Color.red()
-            title = "❌ All Gift Code Redemptions Failed"
-
+            title, color = "❌ All Gift Code Redemptions Failed", EmbedColors.ERROR
         embed = discord.Embed(
-            title=title,
-            description=f"**Gift Code:** `{gift_code}`\n"
-            f"**✅ Success:** {success_count}/{total_count}\n"
-            f"**🔄 Already Redeemed:** {already_redeemed_count}/{total_count}\n"
-            f"**🚫 API Rejected:** {api_rejected_count}/{total_count}\n"
-            f"**🆔 Player/Kingdom Error:** {invalid_id_count}/{total_count}\n"
-            f"**⏭️ Skipped:** {skipped_count}/{total_count}",
-            color=color,
+            title=title, color=color,
+            description=f"**Gift code:** `{gift_code}`\n**Processed:** {len(results)} players\n\n" + self._redemption_counts(results),
         )
-
-        if success_results:
-            embed.add_field(
-                name="✅ Success",
-                value=self._format_result_lines(success_results, "✅"),
-                inline=False,
-            )
-
-        if already_redeemed_results:
-            embed.add_field(
-                name="🔄 Already Redeemed",
-                value=self._format_result_lines(already_redeemed_results, "🔄"),
-                inline=False,
-            )
-
-        if api_rejected_results:
-            embed.add_field(
-                name="🚫 API Rejected",
-                value=self._format_result_lines(api_rejected_results, "🚫"),
-                inline=False,
-            )
-
-        if invalid_id_results:
-            embed.add_field(
-                name="🆔 Player/Kingdom Error",
-                value=self._format_result_lines(invalid_id_results, "🆔"),
-                inline=False,
-            )
-
-        if skipped_results:
-            embed.add_field(
-                name="⏭️ Skipped Without API Request",
-                value=self._format_result_lines(skipped_results, "⏭️"),
-                inline=False,
-            )
-
-        embed.set_footer(
-            text=(
-                f"🎮 Check in-game mail for successful claims • "
-                f"Retry policy: {self.REDEEM_MAX_RETRIES} transient retries; "
-                f"up to {self.REDEEM_RATE_LIMIT_MAX_RETRIES} rate-limit retries"
-            )
-        )
-
-        await channel.send(content=f"<@{requester_user_id}>", embed=embed)
-        logger.info(
-            "Bulk redemption completed: success=%s, already_redeemed=%s, "
-            "api_rejected=%s, invalid_id=%s, skipped=%s",
-            success_count,
-            already_redeemed_count,
-            api_rejected_count,
-            invalid_id_count,
-            skipped_count,
-        )
+        if global_error is not None:
+            embed.add_field(name="Code rejected", value=str(global_error.get("message") or "The code is unavailable.")[:1024], inline=False)
+        embed.set_footer(text="Check in-game mail for successful claims." + (" Open Details to review failed or skipped players." if issues else ""))
+        view = RedemptionResultsView(embed, issues, requester_user_id) if issues else None
+        payload = dict(content=f"<@{requester_user_id}>", embed=embed, view=view)
+        if message is not None:
+            try:
+                await message.edit(**payload)
+            except discord.HTTPException:
+                message = None
+        if message is None:
+            message = await channel.send(**payload)
+        if view is not None:
+            view.message = message
+        logger.info("Bulk redemption completed: success=%s, already_claimed=%s, issues=%s", success_count, already_count, len(issues))
 
     def _categorize_redemption_status(self, result: Dict) -> str:
         """Map API/database redemption result into a single status category."""
@@ -1168,6 +1326,7 @@ class GiftCodeHandler:
         actor_user_id: int,
         guild_id: int | None,
         channel_id: int | None,
+        progress: Callable[[list[dict], str], Awaitable[None]] | None = None,
     ) -> list[dict[str, Any]]:
         """Redeem one code in bounded batches and stop on global code errors."""
         already_redeemed = await self._gift_code_service.get_redeemed_players(None, gift_code)
@@ -1189,6 +1348,23 @@ class GiftCodeHandler:
 
             pending.append((index, player, player_id_int))
 
+        waiting: dict[str, float] = {}
+
+        async def report(phase: str = "Redeeming players") -> None:
+            if progress is not None:
+                if waiting:
+                    phase = f"Rate limited · retry <t:{int(max(waiting.values()))}:R> · {len(waiting)} waiting"
+                await progress([result for _, result in indexed_results], phase)
+
+        async def rate_limit_wait(player_id: str, delay: float) -> None:
+            if delay:
+                waiting[player_id] = datetime.now(timezone.utc).timestamp() + delay
+            else:
+                waiting.pop(player_id, None)
+            await report()
+
+        await report()
+
         async def redeem_one(index: int, player: Any, player_id_int: int) -> tuple[int, dict[str, Any]]:
             cached_profile = self._cached_redemption_player(player)
             player_profile, lookup_failure = await self._resolve_redemption_player(player)
@@ -1201,6 +1377,7 @@ class GiftCodeHandler:
                 kingdom_id=str(player_profile["kingdom"]),
                 gift_code=gift_code,
                 player_id_for_logs=str(player.player_id),
+                rate_limit_wait=rate_limit_wait,
             )
 
             # A transfer makes the database kingdom stale. Only refresh Jeab after
@@ -1227,6 +1404,7 @@ class GiftCodeHandler:
                             kingdom_id=refreshed_kingdom,
                             gift_code=gift_code,
                             player_id_for_logs=str(player.player_id),
+                            rate_limit_wait=rate_limit_wait,
                         )
                         total_attempts = first_attempts + int(result.get("attempts") or 1)
                         result = {
@@ -1270,14 +1448,19 @@ class GiftCodeHandler:
             }
             return index, normalized_result
 
+        async def redeem_and_report(item: tuple[int, Any, int]) -> tuple[int, dict[str, Any]]:
+            result = await redeem_one(*item)
+            indexed_results.append(result)
+            await report()
+            return result
+
         next_pending_index = 0
         global_error: dict[str, Any] | None = None
 
         # Probe one usable player before scheduling bulk work. A bad, expired, or
         # exhausted code therefore costs one redemption request, not 500+.
         while next_pending_index < len(pending):
-            probe_result = await redeem_one(*pending[next_pending_index])
-            indexed_results.append(probe_result)
+            probe_result = await redeem_and_report(pending[next_pending_index])
             next_pending_index += 1
 
             if self._is_global_code_rejection(probe_result[1]):
@@ -1289,8 +1472,7 @@ class GiftCodeHandler:
         if global_error is None:
             while next_pending_index < len(pending):
                 batch = pending[next_pending_index : next_pending_index + self.REDEEM_CONCURRENCY]
-                batch_results = await asyncio.gather(*(redeem_one(*item) for item in batch))
-                indexed_results.extend(batch_results)
+                batch_results = await asyncio.gather(*(redeem_and_report(item) for item in batch))
                 next_pending_index += len(batch)
 
                 global_error = next(
@@ -1314,6 +1496,7 @@ class GiftCodeHandler:
             )
 
         results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+        await report("Saving redemption results")
         await self._persist_bulk_redemption_results(
             gift_code=gift_code,
             results=results,
@@ -1329,6 +1512,7 @@ class GiftCodeHandler:
         kingdom_id: str,
         gift_code: str,
         player_id_for_logs: str,
+        rate_limit_wait: Callable[[str, float], Awaitable[None]] | None = None,
     ) -> Dict:
         """Redeem a code with retry for transient/API failures only."""
         standard_max_attempts = self.REDEEM_MAX_RETRIES + 1
@@ -1400,39 +1584,24 @@ class GiftCodeHandler:
                 last_result.get("error_code"),
                 last_result.get("message"),
             )
-            await asyncio.sleep(retry_delay)
-
-    def _format_result_lines(self, records: List[Dict], emoji: str, limit: int = 10) -> str:
-        """Render result records for embed fields with deterministic truncation."""
-        lines = []
-        for record in records[:limit]:
-            player_display = record.get("player_name") or record.get("player_id")
-            message = record.get("message", "No details")
-            retry_count = int(record.get("retries", 0) or 0)
-            retry_suffix = f" (retried {retry_count}x)" if retry_count > 0 else ""
-            lines.append(f"{emoji} `{record['player_id']}` - {player_display}{retry_suffix}\n   └─ {message}")
-
-        if len(records) > limit:
-            lines.append(f"*... and {len(records) - limit} more*")
-
-        return "\n".join(lines)
+            if is_rate_limited and rate_limit_wait is not None:
+                await rate_limit_wait(player_id_for_logs, retry_delay)
+            try:
+                await asyncio.sleep(retry_delay)
+            finally:
+                if is_rate_limited and rate_limit_wait is not None:
+                    await rate_limit_wait(player_id_for_logs, 0)
 
     def _build_player_lines(self, players: List) -> List[str]:
-        """Format registered players for paginated display."""
+        """Format bounded, labeled player rows; missing data stays unavailable."""
         lines = []
         for player in players:
-            status = "✅" if player.enabled else "⛔"
-            line = f"{status} `{player.player_id}`"
-            if player.player_name:
-                line += f" - {player.player_name}"
-            meta_parts = []
-            if getattr(player, "kingdom", None):
-                meta_parts.append(f"K:{player.kingdom}")
-            if getattr(player, "castle_level", None):
-                meta_parts.append(f"CL:{player.castle_level}")
-            if meta_parts:
-                line += f" ({' | '.join(meta_parts)})"
-            lines.append(line)
+            status = "Enabled" if player.enabled else "Disabled"
+            name = discord.utils.escape_markdown(str(player.player_name or "Unnamed player")[:80])
+            kingdom = getattr(player, "kingdom", None) or "Unavailable"
+            castle = getattr(player, "castle_level", None)
+            castle = "Unavailable" if castle in (None, "") else castle
+            lines.append(f"**{name}** · `{player.player_id}` · {status}\nKingdom: {kingdom} · Castle: {castle}")
         return lines
 
     def _chunk_lines(self, lines: List[str], page_size: int) -> List[List[str]]:
@@ -2091,7 +2260,7 @@ class GiftCodeHandler:
                     embed=discord.Embed(
                         title="❌ Invalid Input",
                         description="No valid player IDs provided.",
-                        color=discord.Color.red(),
+                        color=EmbedColors.ERROR,
                     )
                 )
                 return
@@ -2150,7 +2319,7 @@ class GiftCodeHandler:
                 embed = discord.Embed(
                     title="❌ Players Not Found",
                     description=f"Could not find any of the provided player IDs: {', '.join('`' + p + '`' for p in not_found_players)}\nPlease verify the IDs in-game and try again.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
                 await interaction.followup.send(embed=embed)
                 return
@@ -2158,7 +2327,7 @@ class GiftCodeHandler:
             embed = discord.Embed(
                 title=f"✅ {len(added_players)} Player(s) Added Successfully",
                 description="Player profiles saved and enabled for gift code redemption.",
-                color=discord.Color.green(),
+                color=EmbedColors.SUCCESS,
             )
             
             # Use chunks so we don't hit max limit of discord fields
@@ -2182,7 +2351,7 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Could Not Add Players",
                     description="An error occurred while adding the players. Please check logs.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
             )
 
@@ -2518,7 +2687,7 @@ class GiftCodeHandler:
                     embed=self._build_status_embed(
                         title="❌ Player Not Found",
                         description=f"Player `{player_id}` is not in the player list.",
-                        color=discord.Color.red(),
+                        color=EmbedColors.ERROR,
                     )
                 )
                 return
@@ -2534,7 +2703,7 @@ class GiftCodeHandler:
                     embed=self._build_status_embed(
                         title="⛔ Permission Denied",
                         description="You can only remove players you added, unless you are a server admin.",
-                        color=discord.Color.orange(),
+                        color=EmbedColors.WARNING,
                     )
                 )
                 return
@@ -2546,7 +2715,7 @@ class GiftCodeHandler:
                 embed = discord.Embed(
                     title="✅ Player Removed",
                     description=f"Player `{player_id}` has been removed from the gift code redemption list.",
-                    color=discord.Color.green(),
+                    color=EmbedColors.SUCCESS,
                 )
                 await interaction.followup.send(embed=embed)
                 logger.info(f"Player {player_id} removed by {interaction.user.id} (admin={is_admin})")
@@ -2555,7 +2724,7 @@ class GiftCodeHandler:
                     embed=self._build_status_embed(
                         title="❌ Player Not Found",
                         description=f"Player `{player_id}` is not in the player list.",
-                        color=discord.Color.red(),
+                        color=EmbedColors.ERROR,
                     )
                 )
 
@@ -2565,7 +2734,7 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Could Not Remove Player",
                     description="An error occurred while removing the player.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
             )
 
@@ -2581,27 +2750,15 @@ class GiftCodeHandler:
                     embed=self._build_status_embed(
                         title="📋 No Players Found",
                         description="No player profiles are available yet.",
-                        color=discord.Color.blue(),
+                        color=EmbedColors.INFO,
                     ),
                     ephemeral=True,
                 )
                 return
 
-            enabled_players = [p for p in all_players if p.enabled]
-            disabled_players = [p for p in all_players if not p.enabled]
-            ordered_players = enabled_players + disabled_players
-            player_lines = self._build_player_lines(ordered_players)
-            pages = self._chunk_lines(player_lines, page_size=20)
-
-            view = PlayerListPaginationView(
-                pages=pages,
-                total_players=len(all_players),
-                enabled_count=len(enabled_players),
-                disabled_count=len(disabled_players),
-                author_id=interaction.user.id,
-            )
-            message = await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
-            view.message = message
+            ordered_players = sorted(all_players, key=lambda player: not player.enabled)
+            view = PlayerListPaginationView(self, ordered_players, interaction.user.id)
+            view.message = await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True, wait=True)
 
         except Exception as e:
             logger.error(f"Error listing players: {e}", exc_info=True)
@@ -2609,7 +2766,7 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Could Not List Players",
                     description="An error occurred while retrieving the player list.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 ),
                 ephemeral=True,
             )
@@ -2617,4 +2774,4 @@ class GiftCodeHandler:
     @staticmethod
     def _build_status_embed(title: str, description: str, color: discord.Color) -> discord.Embed:
         """Build a consistent status embed for command responses."""
-        return discord.Embed(title=title, description=description, color=color)
+        return build_status_embed(title=title, description=description, color=color)

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import struct
 import zlib
@@ -12,8 +13,117 @@ from discord.ext import commands
 from services.player_info_service import IPlayerInfoService
 from services.interaction_tracking_service import InteractionTrackingService
 from services.kingshot_data_service import KingshotDataService
+from handlers.ui import EmbedColors, OwnedView
 
 logger = logging.getLogger(__name__)
+
+
+class ScoutReportView(OwnedView):
+    """Browse a kingdom's scout results in one message."""
+
+    def __init__(self, handler, kingdom_number: int, entries: list[dict[str, Any]], author_id: int):
+        super().__init__(author_id)
+        self.handler = handler
+        self.kingdom_number = kingdom_number
+        self.entries = entries
+        self.current_player = 0
+        self.showing_summary = True
+        self._loading = False
+        self._update_controls()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await super().interaction_check(interaction):
+            return False
+        if self._loading:
+            await interaction.response.send_message("Loading this player. Try again in a moment.", ephemeral=True)
+            return False
+        return True
+
+    def _update_controls(self):
+        self.previous_button.disabled = self.current_player == 0
+        self.next_button.disabled = self.current_player == len(self.entries) - 1
+        self.summary_button.disabled = self.showing_summary
+        self.player_select.options = []
+        for index, entry in enumerate(self.entries):
+            player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
+            self.player_select.options.append(discord.SelectOption(
+                label=f"#{entry.get('rank', index + 1)} {player.get('name') or 'Player'}"[:100],
+                value=str(index),
+                description=f"ID: {player['playerId']}"[:100],
+                default=index == self.current_player,
+            ))
+
+    def build_summary(self) -> discord.Embed:
+        lines = []
+        for index, entry in enumerate(self.entries):
+            player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
+            name = discord.utils.escape_markdown(str(player.get("name") or "Unknown player")[:80])
+            rank = str(entry.get("rank", index + 1))[:12]
+            score = self.handler._format_number(entry["score"])[:40] if entry.get("score") is not None else "Unavailable"
+            lines.append(f"**#{rank} {name}** · {score}")
+        embed = discord.Embed(
+            title=f"🔎 Scout Report · Kingdom {self.kingdom_number}",
+            description="**Mystic Trial leaderboard**\n" + "\n".join(lines),
+            color=EmbedColors.INFO,
+        )
+        embed.set_footer(text=f"{len(self.entries)} players · Select a player, then View player · Scores are Mystic Trial scores")
+        return embed
+
+    async def _show_player(self, interaction: discord.Interaction):
+        self._loading = True
+        try:
+            await interaction.response.defer()
+            entry = self.entries[self.current_player]
+            profile = await self.handler._resolve_scout_player(entry)
+            data = profile or entry
+            player_data = self.handler._build_player_data_from_kingshot(data, entry, self.kingdom_number)
+            embed = self.handler._build_stats_embed(
+                player_id=player_data["playerId"],
+                player_name=player_data.get("name") or "Unknown player",
+                player_data=player_data,
+                ks_data=data,
+                mystic_trial={"entry": entry},
+                description=f"Mystic Trial · Rank #{entry.get('rank', self.current_player + 1)}",
+            )
+            hero_file = await self.handler._get_arena_loadout_image(player_data, data)
+            if hero_file:
+                embed.set_image(url="attachment://arena_loadout.png")
+            else:
+                embed.add_field(name="Arena", value="Loadout unavailable", inline=False)
+            self.showing_summary = False
+            self._update_controls()
+            embed.set_footer(text=f"Player {self.current_player + 1}/{len(self.entries)} · Unavailable means data was not returned")
+            await interaction.edit_original_response(embed=embed, attachments=[hero_file] if hero_file else [], view=self)
+
+        finally:
+            self._loading = False
+
+    @discord.ui.select(placeholder="Select a player", row=0)
+    async def player_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.current_player = int(select.values[0])
+        self.showing_summary = True
+        self._update_controls()
+        await interaction.response.edit_message(embed=self.build_summary(), attachments=[], view=self)
+
+    @discord.ui.button(label="View player", style=discord.ButtonStyle.primary, row=1)
+    async def view_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show_player(interaction)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_player = max(0, self.current_player - 1)
+        await self._show_player(interaction)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_player = min(len(self.entries) - 1, self.current_player + 1)
+        await self._show_player(interaction)
+
+    @discord.ui.button(label="Summary", style=discord.ButtonStyle.secondary, row=1)
+    async def summary_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.showing_summary = True
+        self._update_controls()
+        await interaction.response.edit_message(embed=self.build_summary(), attachments=[], view=self)
 
 
 class PlayerInfoHandler:
@@ -101,7 +211,7 @@ class PlayerInfoHandler:
                         f"Could not find a player with ID `{player_id}`.\n"
                         "Please verify the ID in-game and try again."
                     ),
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
                 await interaction.followup.send(embed=not_found_embed)
 
@@ -120,7 +230,6 @@ class PlayerInfoHandler:
 
                 return
 
-            formatted_stats = self._player_info_service.format_player_stats(player_data)
             player_name = player_data.get("name", f"Player {player_id}")
             mystic_trial = await self._get_mystic_trial(player_data, ks_data)
             embed = self._build_stats_embed(
@@ -129,7 +238,7 @@ class PlayerInfoHandler:
                 player_data=player_data,
                 ks_data=ks_data,
                 mystic_trial=mystic_trial,
-                description=formatted_stats,
+                description=None,
             )
 
             hero_file = await self._get_arena_loadout_image(player_data, ks_data)
@@ -137,6 +246,7 @@ class PlayerInfoHandler:
                 embed.set_image(url="attachment://arena_loadout.png")
                 await interaction.followup.send(embed=embed, file=hero_file)
             else:
+                embed.add_field(name="Arena", value="Loadout unavailable", inline=False)
                 await interaction.followup.send(embed=embed)
             logger.info(f"Successfully displayed stats for {player_name} (ID: {player_id}) to {user_info}")
 
@@ -183,7 +293,7 @@ class PlayerInfoHandler:
                 embed=discord.Embed(
                     title="❌ Unexpected Error",
                     description="An error occurred while fetching player stats. Please try again later.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
             )
 
@@ -199,7 +309,7 @@ class PlayerInfoHandler:
                 embed=discord.Embed(
                     title="⚠️ Invalid Kingdom Number",
                     description="Kingdom number must be a positive integer.",
-                    color=discord.Color.orange(),
+                    color=EmbedColors.WARNING,
                 )
             )
             return
@@ -209,7 +319,7 @@ class PlayerInfoHandler:
                 embed=discord.Embed(
                     title="⚠️ Invalid Limit",
                     description="Limit must be at least 1.",
-                    color=discord.Color.orange(),
+                    color=EmbedColors.WARNING,
                 )
             )
             return
@@ -221,7 +331,7 @@ class PlayerInfoHandler:
                 embed=discord.Embed(
                     title="❌ KingShot Data API Not Configured",
                     description="Scout requires the KingShot Data API service.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
             )
             return
@@ -245,7 +355,7 @@ class PlayerInfoHandler:
                 embed = discord.Embed(
                     title=f"❌ Could Not Scout Kingdom {kingdom_number}",
                     description=board_result.get("error_message", "KingShot Data API request failed."),
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
                 embed.set_footer(text="Try again in a moment or verify the kingdom number")
                 await interaction.followup.send(embed=embed)
@@ -258,41 +368,21 @@ class PlayerInfoHandler:
                     embed=discord.Embed(
                         title=f"🔎 Scout Report - Kingdom {kingdom_number}",
                         description="No Mystic Trial leaderboard entries were returned for this kingdom.",
-                        color=discord.Color.orange(),
+                        color=EmbedColors.WARNING,
                     )
                 )
                 return
 
-            profiles_by_fid: dict[str, dict[str, Any] | None] = {}
-            for entry in entries:
-                fid = self._extract_entry_fid(entry)
-                if fid is None:
-                    continue
-                profiles_by_fid[str(fid)] = await self._get_kingshot_data_player(str(fid))
+            entries = entries[:limit]
+            semaphore = asyncio.Semaphore(3)
 
-            for entry in entries:
-                fid = self._extract_entry_fid(entry)
-                profile = profiles_by_fid.get(str(fid)) if fid is not None else None
-                data = profile or entry
-                player_data = self._build_player_data_from_kingshot(data, entry, kingdom_number)
-                player_id = str(player_data.get("playerId") or fid or "")
-                player_name = player_data.get("name") or f"Player {player_id or '?'}"
-                mystic_trial = await self._get_mystic_trial(player_data, data)
-                embed = self._build_stats_embed(
-                    player_id=player_id,
-                    player_name=player_name,
-                    player_data=player_data,
-                    ks_data=data,
-                    mystic_trial=mystic_trial,
-                    description=self._format_kingshot_profile_summary(player_data),
-                )
+            async def resolve_player(entry):
+                async with semaphore:
+                    await self._resolve_scout_player(entry)
 
-                hero_file = await self._get_arena_loadout_image(player_data, data)
-                if hero_file:
-                    embed.set_image(url="attachment://arena_loadout.png")
-                    await interaction.followup.send(embed=embed, file=hero_file)
-                else:
-                    await interaction.followup.send(embed=embed)
+            await asyncio.gather(*(resolve_player(entry) for entry in entries))
+            view = ScoutReportView(self, kingdom_number, entries, interaction.user.id)
+            view.message = await interaction.followup.send(embed=view.build_summary(), view=view, wait=True)
 
             logger.info("Successfully sent scout report for kingdom %s", kingdom_number)
 
@@ -302,19 +392,38 @@ class PlayerInfoHandler:
                 embed=discord.Embed(
                     title="❌ Unexpected Error",
                     description="An error occurred while scouting the kingdom. Please try again later.",
-                    color=discord.Color.red(),
+                    color=EmbedColors.ERROR,
                 )
             )
 
-    async def _get_kingshot_data_player(self, player_id: str) -> dict[str, Any] | None:
-        if self._kingshot_data_service is None:
+    async def _resolve_scout_player(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        profile = entry.get("player")
+        if isinstance(profile, dict) and profile and not profile.get("error"):
+            return profile
+        uid = self._extract_player_uid(entry, None)
+        fid = self._extract_entry_fid(entry)
+        profile = await self._get_kingshot_data_player(str(fid) if fid is not None else None, uid=uid)
+        entry["player"] = profile
+        return profile
+
+    async def _get_kingshot_data_player(
+        self, player_id: str | None = None, *, uid: str | None = None,
+    ) -> dict[str, Any] | None:
+        if self._kingshot_data_service is None or not (uid or player_id):
             return None
 
-        result = await self._kingshot_data_service.get_player_by_fid(player_id)
+        try:
+            result = (
+                await self._kingshot_data_service.get_player(uid)
+                if uid else await self._kingshot_data_service.get_player_by_fid(player_id)
+            )
+        except Exception:
+            logger.warning("KingShot Data enrichment failed for player %s", uid or player_id, exc_info=True)
+            return None
         if not result.get("success"):
             logger.warning(
                 "KingShot Data enrichment failed for player %s: %s",
-                player_id,
+                uid or player_id,
                 result.get("error_message") or result.get("error_code"),
             )
             return None
@@ -358,27 +467,27 @@ class PlayerInfoHandler:
         player_name: str,
         player_data: dict[str, Any],
         ks_data: dict[str, Any] | None,
-        description: str,
+        description: str | None,
         mystic_trial: dict[str, Any] | None = None,
     ) -> discord.Embed:
         embed = discord.Embed(
-            title=f"📊 {player_name}",
-            description=description,
-            color=discord.Color.blue(),
+            title=f"📊 {player_name}"[:256],
+            description=description[:1024] if description else None,
+            color=EmbedColors.INFO,
         )
 
-        embed.add_field(name="Player ID", value=f"`{player_data.get('playerId', player_id)}`", inline=True)
+        embed.add_field(name="Power", value=cls._format_power(ks_data), inline=True)
         embed.add_field(
             name="Kingdom",
-            value=str(player_data.get("kingdom", "N/A")),
+            value=str(player_data.get("kingdom") if player_data.get("kingdom") is not None else "Unavailable"),
             inline=True,
         )
         embed.add_field(
             name="Castle Level",
-            value=str(player_data.get("levelRenderedDetailed") or player_data.get("level") or "N/A"),
+            value=str(player_data.get("levelRenderedDetailed") or (player_data.get("level") if player_data.get("level") is not None else "Unavailable")),
             inline=True,
         )
-        embed.add_field(name="Power", value=cls._format_power(ks_data), inline=True)
+        embed.add_field(name="Player ID", value=f"`{player_data.get('playerId') or player_id}`", inline=True)
         embed.add_field(name="VIP Level", value=cls._format_vip(ks_data), inline=True)
         embed.add_field(name="Alliance", value=cls._format_alliance(ks_data), inline=True)
         embed.add_field(name="Mystic Trial", value=cls._format_mystic_trial(mystic_trial), inline=True)
@@ -386,6 +495,8 @@ class PlayerInfoHandler:
         if "profilePhoto" in player_data and player_data["profilePhoto"]:
             embed.set_thumbnail(url=player_data["profilePhoto"])
 
+        for index, field in enumerate(embed.fields):
+            embed.set_field_at(index, name=field.name, value=str(field.value)[:512], inline=field.inline)
         return embed
 
     async def _get_arena_loadout_image(
@@ -1087,54 +1198,43 @@ class PlayerInfoHandler:
         entry: dict[str, Any],
         kingdom_number: int,
     ) -> dict[str, Any]:
-        fid = data.get("fid") or entry.get("fid") or entry.get("playerId")
+        fid = data.get("fid") or PlayerInfoHandler._extract_entry_fid(entry)
         uid = data.get("uid") or entry.get("uid")
         player = entry.get("player")
         if uid is None and isinstance(player, dict):
             uid = player.get("uid")
         return {
             "name": data.get("name") or entry.get("name"),
-            "playerId": str(fid) if fid is not None else "N/A",
+            "playerId": str(fid) if fid is not None else "Unavailable",
             "playerUid": str(uid) if uid is not None else None,
-            "level": data.get("stove_lv") or data.get("castle_level") or data.get("lv"),
+            "level": next((data[key] for key in ("stove_lv", "castle_level", "lv") if data.get(key) is not None), None),
             "kingdom": data.get("kid") or entry.get("kid") or kingdom_number,
         }
-
-    @staticmethod
-    def _format_kingshot_profile_summary(player_data: dict[str, Any]) -> str:
-        lines = []
-        if player_data.get("name"):
-            lines.append(f"👤 **Name:** {player_data['name']}")
-        if player_data.get("playerId"):
-            lines.append(f"🆔 **ID:** {player_data['playerId']}")
-        if player_data.get("level"):
-            lines.append(f"🏰 **Castle Level:** Level {player_data['level']}")
-        if player_data.get("kingdom"):
-            lines.append(f"🌍 **Kingdom:** {player_data['kingdom']}")
-        return "\n".join(lines) or "No data available"
 
     @classmethod
     def _format_power(cls, ks_data: dict[str, Any] | None) -> str:
         if not ks_data:
-            return "N/A"
+            return "Unavailable"
         power = ks_data.get("power")
         if power is None and isinstance(ks_data.get("stats"), dict):
             power = ks_data["stats"].get("8")
-        return cls._format_number(power) if power is not None else "N/A"
+        return cls._format_number(power) if power is not None else "Unavailable"
 
     @staticmethod
     def _format_vip(ks_data: dict[str, Any] | None) -> str:
         if not ks_data:
-            return "N/A"
+            return "Unavailable"
         vip = ks_data.get("vip")
-        if vip in (None, 0, "0"):
+        if vip is None:
+            return "Unavailable"
+        if vip in (0, "0"):
             return "Hidden"
         return str(vip)
 
     @staticmethod
     def _format_alliance(ks_data: dict[str, Any] | None) -> str:
         if not ks_data or not isinstance(ks_data.get("alliance"), dict):
-            return "N/A"
+            return "Unavailable"
         alliance = ks_data["alliance"]
         aid = alliance.get("aid")
         abbr = alliance.get("abbr")
@@ -1148,12 +1248,12 @@ class PlayerInfoHandler:
             return f"{name}{aid_text}"
         if aid is not None:
             return f"ID `{aid}`"
-        return "N/A"
+        return "Unavailable"
 
     @classmethod
     def _format_mystic_trial(cls, mystic_trial: dict[str, Any] | None) -> str:
         if not mystic_trial:
-            return "Kingdom Rank: N/A\nScore: N/A"
+            return "Kingdom Rank: Unavailable\nScore: Unavailable"
 
         entry = mystic_trial.get("entry")
         if not isinstance(entry, dict):
@@ -1161,8 +1261,8 @@ class PlayerInfoHandler:
 
         rank = entry.get("rank") or mystic_trial.get("rank")
         score = entry.get("score") if entry.get("score") is not None else mystic_trial.get("score")
-        rank_text = f"#{cls._format_number(rank)}" if rank is not None else "N/A"
-        score_text = cls._format_number(score) if score is not None else "N/A"
+        rank_text = f"#{cls._format_number(rank)}" if rank is not None else "Unavailable"
+        score_text = cls._format_number(score) if score is not None else "Unavailable"
         return f"Kingdom Rank: {rank_text}\nScore: {score_text}"
 
     @staticmethod

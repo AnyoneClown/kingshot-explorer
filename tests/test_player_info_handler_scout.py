@@ -1,78 +1,12 @@
-import importlib.util
 import asyncio
-import sys
-import types
-from pathlib import Path
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import discord
+import pytest
 
-def load_player_info_handler():
-    stub_modules = {}
-
-    class FakeEmbed:
-        def __init__(self, title=None, description=None, color=None):
-            self.title = title
-            self.description = description
-            self.color = color
-            self.fields = []
-            self.footer = None
-            self.image_url = None
-
-        def add_field(self, name, value, inline=True):
-            self.fields.append({"name": name, "value": value, "inline": inline})
-
-        def set_footer(self, text):
-            self.footer = text
-
-        def set_image(self, url):
-            self.image_url = url
-
-    discord_module = types.ModuleType("discord")
-    discord_module.Interaction = object
-    discord_module.Embed = FakeEmbed
-    discord_module.File = lambda fp, filename=None: types.SimpleNamespace(fp=fp, filename=filename)
-    discord_module.Color = types.SimpleNamespace(blue=lambda: "blue")
-    discord_module.app_commands = types.SimpleNamespace(describe=lambda **_: lambda func: func)
-    stub_modules["discord"] = discord_module
-
-    discord_ext_module = types.ModuleType("discord.ext")
-    commands_module = types.ModuleType("discord.ext.commands")
-    commands_module.Bot = object
-    stub_modules["discord.ext"] = discord_ext_module
-    stub_modules["discord.ext.commands"] = commands_module
-
-    services_player_info_module = types.ModuleType("services.player_info_service")
-    services_player_info_module.IPlayerInfoService = object
-    stub_modules["services"] = types.ModuleType("services")
-    stub_modules["services.player_info_service"] = services_player_info_module
-
-    services_interaction_module = types.ModuleType("services.interaction_tracking_service")
-    services_interaction_module.InteractionTrackingService = object
-    stub_modules["services.interaction_tracking_service"] = services_interaction_module
-
-    services_kingshot_module = types.ModuleType("services.kingshot_data_service")
-    services_kingshot_module.KingshotDataService = object
-    stub_modules["services.kingshot_data_service"] = services_kingshot_module
-
-    module_path = Path(__file__).resolve().parents[1] / "handlers" / "player_info_handler.py"
-    spec = importlib.util.spec_from_file_location("player_info_handler_under_test", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-
-    originals = {name: sys.modules.get(name) for name in stub_modules}
-    try:
-        sys.modules.update(stub_modules)
-        spec.loader.exec_module(module)
-    finally:
-        for name, original in originals.items():
-            if original is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = original
-
-    return module.PlayerInfoHandler
-
-
-PlayerInfoHandler = load_player_info_handler()
+from handlers.player_info_handler import PlayerInfoHandler
 
 
 def test_scout_uses_mystic_trial_board_type():
@@ -140,12 +74,12 @@ def test_build_stats_embed_matches_stats_style_for_scout_data():
         player_data=player_data,
         ks_data=profile,
         mystic_trial={"rank": 93, "entry": {"rank": 93, "score": 1239}},
-        description=PlayerInfoHandler._format_kingshot_profile_summary(player_data),
+        description=None,
     )
-    fields = {field["name"]: field["value"] for field in embed.fields}
+    fields = {field.name: field.value for field in embed.fields}
 
     assert embed.title == "📊 Amoeba"
-    assert "👤 **Name:** Amoeba" in embed.description
+    assert embed.description is None
     assert fields["Player ID"] == "`121704562`"
     assert player_data["playerUid"] == "30669644"
     assert fields["Kingdom"] == "830"
@@ -155,7 +89,8 @@ def test_build_stats_embed_matches_stats_style_for_scout_data():
     assert fields["Alliance"] == "`[FKA]` FateKillsAll (`83900009`)"
     assert fields["Mystic Trial"] == "Kingdom Rank: #93\nScore: 1,239"
     assert "Links" not in fields
-    assert embed.footer is None
+    assert embed.footer.text is None
+    assert embed.fields[0].name == "Power"
 
 
 def test_get_mystic_trial_searches_type_20_by_uid_and_kingdom():
@@ -283,3 +218,189 @@ def test_annotate_gear_image_tints_red_stage_gear():
 
     assert red["pixels"][sample_offset] > normal["pixels"][sample_offset]
     assert red["pixels"][sample_offset + 1] < normal["pixels"][sample_offset + 1]
+
+
+def test_scout_single_summary_navigation_and_unavailable_data():
+    async def check():
+        entries = [{"rank": index + 1, "fid": None, "uid": index + 200, "score": index} for index in range(20)]
+        active, peak = 0, 0
+
+        async def get_player(uid):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            active -= 1
+            index = int(uid) - 200
+            return {"success": True, "data": {
+                "uid": int(uid), "fid": index + 100, "name": f"Player {index}", "power": 0, "stove_lv": 0,
+            }}
+
+        service = SimpleNamespace(
+            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {"entries": entries}}),
+            get_player=AsyncMock(side_effect=get_player),
+            get_player_by_fid=AsyncMock(),
+        )
+        handler = PlayerInfoHandler(object(), object(), object(), service)
+        hero_file = discord.File(BytesIO(b"image"), filename="arena_loadout.png")
+        handler._get_arena_loadout_image = AsyncMock(side_effect=[hero_file, None])
+        interaction = _scout_interaction()
+        message = interaction.followup.send.return_value
+        await handler._handle_scout_slash(interaction, 830, 99)
+        interaction.followup.send.assert_awaited_once()
+        assert service.get_player.await_count == 15
+        assert 1 <= peak <= 3
+        service.get_player_by_fid.assert_not_awaited()
+        view = interaction.followup.send.call_args.kwargs["view"]
+        assert len(view.entries) == 15
+        assert len(view.build_summary().description) < 4096
+        assert view.previous_button.disabled and not view.next_button.disabled
+        assert view.summary_button.disabled
+        assert "**#1 Player 0** · 0" in view.build_summary().description
+        await view.view_player_button.callback(interaction)
+        first = interaction.edit_original_response.call_args.kwargs
+        assert first["attachments"] == [hero_file]
+        fields = {field.name: field.value for field in first["embed"].fields}
+        assert fields["Power"] == "0" and fields["Castle Level"] == "0"
+        assert fields["VIP Level"] == "Unavailable"
+        await view.next_button.callback(interaction)
+        second = interaction.edit_original_response.call_args.kwargs
+        assert second["attachments"] == []
+        assert second["embed"].fields[-1].value == "Loadout unavailable"
+        assert view.current_player == 1
+        await view.summary_button.callback(interaction)
+        assert interaction.response.edit_message.call_args.kwargs["attachments"] == []
+        view.player_select._values = ["14"]
+        await view.player_select.callback(interaction)
+        assert view.current_player == 14 and view.next_button.disabled
+        assert view.player_select.options[14].default
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_arena(player_data, profile):
+            entered.set()
+            await release.wait()
+            return None
+
+        handler._get_arena_loadout_image = slow_arena
+        pending = asyncio.create_task(view.view_player_button.callback(interaction))
+        await entered.wait()
+        assert not await view.interaction_check(interaction)
+        assert view.current_player == 14
+        release.set()
+        await pending
+        assert not view._loading
+        assert service.get_player.await_count == 15
+        service.get_player_by_fid.assert_not_awaited()
+        stranger = SimpleNamespace(user=SimpleNamespace(id=2), response=SimpleNamespace(send_message=AsyncMock()))
+        assert not await view.interaction_check(stranger)
+        assert stranger.response.send_message.call_args.kwargs["ephemeral"]
+        await view.on_timeout()
+        assert all(item.disabled for item in view.children)
+        message.edit.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+def _scout_interaction():
+    return SimpleNamespace(
+        user=SimpleNamespace(id=1, name="Tester", discriminator="0"),
+        guild=None,
+        response=SimpleNamespace(defer=AsyncMock(), edit_message=AsyncMock(), send_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))),
+        edit_original_response=AsyncMock(),
+    )
+
+
+@pytest.mark.parametrize("source", ["uid_only", "fid_only", "embedded"])
+def test_scout_resolves_identity_for_summary_selector_and_cached_details(source):
+    async def check():
+        profile = {
+            "uid": 28584855,
+            "fid": 117248174,
+            "name": "Resolved Player",
+            "power": 0,
+            "vip": 0,
+            "stove_lv": 0,
+            "kid": 830,
+            "alliance": {"abbr": "FKA", "name": "FateKillsAll"},
+            "rank": 99,
+            "score": 999999,
+        }
+        entry = {"rank": 1, "uid": 28584855, "score": 2846, "fid": None}
+        if source == "fid_only":
+            entry.pop("uid")
+            entry["fid"] = 117248174
+        elif source == "embedded":
+            entry["player"] = profile
+        service = SimpleNamespace(
+            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {"entries": [entry]}}),
+            get_player=AsyncMock(return_value={"success": True, "data": profile}),
+            get_player_by_fid=AsyncMock(return_value={"success": True, "data": profile}),
+        )
+        handler = PlayerInfoHandler(object(), object(), object(), service)
+        handler._get_arena_loadout_image = AsyncMock(return_value=None)
+        interaction = _scout_interaction()
+        await handler._handle_scout_slash(interaction, 830, 5)
+        view = interaction.followup.send.call_args.kwargs["view"]
+        assert view.entries[0]["player"] == profile
+        assert view.entries[0]["rank"] == 1 and view.entries[0]["score"] == 2846
+        assert "**#1 Resolved Player** · 2,846" in view.build_summary().description
+        assert "999,999" not in view.build_summary().description
+        assert "Resolved Player" in view.player_select.options[0].label
+        assert "117248174" in view.player_select.options[0].description
+        await view.view_player_button.callback(interaction)
+        embed = interaction.edit_original_response.call_args.kwargs["embed"]
+        fields = {field.name: field.value for field in embed.fields}
+        assert embed.title == "📊 Resolved Player"
+        assert fields["Player ID"] == "`117248174`"
+        assert fields["Power"] == "0" and fields["Castle Level"] == "0"
+        assert fields["Alliance"] == "`[FKA]` FateKillsAll"
+        assert fields["Mystic Trial"] == "Kingdom Rank: #1\nScore: 2,846"
+        await view.summary_button.callback(interaction)
+        await view.view_player_button.callback(interaction)
+        if source == "uid_only":
+            service.get_player.assert_awaited_once_with("28584855")
+            service.get_player_by_fid.assert_not_awaited()
+        elif source == "fid_only":
+            service.get_player_by_fid.assert_awaited_once_with("117248174")
+            service.get_player.assert_not_awaited()
+        else:
+            service.get_player.assert_not_awaited()
+            service.get_player_by_fid.assert_not_awaited()
+
+    asyncio.run(check())
+
+
+def test_scout_unavailable_profile_preserves_board_score_and_uid_arena(tmp_path):
+    async def check():
+        uid = 28584855
+        service = SimpleNamespace(
+            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {
+                "entries": [{"rank": 1, "uid": uid, "score": 2846, "fid": None}],
+            }}),
+            get_player=AsyncMock(return_value={"success": False, "error_message": "Temporarily unavailable"}),
+            get_player_by_fid=AsyncMock(),
+            get_arena=AsyncMock(return_value={"success": True, "data": {"heroes": [{"id": 50024}]}}),
+        )
+        handler = PlayerInfoHandler(object(), object(), object(), service)
+        handler.HERO_IMAGE_DIR = tmp_path
+        (tmp_path / "50024.png").write_bytes(b"placeholder")
+        handler._build_hero_loadout_png = lambda _: b"arena image"
+        interaction = _scout_interaction()
+        await handler._handle_scout_slash(interaction, 830, 5)
+        view = interaction.followup.send.call_args.kwargs["view"]
+        assert "2,846" in view.build_summary().description
+        assert "Unavailable" in view.player_select.options[0].description
+        await view.view_player_button.callback(interaction)
+        sent = interaction.edit_original_response.call_args.kwargs
+        fields = {field.name: field.value for field in sent["embed"].fields}
+        assert fields["Player ID"] == "`Unavailable`"
+        assert fields["Power"] == "Unavailable"
+        assert fields["Mystic Trial"] == "Kingdom Rank: #1\nScore: 2,846"
+        assert sent["attachments"][0].filename == "arena_loadout.png"
+        service.get_arena.assert_awaited_once_with(str(uid))
+        service.get_player_by_fid.assert_not_awaited()
+        assert service.get_player.await_count >= 1
+        assert all(call.args == (str(uid),) for call in service.get_player.await_args_list)
+
+    asyncio.run(check())

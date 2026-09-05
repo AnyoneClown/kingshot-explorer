@@ -4,6 +4,7 @@ from .database_handler import DatabaseHandler
 from .event_handler import EventHandler
 from .gift_code_handler import GiftCodeHandler
 from .guild_config_handler import GuildConfigHandler
+from .help_handler import HelpHandler
 from .kingshot_rag_handler import KingshotRAGHandler
 from .kvk_handler import KVKHandler
 from .player_info_handler import PlayerInfoHandler
@@ -16,6 +17,7 @@ __all__ = [
     "PlayerInfoHandler",
     "GiftCodeHandler",
     "GuildConfigHandler",
+    "HelpHandler",
     "KingshotRAGHandler",
     "KVKHandler",
     "DatabaseHandler",

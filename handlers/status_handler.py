@@ -88,10 +88,14 @@ class StatusHandler:
 
         embed = build_status_embed(
             title="Bot Status",
-            description="Operational health for DS Translator / AI Clown.",
+            description=(
+                "All services are available." if all(required_checks)
+                else "Some features are unavailable. Check the affected services below."
+            ),
             color=color,
             footer="Private status response",
         )
+        embed.timestamp = now
         embed.add_field(name="Discord", value=status_value(not self._bot.is_closed()), inline=True)
         embed.add_field(name="Latency", value=f"{self._bot.latency * 1000:.0f} ms", inline=True)
         embed.add_field(name="Uptime", value=self._format_duration(uptime_seconds), inline=True)

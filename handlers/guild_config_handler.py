@@ -7,13 +7,13 @@ import logging
 import discord
 from discord.ext import commands
 
-from handlers.ui import EmbedColors, build_status_embed
+from handlers.ui import EmbedColors, OwnedView, build_status_embed
 from services.guild_configuration_service import GuildConfigurationService
 
 logger = logging.getLogger(__name__)
 
 
-class GuildConfigView(discord.ui.View):
+class GuildConfigView(OwnedView):
     """Ephemeral admin control panel for guild configuration."""
 
     def __init__(
@@ -25,9 +25,8 @@ class GuildConfigView(discord.ui.View):
         guild_config_service,
         timeout: float = 180.0,
     ):
-        super().__init__(timeout=timeout)
+        super().__init__(author_id, timeout=timeout)
         self._guild_id = guild_id
-        self._author_id = author_id
         self._guild_name = guild_name
         self._guild_config_service = guild_config_service
 
@@ -46,22 +45,16 @@ class GuildConfigView(discord.ui.View):
                 "Use the buttons below to update guild-wide bot behavior."
             ),
             color=EmbedColors.NEUTRAL,
-            footer="Admin-only configuration panel",
+            footer="Admin-only configuration panel · Reopen /configure when controls expire",
         )
 
     def _sync_voice_button(self, enabled: bool) -> None:
-        self.toggle_voice_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger
+        self.toggle_voice_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
         self.toggle_voice_button.label = f"Voice Replies: {'On' if enabled else 'Off'}"
 
     def _sync_random_replies_button(self, enabled: bool) -> None:
-        self.toggle_random_replies_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger
+        self.toggle_random_replies_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
         self.toggle_random_replies_button.label = f"AI Replies: {'On' if enabled else 'Off'}"
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self._author_id:
-            await interaction.response.send_message("Only the command user can control this panel.", ephemeral=True)
-            return False
-        return True
 
     @discord.ui.button(label="Voice Replies", style=discord.ButtonStyle.secondary, row=0)
     async def toggle_voice_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -131,7 +124,7 @@ class GuildConfigHandler:
             guild_name=interaction.guild.name,
             guild_config_service=self._guild_config_service,
         )
-        await interaction.edit_original_response(
+        view.message = await interaction.edit_original_response(
             embed=await view.build_embed(),
             view=view,
         )
