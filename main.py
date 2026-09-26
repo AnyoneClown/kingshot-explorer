@@ -43,6 +43,8 @@ from services import (
     TranslationService,
     DatabaseHealthService,
     KingshotDataService,
+    MightPulseService,
+    MightPulseAllianceDirectory,
     VoiceMessageService,
 )
 
@@ -108,7 +110,6 @@ class TranslatorBot:
             default_use_random_replies=False,
             db_manager=self.db_manager,
         )
-        self.player_info_service = PlayerInfoService()
         self.interaction_tracking_service = InteractionTrackingService(self.db_manager)
         self.database_health_service = DatabaseHealthService(self.db_manager)
         self.kvk_service = KVKService()
@@ -117,6 +118,12 @@ class TranslatorBot:
             base_url=config.ks_data_base_url,
             timeout_seconds=config.ks_data_timeout_seconds,
         )
+        self.player_info_service = PlayerInfoService(self.kingshot_data_service)
+        self.mightpulse_service = (
+            MightPulseService(config.mightpulse_api_key, base_url=config.mightpulse_base_url)
+            if config.mightpulse_api_key else None
+        )
+        self.alliance_directory_service = MightPulseAllianceDirectory()
         self.alliance_power_service = AlliancePowerService(self.db_manager, self.kingshot_data_service)
         self.kingshot_rag_service = KingshotRAGService(
             self.db_manager,
@@ -172,6 +179,8 @@ class TranslatorBot:
             interaction_tracking_service=self.interaction_tracking_service,
             player_registry_service=self.player_registry_service,
             kingshot_data_service=self.kingshot_data_service,
+            mightpulse_service=self.mightpulse_service,
+            alliance_directory_service=self.alliance_directory_service,
         )
         self.guild_config_handler = GuildConfigHandler(
             self.bot,

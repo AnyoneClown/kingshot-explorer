@@ -18,6 +18,11 @@ from services.player_info_service import IPlayerInfoService
 from services.interaction_tracking_service import InteractionTrackingService
 from services.player_registry_service import PlayerRegistryService
 from services.kingshot_data_service import KingshotDataService
+from services.mightpulse_service import (
+    MightPulseAllianceDirectory,
+    MightPulseService,
+    MightPulseUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +308,8 @@ class GiftCodeHandler:
         interaction_tracking_service: InteractionTrackingService | None = None,
         player_registry_service: PlayerRegistryService | None = None,
         kingshot_data_service: KingshotDataService | None = None,
+        mightpulse_service: MightPulseService | None = None,
+        alliance_directory_service: MightPulseAllianceDirectory | None = None,
     ):
         """
         Initialize gift code handler.
@@ -320,6 +327,8 @@ class GiftCodeHandler:
         self._tracking_service = interaction_tracking_service or InteractionTrackingService()
         self._player_registry_service = player_registry_service or PlayerRegistryService()
         self._kingshot_data_service = kingshot_data_service
+        self._mightpulse_service = mightpulse_service
+        self._alliance_directory_service = alliance_directory_service
         self._polling_loop = None
         self._poll_backoff_until: datetime | None = None
         self._poll_backoff_delta = timedelta(minutes=2)
@@ -384,7 +393,7 @@ class GiftCodeHandler:
         @self._bot.tree.command(name="addalliance", description="Add an alliance to gift code auto-redemption")
         @app_commands.describe(
             kid="Kingdom ID",
-            alliance="Top-15 alliance tag by power (may take a moment to load)",
+            alliance="Top-15 alliance by power (may take a moment to load)",
         )
         async def add_alliance(
             interaction: discord.Interaction,
@@ -1620,15 +1629,13 @@ class GiftCodeHandler:
                 continue
 
             aid = str(row.get("aid", "")).strip()
-            abbr = row.get("abbr")
-            if (
-                not aid.isdigit()
-                or int(aid) <= 0
-                or not isinstance(abbr, str)
-                or len(abbr.strip()) != 3
-                or not abbr.strip().isalnum()
-            ):
+            if not aid.isdigit() or int(aid) <= 0:
                 continue
+            abbr = row.get("abbr")
+            if not isinstance(abbr, str) or len(abbr.strip()) != 3 or not abbr.strip().isalnum():
+                abbr = None
+            else:
+                abbr = abbr.strip()
 
             power: Optional[int]
             rank: Optional[int]
@@ -1666,7 +1673,7 @@ class GiftCodeHandler:
                 aid,
                 {
                     "aid": aid,
-                    "abbr": abbr.strip(),
+                    "abbr": abbr,
                     "power": power,
                     "rank": rank,
                     "name": name,
@@ -1681,7 +1688,7 @@ class GiftCodeHandler:
                 -(alliance["power"] or 0),
                 alliance["rank"] is None,
                 alliance["rank"] or 0,
-                alliance["abbr"].casefold(),
+                (alliance["abbr"] or "").casefold(),
                 int(alliance["aid"]),
             ),
         )
@@ -1798,6 +1805,36 @@ class GiftCodeHandler:
             self._alliance_completion_tasks if exhaustive else self._alliance_refresh_tasks
         )
         try:
+            if self._alliance_directory_service is not None:
+                try:
+                    directory_result = await self._alliance_directory_service.get_ranked_alliances(
+                        kid,
+                        limit=self.ALLIANCE_AUTOCOMPLETE_MAX_CHOICES,
+                    )
+                    directory_choices = self._normalize_ranked_alliances(
+                        directory_result.get("data")
+                    )
+                    if directory_choices:
+                        self._alliance_cache[kid] = (
+                            time.monotonic(),
+                            directory_choices,
+                            True,
+                        )
+                        self._alliance_completion_retry_after.pop(kid, None)
+                        logger.info(
+                            "Cached %s named alliance choices for kingdom %s from public directory",
+                            len(directory_choices),
+                            kid,
+                        )
+                        return directory_choices
+                except MightPulseUnavailableError as exc:
+                    logger.warning(
+                        "Named alliance directory unavailable for kingdom %s: %s; "
+                        "trying KingShot leaderboard",
+                        kid,
+                        exc,
+                    )
+
             if self._kingshot_data_service is None:
                 return None
 
@@ -1840,6 +1877,12 @@ class GiftCodeHandler:
                 self._alliance_cache[kid] = (
                     time.monotonic(),
                     alliances,
+                    resolution_complete,
+                )
+                logger.info(
+                    "Cached %s alliance choices for kingdom %s (metadata complete=%s)",
+                    len(alliances),
+                    kid,
                     resolution_complete,
                 )
 
@@ -1900,9 +1943,11 @@ class GiftCodeHandler:
             )
             return []
 
-        cached, _, resolution_complete = self._get_cached_alliances(kid)
-        if cached is not None and resolution_complete:
+        cached, _, _ = self._get_cached_alliances(kid)
+        if cached is not None:
             return cached
+        if alliances:
+            return alliances
 
         completion = self._alliance_completion_tasks.get(kid)
         remaining = self.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS - (
@@ -1938,12 +1983,30 @@ class GiftCodeHandler:
             return []
 
         alliances = await self._get_alliances_for_autocomplete(normalized_kid)
+        if not alliances:
+            # A shared refresh can finish between its timeout and this check.
+            cached, _, _ = self._get_cached_alliances(normalized_kid)
+            if cached:
+                alliances = cached
+        if not alliances:
+            pending = (
+                self._alliance_refresh_tasks.get(normalized_kid)
+                or self._alliance_completion_tasks.get(normalized_kid)
+            )
+            if pending is not None and not pending.done():
+                return [app_commands.Choice(
+                    name=f"Loading kingdom {normalized_kid} alliances… reopen this field shortly",
+                    value=f"loading:{normalized_kid}",
+                )]
+            return []
+
         needle = str(current or "").strip().casefold()
         if needle:
             alliances = [
                 alliance
                 for alliance in alliances
-                if needle in alliance["abbr"].casefold()
+                if needle in (alliance.get("abbr") or "").casefold()
+                or needle in alliance["aid"]
                 or (
                     isinstance(alliance.get("name"), str)
                     and needle in alliance["name"].casefold()
@@ -1961,10 +2024,12 @@ class GiftCodeHandler:
     @classmethod
     def _format_alliance_choice_name(cls, alliance: Dict[str, Any]) -> str:
         """Render one safe Discord choice label while preserving its suffix."""
-        tag = str(alliance.get("abbr") or "???")
+        tag = alliance.get("abbr")
         full_name = alliance.get("name")
         if not isinstance(full_name, str) or not full_name:
-            full_name = "Unknown Alliance"
+            full_name = "Unknown Alliance" if tag else f"Alliance {alliance['aid']}"
+        elif not tag:
+            full_name = f"{full_name} (AID {alliance['aid']})"
 
         member_count = alliance.get("member_count")
         count_text = (
@@ -1972,7 +2037,7 @@ class GiftCodeHandler:
             if isinstance(member_count, int) and not isinstance(member_count, bool)
             else "?"
         )
-        prefix = f"[{tag}] "
+        prefix = f"[{tag}] " if tag else ""
         suffix = f" - {count_text} members"
         available_name_length = cls.ALLIANCE_CHOICE_NAME_MAX_LENGTH - len(prefix) - len(suffix)
         if len(full_name) > available_name_length:
@@ -2024,7 +2089,8 @@ class GiftCodeHandler:
             matches = [
                 alliance
                 for alliance in alliances
-                if alliance["abbr"].casefold() == normalized_tag
+                if isinstance(alliance.get("abbr"), str)
+                and alliance["abbr"].casefold() == normalized_tag
             ]
         else:
             return None
@@ -2087,7 +2153,7 @@ class GiftCodeHandler:
 
     @staticmethod
     def _extract_member_name(member: Dict[str, Any]) -> Optional[str]:
-        for key in ("name", "nickname", "playerName", "player_name"):
+        for key in ("name", "nickname", "nick_name", "playerName", "player_name"):
             value = member.get(key)
             if value:
                 return str(value)
@@ -2102,7 +2168,7 @@ class GiftCodeHandler:
 
     @staticmethod
     def _extract_member_castle_level(member: Dict[str, Any]) -> Optional[str]:
-        for key in ("castleLevel", "castle", "stove_lv", "level", "lv"):
+        for key in ("castleLevel", "castle", "stove_lv", "town_center_level", "level", "lv"):
             value = member.get(key)
             if value is not None:
                 return str(value)
@@ -2385,6 +2451,15 @@ class GiftCodeHandler:
             return
 
         selection = alliance.strip() if isinstance(alliance, str) else ""
+        if selection == f"loading:{kid}":
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="Alliances Still Loading",
+                    description="Reopen the alliance field in a moment to choose from the list.",
+                    color=discord.Color.orange(),
+                )
+            )
+            return
         cached, is_fresh, resolution_complete = self._get_cached_alliances(kid)
         refresh: Optional[asyncio.Task[Optional[List[Dict[str, Any]]]]] = None
         if cached is None:
@@ -2403,8 +2478,7 @@ class GiftCodeHandler:
                         embed=self._build_status_embed(
                             title="No Alliances Found",
                             description=(
-                                f"No readable 3-character alliance tags were found "
-                                f"in kingdom `{kid}`."
+                                f"No alliance leaderboard entries were found in kingdom `{kid}`."
                             ),
                             color=discord.Color.orange(),
                         )
@@ -2435,7 +2509,7 @@ class GiftCodeHandler:
             await interaction.followup.send(
                 embed=self._build_status_embed(
                     title="No Alliances Found",
-                    description=f"No readable 3-character alliance tags were found in kingdom `{kid}`.",
+                    description=f"No alliance leaderboard entries were found in kingdom `{kid}`.",
                     color=discord.Color.orange(),
                 )
             )
@@ -2470,7 +2544,7 @@ class GiftCodeHandler:
             aid=aid,
             kid=kid,
             defer_response=False,
-            alliance_label=selected["abbr"],
+            alliance_label=selected.get("abbr") or selected.get("name") or f"Alliance {aid}",
         )
 
     async def _handle_add_alliance_slash(
@@ -2527,6 +2601,16 @@ class GiftCodeHandler:
                 return
 
             payload = result.get("data")
+            if isinstance(payload, dict) and payload.get("aid") is not None:
+                if str(payload["aid"]) != str(aid):
+                    await interaction.followup.send(
+                        embed=self._build_status_embed(
+                            title="❌ Could Not Fetch Alliance",
+                            description="The alliance response does not match the selected alliance ID.",
+                            color=discord.Color.red(),
+                        )
+                    )
+                    return
             members = self._extract_alliance_members(payload)
             if not members:
                 await interaction.followup.send(
@@ -2543,6 +2627,7 @@ class GiftCodeHandler:
             seen_fids: set[str] = set()
             cached_uid_count = 0
             resolved_uid_count = 0
+            alternate_uid_count = 0
             players_to_add: List[Dict[str, Any]] = []
             cached_enabled_fids: set[str] = set()
             member_uids = []
@@ -2559,6 +2644,20 @@ class GiftCodeHandler:
                 and not self._extract_member_fid(member)
                 and member_uid not in cached_players_by_uid
             }
+            alternate_members_by_uid: dict[str, Dict[str, Any]] = {}
+            alternate_alliance_name = None
+            if missing_uids and self._mightpulse_service is not None:
+                try:
+                    alternate_roster = await self._mightpulse_service.get_alliance_roster_by_aid(kid, aid)
+                    alternate_members_by_uid = alternate_roster["members_by_uid"]
+                    alternate_alliance_name = alternate_roster.get("name")
+                    missing_uids.difference_update(
+                        uid for uid, member in alternate_members_by_uid.items()
+                        if self._extract_member_fid(member)
+                    )
+                except MightPulseUnavailableError as exc:
+                    logger.warning("Could not resolve Governor IDs for alliance %s: %s", aid, exc)
+
             resolved_profiles_by_uid: dict[str, Dict[str, Any]] = {}
             if missing_uids:
                 resolve_semaphore = asyncio.Semaphore(5)
@@ -2573,7 +2672,11 @@ class GiftCodeHandler:
                             profile_result.get("error_message", "KingShot Data API request failed."),
                         )
                         return uid, None
-                    return uid, self._extract_player_payload(profile_result.get("data"))
+                    profile = self._extract_player_payload(profile_result.get("data"))
+                    if profile and self._extract_profile_uid(profile) != uid:
+                        logger.warning("Player profile uid did not match requested uid %s", uid)
+                        return uid, None
+                    return uid, profile
 
                 for uid, profile in await asyncio.gather(
                     *(resolve_missing_uid(uid) for uid in sorted(missing_uids))
@@ -2599,15 +2702,23 @@ class GiftCodeHandler:
                         if getattr(cached_player, "enabled", False):
                             cached_enabled_fids.add(fid)
                     else:
-                        profile = resolved_profiles_by_uid.get(member_uid)
-                        if profile:
-                            fid = self._extract_profile_fid(profile)
-                            member_uid = self._extract_profile_uid(profile) or member_uid
-                            member_name = member_name or self._extract_profile_name(profile)
-                            castle_level = castle_level or self._extract_profile_castle_level(profile)
-                            member_kingdom = self._extract_profile_kingdom(profile) or member_kingdom
+                        alternate_member = alternate_members_by_uid.get(member_uid)
+                        if alternate_member:
+                            fid = self._extract_member_fid(alternate_member)
+                            member_name = member_name or self._extract_member_name(alternate_member)
+                            castle_level = castle_level or self._extract_member_castle_level(alternate_member)
                             if fid:
-                                resolved_uid_count += 1
+                                alternate_uid_count += 1
+                        if not fid:
+                            profile = resolved_profiles_by_uid.get(member_uid)
+                            if profile:
+                                fid = self._extract_profile_fid(profile)
+                                member_uid = self._extract_profile_uid(profile) or member_uid
+                                member_name = member_name or self._extract_profile_name(profile)
+                                castle_level = castle_level or self._extract_profile_castle_level(profile)
+                                member_kingdom = self._extract_profile_kingdom(profile) or member_kingdom
+                                if fid:
+                                    resolved_uid_count += 1
 
                 if not fid:
                     skipped_members.append(member_name or str(member_uid or member.get("id") or "unknown"))
@@ -2633,10 +2744,20 @@ class GiftCodeHandler:
             if players_to_add:
                 await self._player_registry_service.add_registered_players(players_to_add)
 
-            alliance_name = alliance_label or self._extract_alliance_name(payload) or f"Alliance {aid}"
+            alliance_name = self._extract_alliance_name(payload) or alternate_alliance_name or alliance_label or f"Alliance {aid}"
+            if added_players:
+                title = f"✅ Added {len(added_players)} Alliance Member(s)"
+                description = f"Roster imported from **{alliance_name}** in kingdom `{kid}`."
+            else:
+                title = "⚠️ No Governor IDs Available"
+                description = (
+                    f"The roster for **{alliance_name}** in kingdom `{kid}` contains internal IDs, "
+                    "but no connected source supplied Governor IDs. Ask a bot admin to enable "
+                    "the alliance roster source, or use `/addplayer` with Governor IDs."
+                )
             embed = discord.Embed(
-                title=f"✅ Added {len(added_players)} Alliance Member(s)",
-                description=f"Roster imported from **{alliance_name}** in kingdom `{kid}`.",
+                title=title,
+                description=description,
                 color=discord.Color.green() if added_players else discord.Color.orange(),
             )
 
@@ -2659,6 +2780,7 @@ class GiftCodeHandler:
             embed.set_footer(
                 text=(
                     f"UID cache hits: {cached_uid_count} | UID API resolves: {resolved_uid_count} | "
+                    f"Roster source resolves: {alternate_uid_count} | "
                     "Gift redemption uses Governor ID (fid)"
                 )
             )

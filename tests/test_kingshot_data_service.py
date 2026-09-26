@@ -154,7 +154,7 @@ async def test_get_ranked_alliances_orders_by_power_and_resolves_tags():
     finally:
         await service.close()
 
-    assert result == {
+    expected_full = {
         "success": True,
         "status_code": 200,
         "data": [
@@ -183,6 +183,14 @@ async def test_get_ranked_alliances_orders_by_power_and_resolves_tags():
                 "member_count": 1,
             },
             {
+                "aid": 4004,
+                "power": 200,
+                "rank": 4,
+                "abbr": None,
+                "name": None,
+                "member_count": None,
+            },
+            {
                 "aid": 5005,
                 "power": 100,
                 "rank": 5,
@@ -190,13 +198,37 @@ async def test_get_ranked_alliances_orders_by_power_and_resolves_tags():
                 "name": "Fifth",
                 "member_count": 2,
             },
+            {
+                "aid": 6006,
+                "power": 50,
+                "rank": 6,
+                "abbr": None,
+                "name": None,
+                "member_count": 4,
+            },
         ],
         "partial": True,
         "resolution_complete": True,
         "candidate_count": 6,
-        "resolved_count": 4,
+        "resolved_count": 5,
     }
-    assert exhaustive_result == result
+    assert result == {
+        **expected_full,
+        "data": [
+            {
+                "aid": row["aid"],
+                "power": row["power"],
+                "rank": row["rank"],
+                "abbr": None,
+                "name": None,
+                "member_count": None,
+            }
+            for row in expected_full["data"]
+        ],
+        "resolution_complete": False,
+        "resolved_count": 0,
+    }
+    assert exhaustive_result == expected_full
     board_request = next(
         request for request in requests if request.url.path == "/v1/leaderboards/kingdom/1"
     )
@@ -215,6 +247,42 @@ async def test_get_ranked_alliances_orders_by_power_and_resolves_tags():
         "/v1/players/62",
         "/v1/players/65",
     }
+
+
+@pytest.mark.asyncio
+async def test_ranked_alliances_keep_fifteen_aids_when_names_and_tags_are_null():
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/leaderboards/kingdom/1":
+            return httpx.Response(200, json={"entries": [
+                {"rank": index, "uid": 83900000 + index, "score": 1000 - index}
+                for index in range(1, 16)
+            ]})
+        if request.url.path.startswith("/v1/alliances/"):
+            return httpx.Response(200, json={
+                "aid": None,
+                "abbr": None,
+                "name": None,
+                "members": [{"uid": 30000000, "rank": 5}],
+            })
+        if request.url.path == "/v1/players/30000000":
+            return httpx.Response(200, json={"uid": 30000000, "alliance": None})
+        raise AssertionError(request.url.path)
+
+    service = KingshotDataService(api_key="secret", base_url="https://ks.example")
+    service._client = httpx.AsyncClient(
+        base_url="https://ks.example",
+        headers=service._build_headers(),
+        transport=httpx.MockTransport(handle),
+    )
+    try:
+        result = await service.get_ranked_alliances(830, limit=15, exhaustive=True)
+    finally:
+        await service.close()
+
+    assert result["candidate_count"] == len(result["data"]) == 15
+    assert [row["aid"] for row in result["data"]] == [83900000 + index for index in range(1, 16)]
+    assert all(row["abbr"] is None and row["name"] is None for row in result["data"])
+    assert all(row["member_count"] == 1 for row in result["data"])
 
 
 @pytest.mark.asyncio
@@ -301,6 +369,14 @@ async def test_get_ranked_alliances_returns_completed_rows_when_one_resolution_b
             "status_code": 200,
             "data": [
                 {
+                    "aid": 1001,
+                    "power": 500,
+                    "rank": 1,
+                    "abbr": None,
+                    "name": None,
+                    "member_count": None,
+                },
+                {
                     "aid": 2002,
                     "power": 400,
                     "rank": 2,
@@ -341,7 +417,7 @@ async def test_get_ranked_alliances_returns_completed_rows_when_one_resolution_b
                     "name": "Resolved",
                     "member_count": 1,
                 },
-                *result["data"],
+                *result["data"][1:],
             ],
             "partial": False,
             "resolution_complete": True,
@@ -400,7 +476,14 @@ async def test_exhaustive_resolution_finishes_after_per_alliance_lifetime():
         assert exhaustive == {
             "success": True,
             "status_code": 200,
-            "data": [],
+            "data": [{
+                "aid": 1001,
+                "power": 500,
+                "rank": 1,
+                "abbr": None,
+                "name": None,
+                "member_count": None,
+            }],
             "partial": True,
             "resolution_complete": True,
             "candidate_count": 1,

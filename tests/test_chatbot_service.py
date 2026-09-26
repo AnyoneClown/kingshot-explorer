@@ -1,5 +1,10 @@
 import asyncio
+import logging
+import re
+from copy import deepcopy
 from types import SimpleNamespace
+
+import pytest
 
 from services.chatbot_service import ChatbotService
 
@@ -7,17 +12,24 @@ from services.chatbot_service import ChatbotService
 class FakeClient:
     def __init__(self, responses):
         self.model = "nvidia/nemotron-3-ultra-550b-a55b"
+        self.model_kwargs = {"chat_template_kwargs": {"enable_thinking": True, "other_option": "preserved"}}
         self._responses = list(responses)
         self.calls = []
 
-    async def astream(self, messages):
-        self.calls.append({"messages": messages})
+    async def astream(self, messages, **kwargs):
+        self.calls.append({"messages": deepcopy(messages), **kwargs})
         response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
         chunks = response if isinstance(response, list) else [{"content": response}]
         for chunk in chunks:
+            if isinstance(chunk, BaseException):
+                raise chunk
             yield SimpleNamespace(
                 content=chunk.get("content", ""),
                 additional_kwargs=chunk.get("additional_kwargs", {}),
+                response_metadata=chunk.get("response_metadata", {}),
+                usage_metadata=chunk.get("usage_metadata"),
             )
 
 
@@ -252,9 +264,8 @@ def test_generate_contextual_reply_random_candidate_ignores_plain_text_without_j
 
 
 def test_generate_contextual_reply_force_reply_falls_back_when_model_returns_empty_reply():
-    service = ChatbotService(
-        FakeClient(['{"should_reply":false,"reply":""}']),
-    )
+    client = FakeClient(['{"should_reply":false,"reply":""}', '{"should_reply":true,"reply":""}'])
+    service = ChatbotService(client)
 
     result = asyncio.run(
         service.generate_contextual_reply(
@@ -264,4 +275,168 @@ def test_generate_contextual_reply_force_reply_falls_back_when_model_returns_emp
         )
     )
 
-    assert result == "I saw your message, but I need a little more context to answer."
+    assert result == "I couldn't generate a reply just now. Please try again in a moment."
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        "",
+        "   ",
+        [],
+        [{"additional_kwargs": {"reasoning_content": "private reasoning"}}],
+        "<think>unfinished private reasoning",
+        "<think>private reasoning</think>",
+        '{"should_reply":true,"reply":',
+        '{"reply":}',
+        "{}",
+        "[]",
+        "null",
+        '{"should_reply":true,"reply":"   "}',
+        '{"should_reply":false,"reply":""}',
+        '{"should_reply":true,"reply":null}',
+        '{"should_reply":true,"reply":[]}',
+        '{"should_reply":true,"reply":42}',
+    ],
+)
+def test_generate_contextual_reply_retries_unusable_direct_response_with_same_context(first_response):
+    client = FakeClient([first_response, '{"should_reply":true,"reply":"The seaweed one."}'])
+    original_model_kwargs = deepcopy(client.model_kwargs)
+    service = ChatbotService(client)
+
+    result = asyncio.run(
+        service.generate_contextual_reply(
+            "Which do you prefer?",
+            [{"author": "Alice", "content": "We have seaweed and prawn snacks."}],
+            force_reply=True,
+            reply_context={"author": "Bot", "is_bot": True, "content": "Both snacks sound good."},
+        )
+    )
+
+    assert result == "The seaweed one."
+    assert len(client.calls) == 2
+    assert client.calls[0]["messages"] == client.calls[1]["messages"]
+    prompt = client.calls[1]["messages"][1]["content"]
+    assert "Alice: We have seaweed and prawn snacks." in prompt
+    assert "Bot [bot]: Both snacks sound good." in prompt
+    assert 'User: "Which do you prefer?"' in prompt
+    assert "chat_template_kwargs" not in client.calls[0]
+    assert client.calls[1]["chat_template_kwargs"] == {"enable_thinking": False, "other_option": "preserved"}
+    assert client.model_kwargs == original_model_kwargs
+
+
+@pytest.mark.parametrize(
+    "response",
+    ["", '{"reply":}', '{"should_reply":true,"reply":null}', RuntimeError("upstream unavailable")],
+)
+def test_generate_contextual_reply_stops_after_two_failed_attempts(response):
+    client = FakeClient([response, response])
+    service = ChatbotService(client)
+
+    result = asyncio.run(service.generate_contextual_reply("Can you help?", [], force_reply=True))
+
+    assert result == "I couldn't generate a reply just now. Please try again in a moment."
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "",
+        "plain text without a reply decision",
+        '{"should_reply":false,"reply":""}',
+        '{"should_reply":true,"reply":null}',
+        RuntimeError("upstream unavailable"),
+    ],
+)
+def test_generate_contextual_reply_does_not_retry_or_send_failures_for_random_candidates(response):
+    client = FakeClient([response])
+
+    result = asyncio.run(ChatbotService(client).generate_contextual_reply("Maybe?", []))
+
+    assert result is None
+    assert len(client.calls) == 1
+
+
+def test_generate_contextual_reply_retries_stream_error_without_reusing_partial_answer():
+    client = FakeClient(
+        [
+            [{"content": '{"should_reply":true,"reply":"Incomplete'}, RuntimeError("stream interrupted")],
+            '{"should_reply":true,"reply":"Complete answer"}',
+        ]
+    )
+
+    result = asyncio.run(ChatbotService(client).generate_contextual_reply("Can you help?", [], force_reply=True))
+
+    assert result == "Complete answer"
+    assert len(client.calls) == 2
+
+
+def test_generate_contextual_reply_propagates_cancellation_without_retry():
+    client = FakeClient([asyncio.CancelledError()])
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(ChatbotService(client).generate_contextual_reply("Can you help?", [], force_reply=True))
+
+    assert len(client.calls) == 1
+
+
+def test_generate_contextual_reply_logs_stop_reason_and_separate_usage_chunk_without_reasoning(caplog):
+    client = FakeClient(
+        [
+            [
+                {"additional_kwargs": {"reasoning_content": "private reasoning"}},
+                {"response_metadata": {"finish_reason": "length"}},
+                {"usage_metadata": {"input_tokens": 100, "output_tokens": 16384, "total_tokens": 16484}},
+            ],
+            [
+                {"content": '{"should_reply":true,"reply":"Visible answer"}'},
+                {"response_metadata": {"finish_reason": "stop"}},
+                {"usage_metadata": {"input_tokens": 100, "output_tokens": 12, "total_tokens": 112}},
+            ],
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.chatbot_service"):
+        result = asyncio.run(ChatbotService(client).generate_contextual_reply("Can you help?", [], force_reply=True))
+
+    assert result == "Visible answer"
+    summaries = [record.message for record in caplog.records if "ChatNVIDIA stream summary:" in record.message]
+    assert len(summaries) == 2
+    assert "attempt=1 completed=True thinking_disabled=False finish_reason=length" in summaries[0]
+    assert "input_tokens=100 output_tokens=16384 total_tokens=16484" in summaries[0]
+    assert "reasoning_chunks=1 reasoning_chars=17 content_chars=0 answer_chars=0" in summaries[0]
+    assert "attempt=2 completed=True thinking_disabled=True finish_reason=stop" in summaries[1]
+    assert "input_tokens=100 output_tokens=12 total_tokens=112" in summaries[1]
+    assert "reason=empty_response" in caplog.text
+    assert "private reasoning" not in caplog.text
+    request_ids = re.findall(r"request_id=([0-9a-f]+)", caplog.text)
+    assert len(set(request_ids)) == 1
+
+
+def test_generate_contextual_reply_logs_interrupted_stream_with_missing_usage(caplog):
+    client = FakeClient([RuntimeError("stream interrupted"), "Recovered answer"])
+
+    with caplog.at_level(logging.INFO, logger="services.chatbot_service"):
+        result = asyncio.run(ChatbotService(client).generate_contextual_reply("Can you help?", [], force_reply=True))
+
+    assert result == "Recovered answer"
+    assert "attempt=1 completed=False" in caplog.text
+    assert "finish_reason=None input_tokens=None output_tokens=None total_tokens=None" in caplog.text
+    assert "reason=completion_error" in caplog.text
+
+
+def test_generate_contextual_reply_next_request_keeps_default_thinking():
+    client = FakeClient(["", "Recovered answer", "Next answer"])
+    service = ChatbotService(client)
+
+    async def run_requests():
+        first = await service.generate_contextual_reply("Can you help?", [], force_reply=True)
+        second = await service.generate_contextual_reply("Anything else?", [], force_reply=True)
+        return first, second
+
+    assert asyncio.run(run_requests()) == ("Recovered answer", "Next answer")
+    assert len(client.calls) == 3
+    assert "chat_template_kwargs" not in client.calls[2]
+    assert client.model_kwargs["chat_template_kwargs"]["enable_thinking"] is True

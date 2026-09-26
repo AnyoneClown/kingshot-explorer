@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _RankedAllianceBatch:
-    """One reusable leaderboard snapshot and its in-flight tag resolutions."""
+    """One reusable leaderboard snapshot and its in-flight metadata resolutions."""
 
     status_code: Optional[int]
     candidates: list[Dict[str, int]]
@@ -28,7 +28,8 @@ class KingshotDataService:
 
     _ALLIANCE_POWER_BOARD_TYPE = 1
     _ALLIANCE_RESOLUTION_CONCURRENCY = 25
-    _ALLIANCE_RESOLUTION_DEADLINE_SECONDS = 1.5
+    # Discord needs the AID choices before alliance metadata finishes resolving.
+    _ALLIANCE_RESOLUTION_DEADLINE_SECONDS = 0.0
     _ALLIANCE_RESOLVER_MAX_LIFETIME_SECONDS = 10.0
     _ALLIANCE_BATCH_RETENTION_SECONDS = 30.0
 
@@ -118,7 +119,7 @@ class KingshotDataService:
         *,
         exhaustive: bool = False,
     ) -> Dict[str, Any]:
-        """Fetch ranked alliances, optionally waiting for every tag resolution.
+        """Fetch ranked alliances, optionally waiting for every metadata resolution.
 
         Bounded calls retain unfinished work. A prompt exhaustive call with the same
         kingdom and limit reuses that batch instead of repeating its API requests.
@@ -143,7 +144,7 @@ class KingshotDataService:
             if exhaustive:
                 completion = asyncio.gather(*batch.tasks, return_exceptions=True)
                 await asyncio.shield(completion)
-            else:
+            elif self._ALLIANCE_RESOLUTION_DEADLINE_SECONDS > 0:
                 await asyncio.wait(
                     batch.tasks,
                     timeout=self._ALLIANCE_RESOLUTION_DEADLINE_SECONDS,
@@ -291,28 +292,29 @@ class KingshotDataService:
     @staticmethod
     def _ranked_alliance_batch_result(batch: _RankedAllianceBatch) -> Dict[str, Any]:
         """Build a backward-compatible envelope with resolution progress metadata."""
-        resolved = []
-        for task in batch.tasks:
-            if not task.done() or task.cancelled():
-                continue
-            try:
-                alliance = task.result()
-            except Exception:
-                continue
+        alliances = []
+        resolved_count = 0
+        for candidate, task in zip(batch.candidates, batch.tasks, strict=True):
+            alliance = None
+            if task.done() and not task.cancelled():
+                try:
+                    alliance = task.result()
+                except Exception:
+                    pass
             if alliance is not None:
-                resolved.append(alliance)
+                resolved_count += 1
+            alliances.append(alliance or KingshotDataService._ranked_alliance(candidate, None, None, None))
 
-        alliances = resolved
         alliances.sort(key=lambda alliance: (-alliance["power"], alliance["rank"], alliance["aid"]))
         resolution_complete = all(task.done() for task in batch.tasks)
         return {
             "success": True,
             "status_code": batch.status_code,
             "data": alliances,
-            "partial": len(alliances) < len(batch.candidates),
+            "partial": resolved_count < len(batch.candidates),
             "resolution_complete": resolution_complete,
             "candidate_count": len(batch.candidates),
-            "resolved_count": len(alliances),
+            "resolved_count": resolved_count,
         }
 
     async def _resolve_ranked_alliance(
@@ -340,9 +342,10 @@ class KingshotDataService:
         payload_aid = self._positive_int(payload.get("aid"))
         if tag is not None and (payload_aid is None or payload_aid == aid):
             return self._ranked_alliance(candidate, tag, payload.get("name"), member_count)
+        fallback_name = payload.get("name") if payload_aid is None or payload_aid == aid else None
 
         if not isinstance(members, list):
-            return None
+            return self._ranked_alliance(candidate, None, fallback_name, None)
 
         ordered_members = [
             *(member for member in readable_members if self._positive_int(member.get("rank")) == 5),
@@ -369,14 +372,14 @@ class KingshotDataService:
             tag = self._alliance_tag(alliance.get("abbr"))
             if tag is not None:
                 return self._ranked_alliance(candidate, tag, alliance.get("name"), member_count)
-        return None
+        return self._ranked_alliance(candidate, None, fallback_name, member_count)
 
     @staticmethod
     def _ranked_alliance(
         candidate: Dict[str, int],
-        tag: str,
+        tag: Optional[str],
         name: Any,
-        member_count: int,
+        member_count: Optional[int],
     ) -> Dict[str, Any]:
         readable_name = name.strip() if isinstance(name, str) and name.strip() else None
         return {

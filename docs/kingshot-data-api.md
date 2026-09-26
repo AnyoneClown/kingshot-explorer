@@ -60,6 +60,12 @@ Important response behavior:
 - Privacy settings can hide fields such as VIP, gear, or profile details.
 - Power may appear as top-level `power`, or in `stats["8"]` for sparse responses.
 
+`/stats` and `/addplayer` resolve the in-game Governor ID with
+`GET /v1/players/by-fid/{fid}`. The old Century Games `/api/player` lookup has been
+removed, so it is not used for profiles. `/stats` reuses that modern profile for power,
+alliance, and arena lookups. An explicit `fid not found` is reported as missing; a
+gateway failure is reported as a temporary lookup problem.
+
 ### Gift-code kingdom resolution
 
 Gift-code redemption uses the in-game Governor ID as `fid`, but the Century Games
@@ -130,6 +136,39 @@ Current lean roster entries may contain only:
 ```
 
 Future responses may include `fid`; `/addalliance` should use `fid` when present because gift code redemption needs Governor ID, not internal `uid`.
+
+As observed for kingdom 830 on 2026-09-25, the alliance board returned 15 AIDs, while
+the alliance summary had null `abbr` and `name`, and a member lookup by UID had null
+`fid`. AID-only autocomplete lets users select a record but does not identify the
+alliance. The bot now reads the [public MightPulse kingdom view](https://mightpulse.com/kingdom/830)
+through its `/api/kingdoms/{kid}?players=1&alliances=100` JSON endpoint. The public
+view requires no API key. Every returned alliance row must match the requested kingdom
+and have a positive AID and nonempty name. Autocomplete shows `[TAG] Name` and retains
+the AID as the Discord choice value. The selected roster's AID is checked before import.
+The public directory may lag the game, so an alliance can have an older name or rank;
+the AID keeps the selected identity stable. The bot caches named choices for ten minutes.
+
+If the public directory fails, the bot falls back to the KingShot alliance board and
+retains its AIDs as autocomplete choices even when names or tags are null. Those fallback
+choices display the AID. It returns the choices as soon as the leaderboard arrives while
+metadata resolution continues in the background. Waiting for metadata after the board
+previously consumed Discord's autocomplete response window and caused an empty selector.
+If the leaderboard itself takes longer than the response window, the selector displays a
+loading choice; reopen the alliance field shortly after the shared lookup finishes.
+
+The public directory supplies alliance names, not a Governor-ID roster. For uncached
+roster UIDs without `fid`, the bot can optionally use
+[MightPulse's API](https://api.mightpulse.com/) for a Governor-ID-bearing roster.
+Configure `MIGHTPULSE_API_KEY` (and optionally `MIGHTPULSE_API_BASE_URL`). The bot finds
+the AID in MightPulse's kingdom alliance-power ranks, fetches that alliance's tagged
+roster, verifies the returned AID and kingdom, then joins members **only by UID** to the
+current KingShot Data API roster. MightPulse's documented data may be up to one hour old;
+stale extra members cannot be imported because their UIDs are absent from the current
+roster. Unmatched current members are tried through the local UID cache and KingShot
+profile endpoint. When no source yields Governor IDs, `/addalliance` reports that no
+members were imported instead of claiming success. Without a MightPulse key, imports
+still work for members whose FIDs are already in the local cache or supplied by the
+KingShot Data API.
 
 ## Arena Endpoint
 
@@ -309,10 +348,30 @@ These are server-side variables for the API service itself. The bot normally onl
 
 Current project usage:
 
-- `/stats` uses the default KingShot API for the profile image, then enriches fields from `GET /v1/players/by-fid/{fid}`.
+- `/stats` uses `GET /v1/players/by-fid/{fid}` as its profile source and reuses the response for the stats card.
 - `/scout` uses `GET /v1/leaderboards/kingdom/20?kid={kid}&limit={limit}&resolve=true`, then resolves player profiles with `GET /v1/players/{uid}` (or `GET /v1/players/by-fid/{fid}` when only a Governor ID is available). Profiles are reused across the summary, selector, and stats-style detail cards in one message. The command defaults to 5 players and caps the limit at 15.
 - `/alliance` power tracking loads `GET /v1/alliances/{aid}?kid={kid}` and resolves roster UIDs through `GET /v1/players/{uid}`, with at most five profile requests in flight per capture. It stores one complete daily UTC snapshot of member power and reuses the stored data when browsing reports. Missing power, inconsistent identities, duplicate UIDs, and explicitly incomplete rosters reject the capture; missing data is never counted as zero.
-- `/addalliance kid:<kid> alliance:<tag>` loads alliance-power leaderboard type `1`, resolves each ranked alliance's three-character tag and full name from its roster, and exposes the top 15 as native Discord autocomplete choices ordered by power. Each choice is displayed as `[TAG] Name - N members` and carries `aid` as its hidden value. Ready choices can be returned within Discord's short autocomplete deadline while unresolved entries continue loading from the same request batch; only the completed snapshot receives the normal ten-minute cache lifetime. After selection, the bot loads `/v1/alliances/{aid}?kid={kid}`; roster UIDs are resolved through the local cache or player endpoint when no `fid` is present.
+- `/addalliance kid:<kid> alliance:<choice>` loads the public MightPulse kingdom directory for named top-15 alliances. The AID is the choice value; labels use `[TAG] Name - N members`. If the directory fails, it uses KingShot alliance-power leaderboard type `1` and displays AID fallback labels for missing names. A slow fallback leaderboard shows a temporary loading choice and keeps the lookup running. After selection, the bot loads `/v1/alliances/{aid}?kid={kid}` and resolves Governor IDs from direct roster fields, the local UID cache, the optional key-protected MightPulse roster, or player profiles.
+
+Verification: mocked tests cover the 15-AID/null-tag response, AID autocomplete and
+selection, the modern Governor-ID profile, cross-source UID joining and alliance
+identity validation, and truthful zero-import reporting. A live read-only probe of
+kingdom 830 confirmed 15 board entries, null alliance tag/name, and null `fid` on a
+member's UID profile; a by-fid profile lookup returned full identity fields. The
+autocomplete regression test blocks metadata beyond Discord's response window and
+checks that all 15 AID choices return after the leaderboard. The bot log also showed
+a 2.40-second autocomplete timeout on a cold lookup before this timing fix. The
+deployed handler returned all 15 kingdom 830 choices in 0.58 seconds in a live
+read-only probe. A separate slow-board probe returned the temporary loading choice
+at 2.40 seconds while its lookup continued. The MightPulse integration was tested
+against its published contract with mock responses;
+no MightPulse key is configured in this workspace for a live end-to-end import.
+
+On 2026-09-25, the public MightPulse kingdom endpoint returned names and tags for all
+15 AIDs in the KingShot kingdom 830 board, in the same order. A live read-only directory
+probe returned `[KOR] Serendipity`, `[FFL] FireLeague`, and `[FKA] FateKillsAll` among
+the choices in 0.46 seconds. Mocked tests cover source identity checks, named choice
+labels, and fallback to the KingShot board when the directory fails.
 
 ## Client Etiquette
 

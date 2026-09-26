@@ -189,7 +189,7 @@ Gift code related commands include:
 
 - /redeem
 - /addplayer
-- `/addalliance kid:<id> alliance:<tag>` (top 15 by power, shown as `[TAG] Name - N members`)
+- `/addalliance kid:<id> alliance:<choice>` (top 15 by power with names from MightPulse's public kingdom view; AIDs remain the choice values and appear as fallback labels when names are unavailable)
 - /removeplayer
 - /listplayers
 - /playerlist (alias)
@@ -286,6 +286,10 @@ Contextual replies use `langchain-nvidia-ai-endpoints` with `ChatNVIDIA.astream(
 the `NVIDIA_CHAT_MODEL`. The default is `nvidia/nemotron-3-ultra-550b-a55b` with thinking
 enabled, temperature `1`, top-p `0.95`, and a 16,384-token completion ceiling. Internal
 reasoning chunks are discarded; only final answer content is parsed and posted to Discord.
+Direct mentions and replies get one retry with thinking disabled if generation fails
+or returns no usable answer. If both attempts fail, the bot reports a generation failure
+instead of asking for more context. Stream summaries log stop reasons and token usage
+for diagnosis. See [contextual chat recovery](docs/contextual-chat.md) for details.
 `NVIDIA_MODEL` remains the model setting for translation and KingShot RAG requests.
 The chat persona favors concise, context-specific dry humor and playful sarcasm while
 avoiding hostile teasing, sensitive topics, and generic bot-like filler.

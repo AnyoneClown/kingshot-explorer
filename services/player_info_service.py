@@ -2,7 +2,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
-from services.kingshot_api import KingshotAPIClient
+from services.kingshot_data_service import KingshotDataService
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +17,10 @@ class IPlayerInfoService(ABC):
 
 
 class PlayerInfoService(IPlayerInfoService):
-    """Service responsible for fetching player information from external API."""
+    """Resolve in-game Governor IDs through the KingShot Data API."""
 
-    def __init__(self):
-        """
-        Initialize player info service.
-        """
-        logger.info("PlayerInfoService initialized using original Kingshot API")
+    def __init__(self, kingshot_data_service: KingshotDataService):
+        self._kingshot_data_service = kingshot_data_service
 
     async def get_player_info(self, player_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -33,45 +30,37 @@ class PlayerInfoService(IPlayerInfoService):
             player_id: The player ID to look up
 
         Returns:
-            Dictionary containing player information, or None if request failed
+            Dictionary containing player information, or None when the ID is unknown.
         """
-        logger.info(f"Fetching player info for ID: {player_id}")
-        try:
-            async with KingshotAPIClient() as client:
-                response = await client.get_player(player_id)
-                # Success response should have code 0
-                if response.get("code") == 0:
-                    raw_data = response.get("data", {})
-                    if raw_data:
-                        # Normalize to old format to minimize handler changes
-                        player_data = {
-                            "name": raw_data.get("nickname"),
-                            "playerId": str(raw_data.get("fid", player_id)),
-                            "playerUid": str(raw_data.get("uid")) if raw_data.get("uid") is not None else None,
-                            "level": raw_data.get("stove_lv"),
-                            "kingdom": raw_data.get("kid"),
-                            "profilePhoto": raw_data.get("avatar_image"),
-                        }
-                        logger.info(
-                            f"Successfully fetched player info for ID {player_id}: "
-                            f"{player_data.get('name', 'Unknown')} (Kingdom {player_data.get('kingdom', 'N/A')})"
-                        )
-                    else:
-                        player_data = {}
-                        logger.warning(f"API returned code 0 but no data for player ID: {player_id}")
-                    return player_data
-                elif response.get("err_code") == 40004 or "not exist" in str(response.get("msg", "")).lower():
-                    logger.warning(f"Player not found: {player_id}")
-                    return None
-                else:
-                    logger.error(f"API error for player {player_id}: {response}")
-                    return None
-        except Exception as e:
-            logger.error(
-                f"Unexpected error fetching player info for {player_id}: {e}",
-                exc_info=True,
+        logger.info("Fetching player info for Governor ID %s", player_id)
+        response = await self._kingshot_data_service.get_player_by_fid(player_id)
+        if not response.get("success"):
+            raise PlayerInfoUnavailableError(
+                response.get("error_message") or "KingShot Data API request failed"
             )
+
+        profile = response.get("data")
+        if not isinstance(profile, dict):
+            raise PlayerInfoUnavailableError("KingShot Data API returned an invalid player profile")
+        if profile.get("error") == "fid not found":
             return None
+        if profile.get("error"):
+            raise PlayerInfoUnavailableError(str(profile["error"]))
+        if not profile.get("uid"):
+            raise PlayerInfoUnavailableError("KingShot Data API returned an incomplete player profile")
+
+        avatar = profile.get("avatar_image") or profile.get("avatar_url")
+        player_data = {
+            "name": profile.get("name") or f"Player {player_id}",
+            "playerId": str(profile.get("fid") or player_id),
+            "playerUid": str(profile["uid"]),
+            "level": profile.get("stove_lv") if profile.get("stove_lv") is not None else profile.get("lv"),
+            "kingdom": profile.get("kid"),
+            "profilePhoto": avatar if isinstance(avatar, str) and avatar.startswith(("https://", "http://")) else None,
+            "_profile": profile,
+        }
+        logger.info("Resolved Governor ID %s in kingdom %s", player_id, player_data["kingdom"])
+        return player_data
 
     def format_player_stats(self, player_data: Dict[str, Any]) -> str:
         """
@@ -111,3 +100,7 @@ class PlayerInfoService(IPlayerInfoService):
             lines.append(f"🌍 **Kingdom:** {player_data['kingdom']}")
 
         return "\n".join(lines)
+
+
+class PlayerInfoUnavailableError(RuntimeError):
+    """The profile lookup failed for a reason other than an unknown Governor ID."""

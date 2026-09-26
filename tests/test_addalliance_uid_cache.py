@@ -95,7 +95,7 @@ class FakeKingshotDataService:
         return {"success": True, "data": profile}
 
 
-def build_handler(registry, kingshot):
+def build_handler(registry, kingshot, mightpulse=None):
     return GiftCodeHandler(
         gift_code_service=SimpleNamespace(),
         player_info_service=SimpleNamespace(),
@@ -104,6 +104,7 @@ def build_handler(registry, kingshot):
         interaction_tracking_service=FakeTrackingService(),
         player_registry_service=registry,
         kingshot_data_service=kingshot,
+        mightpulse_service=mightpulse,
     )
 
 
@@ -246,3 +247,83 @@ def test_addalliance_reenables_cached_disabled_player():
             "enabled": True,
         }
     ]
+
+
+def test_addalliance_uses_external_governor_ids_only_for_current_roster_uids():
+    class FakeMightPulse:
+        def __init__(self):
+            self.calls = []
+
+        async def get_alliance_roster_by_aid(self, kid, aid):
+            self.calls.append((kid, aid))
+            return {
+                "name": "Known Alliance",
+                "members_by_uid": {
+                    "30669791": {
+                        "uid": 30669791,
+                        "governor_id": 123456789,
+                        "nick_name": "Known Governor",
+                        "town_center_level": 30,
+                        "kid": 830,
+                    },
+                    "99999999": {"uid": 99999999, "governor_id": 999999999, "kid": 830},
+                },
+            }
+
+    provider = FakeMightPulse()
+    registry = FakeRegistryService()
+    kingshot = FakeKingshotDataService(
+        alliance_payload={
+            "aid": None,
+            "name": None,
+            "members": [{"uid": 30669791, "rank": 4}, {"uid": 30669792, "rank": 3}],
+        }
+    )
+    handler = build_handler(registry, kingshot, provider)
+    interaction = FakeInteraction()
+
+    asyncio.run(handler._handle_add_alliance_slash(interaction, aid="83900009", kid=830))
+
+    assert provider.calls == [(830, "83900009")]
+    assert kingshot.player_calls == ["30669792"]
+    assert registry.added_players == [{
+        "player_id": "123456789",
+        "added_by_user_id": 111,
+        "player_uid": "30669791",
+        "player_name": "Known Governor",
+        "kingdom": "830",
+        "castle_level": "30",
+        "enabled": True,
+    }]
+    assert "Known Alliance" in interaction.followup.sent_embed.description
+    assert "1 member(s) could not be mapped" in interaction.followup.sent_embed.fields[-1].value
+
+
+def test_addalliance_reports_missing_governor_ids_without_claiming_success():
+    registry = FakeRegistryService()
+    kingshot = FakeKingshotDataService(
+        alliance_payload={"members": [{"uid": 30669791, "rank": 4}]}
+    )
+    handler = build_handler(registry, kingshot)
+    interaction = FakeInteraction()
+
+    asyncio.run(handler._handle_add_alliance_slash(interaction, aid="83900009", kid=830))
+
+    assert registry.added_players == []
+    assert interaction.followup.sent_embed.title == "⚠️ No Governor IDs Available"
+    assert "`/addplayer`" in interaction.followup.sent_embed.description
+
+
+def test_addalliance_rejects_mismatched_alliance_payload():
+    registry = FakeRegistryService()
+    kingshot = FakeKingshotDataService(
+        alliance_payload={"aid": 83900010, "members": [{"uid": 30669791, "fid": 123456789}]}
+    )
+    interaction = FakeInteraction()
+
+    asyncio.run(build_handler(registry, kingshot)._handle_add_alliance_slash(
+        interaction, aid="83900009", kid=830,
+    ))
+
+    assert registry.added_players == []
+    assert "does not match" in interaction.followup.sent_embed.description

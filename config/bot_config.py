@@ -35,6 +35,8 @@ class BotConfig:
     ks_data_api_key: str | None = None
     ks_data_base_url: str = "https://ks.jeab.dev"
     ks_data_timeout_seconds: int = 30
+    mightpulse_api_key: str | None = None
+    mightpulse_base_url: str = "https://api.mightpulse.com"
     admin_user_ids: set = None
     banned_players: set = None
     auto_redeem_channels: set = None
@@ -157,6 +159,8 @@ class BotConfig:
             ks_data_api_key=os.getenv("KS_DATA_API_KEY"),
             ks_data_base_url=os.getenv("KS_DATA_API_BASE_URL", "https://ks.jeab.dev"),
             ks_data_timeout_seconds=int(os.getenv("KS_DATA_TIMEOUT_SECONDS", "30")),
+            mightpulse_api_key=os.getenv("MIGHTPULSE_API_KEY"),
+            mightpulse_base_url=os.getenv("MIGHTPULSE_API_BASE_URL", "https://api.mightpulse.com"),
             admin_user_ids=admin_user_ids,
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,

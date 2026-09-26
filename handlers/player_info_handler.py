@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from services.player_info_service import IPlayerInfoService
+from services.player_info_service import IPlayerInfoService, PlayerInfoUnavailableError
 from services.interaction_tracking_service import InteractionTrackingService
 from services.kingshot_data_service import KingshotDataService
 from handlers.ui import EmbedColors, OwnedView
@@ -201,7 +201,9 @@ class PlayerInfoHandler:
         try:
             # Fetch player info
             player_data = await self._player_info_service.get_player_info(player_id)
-            ks_data = await self._get_kingshot_data_player(player_id)
+            ks_data = player_data.get("_profile") if player_data else None
+            if player_data and not isinstance(ks_data, dict):
+                ks_data = await self._get_kingshot_data_player(player_id)
 
             if player_data is None:
                 logger.warning(f"Player {player_id} not found for request by {user_info}")
@@ -284,6 +286,15 @@ class PlayerInfoHandler:
             except Exception as db_error:
                 logger.error(f"Database tracking error: {db_error}", exc_info=True)
 
+        except PlayerInfoUnavailableError as e:
+            logger.warning("Player lookup unavailable for Governor ID %s: %s", player_id, e)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Player Lookup Unavailable",
+                    description="The player data service could not complete this lookup. Please try again later.",
+                    color=EmbedColors.ERROR,
+                )
+            )
         except Exception as e:
             logger.error(
                 f"Error handling stats command for player {player_id} by {user_info}: {e}",

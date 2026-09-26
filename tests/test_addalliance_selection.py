@@ -10,6 +10,8 @@ import pytest
 from discord.ext import commands
 
 from handlers.gift_code_handler import GiftCodeHandler
+from services.kingshot_data_service import KingshotDataService
+from services.mightpulse_service import MightPulseUnavailableError
 
 
 class FakeResponse:
@@ -118,7 +120,7 @@ def _alliances(count):
     ]
 
 
-def _build_handler(service, *, bot=None):
+def _build_handler(service, *, bot=None, directory=None):
     return GiftCodeHandler(
         gift_code_service=SimpleNamespace(),
         player_info_service=SimpleNamespace(),
@@ -127,6 +129,7 @@ def _build_handler(service, *, bot=None):
         interaction_tracking_service=SimpleNamespace(),
         player_registry_service=SimpleNamespace(),
         kingshot_data_service=service,
+        alliance_directory_service=directory,
     )
 
 
@@ -249,10 +252,11 @@ async def test_autocomplete_orders_by_power_filters_case_insensitively_and_hides
     choices = await handler._get_alliance_autocomplete_choices(830, "")
     assert [(choice.name, choice.value) for choice in choices] == [
         (_label("FKA", "Fate Kills All", 88), "83900001"),
+        ("Alliance 83900004 - ? members", "83900004"),
         (_label("aBc", "Alpha Beta Coalition", 64), "83900002"),
         (_label("car", "Carpathian Guard", 73), "83900003"),
     ]
-    assert all(choice.value not in choice.name for choice in choices)
+    assert all(choice.value not in choice.name for choice in choices if choice.value != "83900004")
 
     by_name = await handler._get_alliance_autocomplete_choices(830, "KILLS")
     assert [(choice.name, choice.value) for choice in by_name] == [
@@ -263,6 +267,128 @@ async def test_autocomplete_orders_by_power_filters_case_insensitively_and_hides
     assert [(choice.name, choice.value) for choice in by_tag] == [
         (_label("aBc", "Alpha Beta Coalition", 64), "83900002")
     ]
+
+
+@pytest.mark.asyncio
+async def test_named_directory_populates_alliance_choices_without_a_jeab_name():
+    directory = SimpleNamespace(get_ranked_alliances=AsyncMock(return_value=_result(
+        {"aid": 83900004, "abbr": "KOR", "name": "Serendipity",
+         "member_count": 98, "power": 300, "rank": 1},
+        {"aid": 83900009, "abbr": "FKA", "name": "FateKillsAll",
+         "member_count": 93, "power": 200, "rank": 2},
+    )))
+    service = FakeRankedAllianceService(_result())
+    handler = _build_handler(service, directory=directory)
+
+    choices = await handler._get_alliance_autocomplete_choices(830, "")
+
+    assert [(choice.name, choice.value) for choice in choices] == [
+        ("[KOR] Serendipity - 98 members", "83900004"),
+        ("[FKA] FateKillsAll - 93 members", "83900009"),
+    ]
+    assert handler._alliance_cache[830][2] is True
+    assert service.calls == []
+    directory.get_ranked_alliances.assert_awaited_once_with(830, limit=15)
+
+    handler._handle_add_alliance_slash = AsyncMock()
+    interaction = FakeInteraction()
+    await handler._handle_add_alliance_choice_slash(interaction, 830, choices[1].value)
+    handler._handle_add_alliance_slash.assert_awaited_once_with(
+        interaction,
+        aid="83900009",
+        kid=830,
+        defer_response=False,
+        alliance_label="FKA",
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_directory_failure_falls_back_to_kingshot_leaderboard():
+    directory = SimpleNamespace(get_ranked_alliances=AsyncMock(
+        side_effect=MightPulseUnavailableError("offline")
+    ))
+    service = FakeRankedAllianceService(_result(
+        {"aid": 83900004, "abbr": None, "name": None, "power": 300, "rank": 1}
+    ))
+    handler = _build_handler(service, directory=directory)
+
+    choices = await handler._get_alliance_autocomplete_choices(830, "")
+
+    assert [(choice.name, choice.value) for choice in choices] == [
+        ("Alliance 83900004 - ? members", "83900004")
+    ]
+    assert service.calls == [(830, 15, False)]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_and_selection_work_with_aid_only_alliances():
+    service = FakeRankedAllianceService(_result(*[
+        {
+            "aid": 83900000 + index,
+            "abbr": None,
+            "name": None,
+            "member_count": 90 - index,
+            "power": 1000 - index,
+            "rank": index,
+        }
+        for index in range(1, 16)
+    ]))
+    handler = _build_handler(service)
+
+    choices = await handler._get_alliance_autocomplete_choices(830, "")
+    assert len(choices) == 15
+    assert choices[0].name == "Alliance 83900001 - 89 members"
+    assert choices[0].value == "83900001"
+    assert [choice.value for choice in await handler._get_alliance_autocomplete_choices(830, "83900015")] == ["83900015"]
+
+    handler._handle_add_alliance_slash = AsyncMock()
+    interaction = FakeInteraction()
+    await handler._handle_add_alliance_choice_slash(interaction, 830, choices[0].value)
+    handler._handle_add_alliance_slash.assert_awaited_once_with(
+        interaction,
+        aid="83900001",
+        kid=830,
+        defer_response=False,
+        alliance_label="Alliance 83900001",
+    )
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_returns_aids_before_slow_metadata_exceeds_discord_budget():
+    class SlowMetadataService(KingshotDataService):
+        def __init__(self):
+            super().__init__(api_key="test")
+            self.release = asyncio.Event()
+
+        async def get_kingdom_board(self, board_type, kid, limit=100, resolve=False):
+            await asyncio.sleep(0.02)
+            return {"success": True, "data": {"entries": [
+                {"rank": rank, "uid": 83900000 + rank, "score": 1000 - rank}
+                for rank in range(1, 16)
+            ]}}
+
+        async def _resolve_ranked_alliance(self, candidate, kid):
+            await self.release.wait()
+            return self._ranked_alliance(candidate, "FKA", "Later", 90)
+
+    service = SlowMetadataService()
+    handler = _build_handler(service)
+    handler.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS = 0.5
+
+    try:
+        choices = await asyncio.wait_for(
+            handler._get_alliance_autocomplete_choices(830, ""),
+            timeout=0.2,
+        )
+        assert len(choices) == 15
+        assert choices[0].name.startswith("Alliance 83900001")
+        assert handler._alliance_cache[830][2] is False
+    finally:
+        service.release.set()
+        completion = handler._alliance_completion_tasks.get(830)
+        if completion is not None:
+            await completion
+        await service.close()
 
 
 @pytest.mark.asyncio
@@ -376,9 +502,11 @@ async def test_empty_partial_preview_uses_existing_completion_without_new_previe
     handler = _build_handler(service)
     handler.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS = 0.01
 
-    assert await handler._get_alliance_autocomplete_choices(830, "") == []
+    loading = await handler._get_alliance_autocomplete_choices(830, "")
+    assert [choice.value for choice in loading] == ["loading:830"]
     await asyncio.wait_for(service.completion_started.wait(), timeout=0.5)
-    assert await handler._get_alliance_autocomplete_choices(830, "") == []
+    loading_again = await handler._get_alliance_autocomplete_choices(830, "")
+    assert [choice.value for choice in loading_again] == ["loading:830"]
     assert service.calls == [(830, 15, False), (830, 15, True)]
 
     service.release_completion.set()
@@ -490,7 +618,8 @@ async def test_autocomplete_timeout_does_not_cancel_shared_lookup(caplog):
     handler = _build_handler(service)
     handler.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS = 0.01
 
-    assert await handler._get_alliance_autocomplete_choices(830, "") == []
+    loading = await handler._get_alliance_autocomplete_choices(830, "")
+    assert [choice.value for choice in loading] == ["loading:830"]
     refresh = handler._alliance_refresh_tasks[830]
     assert not refresh.done()
     assert not refresh.cancelled()
@@ -539,6 +668,20 @@ async def test_submission_accepts_hidden_aid_or_exact_manual_tag(selection):
         defer_response=False,
         alliance_label="FKA",
     )
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_submission_of_loading_choice_asks_user_to_reopen_list():
+    service = FakeRankedAllianceService(_result())
+    handler = _build_handler(service)
+    handler._handle_add_alliance_slash = AsyncMock()
+    interaction = FakeInteraction()
+
+    await handler._handle_add_alliance_choice_slash(interaction, 830, "loading:830")
+
+    handler._handle_add_alliance_slash.assert_not_awaited()
+    assert "Still Loading" in interaction.followup.messages[0]["embed"].title
     assert service.calls == []
 
 

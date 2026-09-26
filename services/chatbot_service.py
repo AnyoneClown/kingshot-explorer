@@ -3,8 +3,10 @@
 import json
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
@@ -29,7 +31,7 @@ class IChatbotService(ABC):
 class ChatbotService(IChatbotService):
     """Service responsible for contextual chat replies."""
 
-    _FORCED_REPLY_FALLBACK = "I saw your message, but I need a little more context to answer."
+    _FORCED_REPLY_FALLBACK = "I couldn't generate a reply just now. Please try again in a moment."
 
     def __init__(self, client: ChatNVIDIA, max_chat_response_chars: int = 500):
         self._client = client
@@ -113,7 +115,7 @@ class ChatbotService(IChatbotService):
         if "should_reply" in lower and "reply" in lower:
             return None
 
-        if stripped in {"{}", "[]", "null"}:
+        if stripped.startswith(("{", "[")) or stripped in {"null", "true", "false"}:
             return None
 
         return stripped
@@ -142,23 +144,75 @@ class ChatbotService(IChatbotService):
             return ""
         return cleaned.strip()
 
-    async def _create_completion(self, messages: List[Dict[str, str]]) -> str:
+    async def _create_completion(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        request_id: str,
+        attempt: int,
+    ) -> str:
         """Stream a ChatNVIDIA response asynchronously and collect final content only."""
         content_parts: list[str] = []
+        chunks = 0
         reasoning_chunks = 0
+        reasoning_chars = 0
+        finish_reason = None
+        usage: dict[str, int] = {}
+        response_text = ""
+        completed = False
+        started_at = time.monotonic()
+        stream_kwargs: dict[str, Any] = {}
 
-        async for chunk in self._client.astream(messages):
-            additional_kwargs = getattr(chunk, "additional_kwargs", None)
-            if isinstance(additional_kwargs, dict) and additional_kwargs.get("reasoning_content"):
-                reasoning_chunks += 1
+        if attempt > 1:
+            # Override only this invocation; other concurrent requests keep thinking enabled.
+            model_kwargs = getattr(self._client, "model_kwargs", {}) or {}
+            template_kwargs = dict(model_kwargs.get("chat_template_kwargs") or {})
+            template_kwargs["enable_thinking"] = False
+            stream_kwargs["chat_template_kwargs"] = template_kwargs
 
-            content_parts.append(self._chunk_content_text(getattr(chunk, "content", "")))
+        try:
+            async for chunk in self._client.astream(messages, **stream_kwargs):
+                chunks += 1
+                additional_kwargs = getattr(chunk, "additional_kwargs", None)
+                if isinstance(additional_kwargs, dict) and additional_kwargs.get("reasoning_content"):
+                    reasoning_chunks += 1
+                    reasoning_chars += len(str(additional_kwargs["reasoning_content"]))
 
-        logger.debug(
-            "ChatNVIDIA stream completed; omitted %s internal reasoning chunk(s)",
-            reasoning_chunks,
-        )
-        return self._strip_reasoning_tags("".join(content_parts))
+                content_parts.append(self._chunk_content_text(getattr(chunk, "content", "")))
+                metadata = getattr(chunk, "response_metadata", None)
+                if isinstance(metadata, dict) and metadata.get("finish_reason"):
+                    finish_reason = metadata["finish_reason"]
+                chunk_usage = getattr(chunk, "usage_metadata", None)
+                if isinstance(chunk_usage, dict):
+                    # Usage arrives as cumulative totals, often after the finish-reason chunk.
+                    for key in ("input_tokens", "output_tokens", "total_tokens"):
+                        if chunk_usage.get(key) is not None:
+                            usage[key] = chunk_usage[key]
+
+            response_text = self._strip_reasoning_tags("".join(content_parts))
+            completed = True
+            return response_text
+        finally:
+            logger.info(
+                "ChatNVIDIA stream summary: request_id=%s attempt=%s completed=%s "
+                "thinking_disabled=%s finish_reason=%s input_tokens=%s output_tokens=%s "
+                "total_tokens=%s chunks=%s reasoning_chunks=%s reasoning_chars=%s "
+                "content_chars=%s answer_chars=%s elapsed_seconds=%.2f",
+                request_id,
+                attempt,
+                completed,
+                attempt > 1,
+                finish_reason,
+                usage.get("input_tokens"),
+                usage.get("output_tokens"),
+                usage.get("total_tokens"),
+                chunks,
+                reasoning_chunks,
+                reasoning_chars,
+                sum(len(part) for part in content_parts),
+                len(response_text),
+                time.monotonic() - started_at,
+            )
 
     async def generate_contextual_reply(
         self,
@@ -264,40 +318,74 @@ class ChatbotService(IChatbotService):
             },
         ]
 
-        try:
-            logger.info(
-                "Contextual reply request: force_reply=%s latest_message=%r replied_to=%r recent_context=%r",
-                force_reply,
-                cleaned_message,
-                replied_to_block,
-                history_block,
-            )
-            response_text = await self._create_completion(messages)
-            logger.info("Contextual reply raw model response: %r", response_text)
+        request_id = uuid4().hex[:12]
+        logger.info(
+            "Contextual reply request: request_id=%s force_reply=%s latest_message=%r "
+            "replied_to=%r recent_context=%r",
+            request_id,
+            force_reply,
+            cleaned_message,
+            replied_to_block,
+            history_block,
+        )
+        max_attempts = 2 if force_reply else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response_text = await self._create_completion(messages, request_id=request_id, attempt=attempt)
+                logger.info(
+                    "Contextual reply raw model response: request_id=%s attempt=%s response=%r",
+                    request_id,
+                    attempt,
+                    response_text,
+                )
 
-            payload = self._extract_json_payload(response_text)
-            if not payload:
-                logger.info("Contextual reply skipped: model response did not contain a JSON payload")
-                if force_reply:
-                    plain_reply = self._extract_plain_reply(response_text)
-                    if plain_reply:
-                        final_reply = plain_reply[: self._max_chat_response_chars].rstrip()
-                        logger.info("Contextual reply final plain-text reply: %r", final_reply)
-                        return final_reply
-                return self._FORCED_REPLY_FALLBACK if force_reply else None
+                payload = self._extract_json_payload(response_text)
+                if payload is None:
+                    reply = self._extract_plain_reply(response_text) if force_reply else None
+                    failure_reason = "empty_response" if not response_text else "invalid_json"
+                else:
+                    if not force_reply and payload.get("should_reply") is not True:
+                        logger.info(
+                            "Contextual reply skipped: request_id=%s model decided not to reply",
+                            request_id,
+                        )
+                        return None
+                    reply_value = payload.get("reply")
+                    reply = reply_value.strip() if isinstance(reply_value, str) else None
+                    failure_reason = "empty_or_invalid_reply"
 
-            if not force_reply and not payload.get("should_reply"):
-                logger.info("Contextual reply skipped: model decided not to reply payload=%r", payload)
-                return None
+                if reply:
+                    final_reply = reply[: self._max_chat_response_chars].rstrip()
+                    logger.info(
+                        "Contextual reply final reply: request_id=%s attempt=%s reply=%r",
+                        request_id,
+                        attempt,
+                        final_reply,
+                    )
+                    return final_reply
+            except Exception as exc:
+                failure_reason = "completion_error"
+                logger.warning(
+                    "Contextual reply generation failed: request_id=%s attempt=%s error=%s",
+                    request_id,
+                    attempt,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
 
-            reply = str(payload.get("reply", "")).strip()
-            if not reply:
-                logger.info("Contextual reply skipped: model returned an empty reply payload=%r", payload)
-                return self._FORCED_REPLY_FALLBACK if force_reply else None
+            if attempt < max_attempts:
+                logger.warning(
+                    "Contextual reply retrying without thinking: request_id=%s attempt=%s reason=%s",
+                    request_id,
+                    attempt,
+                    failure_reason,
+                )
 
-            final_reply = reply[: self._max_chat_response_chars].rstrip()
-            logger.info("Contextual reply final JSON reply: %r", final_reply)
-            return final_reply
-        except Exception as exc:
-            logger.error("Contextual reply generation failed: %s", exc, exc_info=True)
-            return self._FORCED_REPLY_FALLBACK if force_reply else None
+        logger.warning(
+            "Contextual reply %s: request_id=%s attempts=%s reason=%s",
+            "using failure fallback" if force_reply else "skipped",
+            request_id,
+            max_attempts,
+            failure_reason,
+        )
+        return self._FORCED_REPLY_FALLBACK[: self._max_chat_response_chars].rstrip() if force_reply else None
