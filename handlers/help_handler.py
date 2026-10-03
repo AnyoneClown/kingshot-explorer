@@ -10,7 +10,7 @@ from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_erro
 
 GROUPS = {
     "Players": (
-        "Look up a Governor ID or browse a kingdom's Mystic Trial leaderboard.",
+        "Look up a Governor ID or internal player UID, or browse a kingdom's Mystic Trial leaderboard.",
         (
             ("stats", "View player", "/stats player_id:123456"),
             ("scout", "Scout kingdom", "/scout kingdom_number:830 limit:5"),

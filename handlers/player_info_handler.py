@@ -165,7 +165,7 @@ class PlayerInfoHandler:
         default_scout_limit = self.SCOUT_DEFAULT_LIMIT
 
         @self._bot.tree.command(name="stats", description="Fetch and display player statistics")
-        @app_commands.describe(player_id="Governor ID / player ID to look up")
+        @app_commands.describe(player_id="Governor ID or internal player UID to look up")
         async def get_player_stats(interaction: discord.Interaction, player_id: str):
             """Fetch and display player statistics."""
             await self._handle_player_stats_slash(interaction, player_id)
@@ -200,7 +200,7 @@ class PlayerInfoHandler:
 
         try:
             # Fetch player info
-            player_data = await self._player_info_service.get_player_info(player_id)
+            player_data = await self._get_stats_player_data(player_id)
             ks_data = player_data.get("_profile") if player_data else None
             if player_data and not isinstance(ks_data, dict):
                 ks_data = await self._get_kingshot_data_player(player_id)
@@ -264,6 +264,7 @@ class PlayerInfoHandler:
                 await self._interaction_tracking_service.track_player_lookup(
                     user_id=interaction.user.id,
                     player_id=resolved_player_id,
+                    player_uid=self._extract_player_uid(player_data, ks_data),
                     player_name=player_name,
                     kingdom=resolved_kingdom,
                     castle_level=resolved_castle_level,
@@ -416,6 +417,40 @@ class PlayerInfoHandler:
         profile = await self._get_kingshot_data_player(str(fid) if fid is not None else None, uid=uid)
         entry["player"] = profile
         return profile
+
+    async def _get_stats_player_data(self, player_id: str) -> dict[str, Any] | None:
+        """Resolve Governor IDs first, then accept internal UIDs for stats."""
+        player_data = await self._player_info_service.get_player_info(player_id)
+        if player_data is not None or self._kingshot_data_service is None:
+            return player_data
+
+        result = await self._kingshot_data_service.get_player(player_id)
+        if not result.get("success"):
+            raise PlayerInfoUnavailableError(
+                result.get("error_message") or "KingShot Data API UID lookup failed"
+            )
+
+        profile = result.get("data")
+        if not isinstance(profile, dict):
+            raise PlayerInfoUnavailableError("KingShot Data API returned an invalid player profile")
+        if profile.get("error") == "uid not found":
+            return None
+        if profile.get("error"):
+            raise PlayerInfoUnavailableError(str(profile["error"]))
+        # Unknown UIDs return an empty profile with no Governor ID.
+        if not profile.get("fid"):
+            return None
+        if not profile.get("uid"):
+            raise PlayerInfoUnavailableError("KingShot Data API returned an incomplete player profile")
+
+        player_data = self._build_player_data_from_kingshot(profile, {}, profile.get("kid"))
+        avatar = profile.get("avatar_image") or profile.get("avatar_url")
+        player_data["profilePhoto"] = (
+            avatar if isinstance(avatar, str) and avatar.startswith(("https://", "http://")) else None
+        )
+        player_data["_profile"] = profile
+        logger.info("Resolved internal UID %s to Governor ID %s", player_id, player_data["playerId"])
+        return player_data
 
     async def _get_kingshot_data_player(
         self, player_id: str | None = None, *, uid: str | None = None,

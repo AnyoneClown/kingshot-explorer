@@ -59,6 +59,7 @@ async def test_stats_renders_modern_profile_without_second_profile_request():
     }
     api = SimpleNamespace(
         get_player_by_fid=AsyncMock(return_value={"success": True, "data": profile}),
+        get_player=AsyncMock(),
         search_leaderboard=AsyncMock(return_value={"success": False}),
         get_arena=AsyncMock(return_value={"success": False}),
     )
@@ -90,6 +91,92 @@ async def test_stats_renders_modern_profile_without_second_profile_request():
     assert fields["Kingdom"] == "830"
     assert fields["Power"] == "123,456,789"
     api.get_player_by_fid.assert_awaited_once_with("123949113")
+    api.get_player.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stats_accepts_uid_and_tracks_canonical_governor_id():
+    profile = {
+        "uid": 100404437,
+        "fid": 402436144,
+        "name": "Chikawa",
+        "kid": 830,
+        "stove_lv": 30,
+        "power": 123456789,
+    }
+    api = SimpleNamespace(
+        get_player_by_fid=AsyncMock(return_value={
+            "success": True, "data": {"fid": 100404437, "error": "fid not found"},
+        }),
+        get_player=AsyncMock(return_value={"success": True, "data": profile}),
+        search_leaderboard=AsyncMock(return_value={"success": False}),
+        get_arena=AsyncMock(return_value={"success": False}),
+    )
+    tracking = SimpleNamespace(track_player_lookup=AsyncMock(), sync_player_metadata=AsyncMock())
+    send = AsyncMock()
+    handler = PlayerInfoHandler(
+        player_info_service=PlayerInfoService(api), bot=object(),
+        interaction_tracking_service=tracking, kingshot_data_service=api,
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=111, name="tester", discriminator="0", display_name="Tester"),
+        guild=None, response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=send),
+    )
+
+    await handler._handle_player_stats_slash(interaction, "100404437")
+
+    send.assert_awaited_once()
+    embed = send.await_args.kwargs["embed"]
+    assert embed.title == "📊 Chikawa"
+    assert {field.name: field.value for field in embed.fields}["Player ID"] == "`402436144`"
+    api.get_player_by_fid.assert_awaited_once_with("100404437")
+    api.get_player.assert_awaited_once_with("100404437")
+    api.search_leaderboard.assert_awaited_once_with(20, "100404437", "830")
+    api.get_arena.assert_awaited_once_with("100404437")
+    assert tracking.track_player_lookup.await_args.kwargs["player_id"] == "402436144"
+    assert tracking.track_player_lookup.await_args.kwargs["player_uid"] == "100404437"
+    assert tracking.track_player_lookup.await_args.kwargs["success"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uid_result, expected_title, tracks_failure", [
+    ({"success": True, "data": {"uid": 999999999999, "fid": None, "name": None}},
+     "❌ Player Not Found", True),
+    ({"success": True, "data": {"error": "uid not found"}}, "❌ Player Not Found", True),
+    ({"success": False, "error_message": "gateway unavailable"},
+     "❌ Player Lookup Unavailable", False),
+    ({"success": True, "data": None}, "❌ Player Lookup Unavailable", False),
+])
+async def test_stats_distinguishes_unknown_uids_from_uid_lookup_failures(
+    uid_result, expected_title, tracks_failure,
+):
+    api = SimpleNamespace(
+        get_player_by_fid=AsyncMock(return_value={
+            "success": True, "data": {"error": "fid not found"},
+        }),
+        get_player=AsyncMock(return_value=uid_result),
+    )
+    tracking = SimpleNamespace(track_player_lookup=AsyncMock())
+    send = AsyncMock()
+    handler = PlayerInfoHandler(
+        player_info_service=PlayerInfoService(api), bot=object(),
+        interaction_tracking_service=tracking, kingshot_data_service=api,
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=111, name="tester", discriminator="0", display_name="Tester"),
+        guild=None, response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=send),
+    )
+
+    await handler._handle_player_stats_slash(interaction, "999999999999")
+
+    send.assert_awaited_once()
+    assert send.await_args.kwargs["embed"].title == expected_title
+    if tracks_failure:
+        assert tracking.track_player_lookup.await_args.kwargs["success"] is False
+    else:
+        tracking.track_player_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
