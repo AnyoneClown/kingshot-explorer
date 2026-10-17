@@ -287,8 +287,11 @@ the `NVIDIA_CHAT_MODEL`. The default is `nvidia/nemotron-3.5-super-vl-120b-a12b`
 enabled, temperature `1`, top-p `0.95`, seed `42`, parallel tool calls enabled, and a
 16,384-token completion ceiling. Internal
 reasoning chunks are discarded; only final answer content is parsed and posted to Discord.
-Direct mentions and replies get one retry with thinking disabled if generation fails
-or returns no usable answer. If both attempts fail, the bot reports a generation failure
+Direct mentions and replies retry with thinking disabled if generation fails or
+returns no usable answer. Temporary provider errors allow up to four attempts with
+2-, 4-, and 8-second backoff; malformed or empty answers allow two attempts. Permanent
+HTTP errors are not retried. Each stream is limited to 30 seconds and the complete
+reply to 60 seconds. If all attempts fail, the bot reports a generation failure
 instead of asking for more context. Stream summaries log stop reasons and token usage
 for diagnosis. See [contextual chat recovery](docs/contextual-chat.md) for details.
 `NVIDIA_MODEL` controls translation and KingShot RAG requests and defaults to the same

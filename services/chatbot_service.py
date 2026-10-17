@@ -1,5 +1,6 @@
 """Service responsible for conversational chat reply generation."""
 
+import asyncio
 import json
 import logging
 import re
@@ -8,6 +9,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from aiohttp import ClientConnectionError
+from httpx import TransportError
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,28 @@ class ChatbotService(IChatbotService):
     """Service responsible for contextual chat replies."""
 
     _FORCED_REPLY_FALLBACK = "I couldn't generate a reply just now. Please try again in a moment."
+    _MAX_DIRECT_ATTEMPTS = 4
+    _PROVIDER_ATTEMPT_TIMEOUT_SECONDS = 30.0
+    _TOTAL_REPLY_TIMEOUT_SECONDS = 60.0
+
+    @staticmethod
+    def _provider_error_status(exc: Exception) -> int | None:
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int):
+            return status
+        # ChatNVIDIA wraps HTTP failures in plain Exception, including JSON-like
+        # error bodies such as {'code': 500} instead of exposing status_code.
+        match = re.search(r"\[(\d{3})\]|[\"'](?:status|status_code|code)[\"']\s*:\s*(\d{3})\b", str(exc))
+        return int(next(value for value in match.groups() if value)) if match else None
+
+    @classmethod
+    def _is_transient_provider_error(cls, exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError, ClientConnectionError, TransportError)):
+            return True
+        status = cls._provider_error_status(exc)
+        if status == 429 or (status is not None and 500 <= status <= 599):
+            return True
+        return any(marker in str(exc).lower() for marker in ("degraded function", "temporarily overloaded"))
 
     def __init__(self, client: ChatNVIDIA, max_chat_response_chars: int = 500):
         self._client = client
@@ -328,10 +353,23 @@ class ChatbotService(IChatbotService):
             replied_to_block,
             history_block,
         )
-        max_attempts = 2 if force_reply else 1
+        max_attempts = self._MAX_DIRECT_ATTEMPTS if force_reply else 1
+        deadline = time.monotonic() + self._TOTAL_REPLY_TIMEOUT_SECONDS
+        completed_attempts = 0
+        failure_reason = "reply_deadline"
         for attempt in range(1, max_attempts + 1):
+            transient_error = False
+            retryable_error = True
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                failure_reason = "reply_deadline"
+                break
+            completed_attempts = attempt
             try:
-                response_text = await self._create_completion(messages, request_id=request_id, attempt=attempt)
+                response_text = await asyncio.wait_for(
+                    self._create_completion(messages, request_id=request_id, attempt=attempt),
+                    timeout=min(self._PROVIDER_ATTEMPT_TIMEOUT_SECONDS, remaining_seconds),
+                )
                 logger.info(
                     "Contextual reply raw model response: request_id=%s attempt=%s response=%r",
                     request_id,
@@ -365,6 +403,9 @@ class ChatbotService(IChatbotService):
                     return final_reply
             except Exception as exc:
                 failure_reason = "completion_error"
+                transient_error = self._is_transient_provider_error(exc)
+                status = self._provider_error_status(exc)
+                retryable_error = transient_error or status is None
                 logger.warning(
                     "Contextual reply generation failed: request_id=%s attempt=%s error=%s",
                     request_id,
@@ -373,19 +414,30 @@ class ChatbotService(IChatbotService):
                     exc_info=True,
                 )
 
-            if attempt < max_attempts:
-                logger.warning(
-                    "Contextual reply retrying without thinking: request_id=%s attempt=%s reason=%s",
-                    request_id,
-                    attempt,
-                    failure_reason,
-                )
+            retry_limit = max_attempts if transient_error else min(max_attempts, 2)
+            if not retryable_error or attempt >= retry_limit:
+                break
+            delay_seconds = 2 ** attempt if transient_error else 0
+            if deadline - time.monotonic() <= delay_seconds:
+                failure_reason = "reply_deadline"
+                break
+            logger.warning(
+                "Contextual reply retrying without thinking: request_id=%s attempt=%s "
+                "reason=%s transient=%s delay_seconds=%s",
+                request_id,
+                attempt,
+                failure_reason,
+                transient_error,
+                delay_seconds,
+            )
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
 
         logger.warning(
             "Contextual reply %s: request_id=%s attempts=%s reason=%s",
             "using failure fallback" if force_reply else "skipped",
             request_id,
-            max_attempts,
+            completed_attempts,
             failure_reason,
         )
         return self._FORCED_REPLY_FALLBACK[: self._max_chat_response_chars].rstrip() if force_reply else None

@@ -6,7 +6,7 @@ translation and KingShot RAG model.
 
 ## Failure handling
 
-Direct mentions and replies to the bot allow at most two generation attempts:
+Direct mentions and replies to the bot normally allow two generation attempts:
 
 1. Use the configured model settings, including thinking mode.
 2. If the stream fails or produces no usable reply, repeat the same prompt and
@@ -23,7 +23,7 @@ Existing recovery of plain-text answers and truncated JSON is retained. Partial
 answers from interrupted streams are discarded before retrying. Cancellation
 propagates without retrying.
 
-If both attempts fail, the bot sends:
+If all permitted attempts fail, the bot sends:
 
 > I couldn't generate a reply just now. Please try again in a moment.
 
@@ -54,9 +54,10 @@ fallback described generation failures as missing context, and the old logs did
 not record the finish reason or token usage. The original upstream cause therefore
 could not be established from those logs.
 
-One retry can recover intermittent failures but cannot guarantee provider
-availability or output quality. A failed direct request can take up to one
-additional generation call. No dependencies or environment settings were added.
+Bounded retries can recover intermittent failures but cannot guarantee provider
+availability or output quality. A failed direct request can make up to three
+additional generation calls within the shared deadline. No dependencies or
+environment settings were added.
 
 ## Verification
 
@@ -102,3 +103,32 @@ A configuration migration does not resolve an unavailable provider deployment.
 
 Migration validation: Ruff and all 221 repository tests passed on 2026-10-17.
 Live provider failures remain separate from passing local request and parsing tests.
+
+## Transient provider failures (2026-10-17)
+
+A real direct mention failed twice with NVIDIA `Failed to generate completions`
+(HTTP 500), even though earlier isolated chat and translation checks had succeeded.
+Synthetic conversation checks also alternated between successful answers and HTTP
+500. A single passing provider check therefore does not establish availability.
+
+Direct replies now retry transient HTTP 429/5xx, degraded-function and overload
+responses, transport errors, and timeouts with 2-, 4-, and 8-second backoff, up to
+four total attempts. The classifier supports both structured SDK status codes and
+ChatNVIDIA's plain exceptions containing bracketed HTTP codes or JSON-like error
+bodies. Permanent HTTP errors such as authentication failures are not retried.
+Empty or malformed answers and unclassified errors retain the two-attempt limit.
+Random reply candidates still make one attempt and stay silent on failure.
+
+Each stream has a 30-second timeout, and all attempts and backoff share one
+60-second time budget. Timed-out streams are cancelled. External cancellation also
+propagates through streaming and backoff. Retries preserve the prompt, selected
+model, request ID, and shared client options; thinking remains disabled after the
+first attempt. No new dependencies or model fallback were added. Persistent
+provider failure can still exhaust the budget and produce the failure message.
+
+Regression tests cover recovery after repeated 500/503/429/degraded/network
+failures, four-attempt exhaustion, permanent error suppression, stream cancellation
+on deadline, cancellation during backoff, unchanged shared options and prompts,
+and single-attempt behavior for random candidates.
+
+On 2026-10-17, Ruff, all 58 contextual-chat tests, and all 237 repository tests passed.

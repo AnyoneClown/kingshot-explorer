@@ -3,6 +3,7 @@ import logging
 import re
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -440,3 +441,110 @@ def test_generate_contextual_reply_next_request_keeps_default_thinking():
     assert len(client.calls) == 3
     assert "chat_template_kwargs" not in client.calls[2]
     assert client.model_kwargs["chat_template_kwargs"]["enable_thinking"] is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Exception("[###] Unknown Error\n{'message': 'Failed to generate completions', 'code': 500}"),
+        Exception("[503] Service unavailable"),
+        Exception('[429] Too many requests'),
+        Exception("[400] DEGRADED function cannot be invoked"),
+        TimeoutError(),
+        ConnectionError("connection reset"),
+    ],
+)
+def test_direct_reply_recovers_from_repeated_transient_errors_with_backoff(monkeypatch, error):
+    sleep = AsyncMock()
+    monkeypatch.setattr("services.chatbot_service.asyncio.sleep", sleep)
+    client = FakeClient([error, error, '{"should_reply":true,"reply":"Recovered answer"}'])
+    original_options = deepcopy(client.model_kwargs)
+    service = ChatbotService(client)
+
+    result = asyncio.run(service.generate_contextual_reply("Please answer", [], force_reply=True))
+
+    assert result == "Recovered answer"
+    assert sleep.await_args_list == [call(2), call(4)]
+    assert len(client.calls) == 3
+    assert all(item["messages"] == client.calls[0]["messages"] for item in client.calls)
+    assert client.calls[2]["chat_template_kwargs"]["enable_thinking"] is False
+    assert client.model_kwargs == original_options
+
+
+def test_direct_reply_stops_after_four_transient_failures(monkeypatch, caplog):
+    sleep = AsyncMock()
+    monkeypatch.setattr("services.chatbot_service.asyncio.sleep", sleep)
+    client = FakeClient([Exception("[500] Internal Server Error")] * 4)
+    service = ChatbotService(client)
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(service.generate_contextual_reply("Please answer", [], force_reply=True))
+
+    assert result == service._FORCED_REPLY_FALLBACK
+    assert len(client.calls) == 4
+    assert sleep.await_args_list == [call(2), call(4), call(8)]
+    assert "attempts=4 reason=completion_error" in caplog.text
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 422])
+def test_direct_reply_does_not_retry_permanent_provider_errors(monkeypatch, status):
+    class ProviderError(Exception):
+        status_code = status
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("services.chatbot_service.asyncio.sleep", sleep)
+    client = FakeClient([ProviderError("request rejected")])
+    service = ChatbotService(client)
+
+    result = asyncio.run(service.generate_contextual_reply("Please answer", [], force_reply=True))
+
+    assert result == service._FORCED_REPLY_FALLBACK
+    assert len(client.calls) == 1
+    sleep.assert_not_awaited()
+
+
+def test_direct_reply_cancels_slow_stream_when_time_budget_is_exhausted(caplog):
+    class SlowClient:
+        model = "slow-test-model"
+        cancelled = False
+
+        async def astream(self, messages, **kwargs):
+            try:
+                await asyncio.sleep(1)
+                yield SimpleNamespace(content="too late")
+            finally:
+                self.cancelled = True
+
+    client = SlowClient()
+    service = ChatbotService(client)
+    service._TOTAL_REPLY_TIMEOUT_SECONDS = 0.01
+
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(service.generate_contextual_reply("Please answer", [], force_reply=True))
+
+    assert result == service._FORCED_REPLY_FALLBACK
+    assert client.cancelled
+    assert "attempts=1 reason=reply_deadline" in caplog.text
+
+
+def test_direct_reply_propagates_cancellation_during_backoff(monkeypatch):
+    sleep = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr("services.chatbot_service.asyncio.sleep", sleep)
+    client = FakeClient([Exception("[500] Internal Server Error")])
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(ChatbotService(client).generate_contextual_reply("Please answer", [], force_reply=True))
+
+    assert len(client.calls) == 1
+
+
+def test_random_reply_does_not_retry_transient_provider_errors(monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("services.chatbot_service.asyncio.sleep", sleep)
+    client = FakeClient([Exception("[500] Internal Server Error")])
+
+    result = asyncio.run(ChatbotService(client).generate_contextual_reply("Maybe?", []))
+
+    assert result is None
+    assert len(client.calls) == 1
+    sleep.assert_not_awaited()
