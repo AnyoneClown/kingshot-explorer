@@ -6,7 +6,7 @@ This project has a reusable Kingshot RAG feature backed by CockroachDB and NVIDI
 
 - Embedding provider base URL: `https://integrate.api.nvidia.com/v1`
 - Embedding model: `nvidia/llama-nemotron-embed-1b-v2`
-- Chat model: `openai/gpt-oss-120b`
+- Chat model: `nvidia/nemotron-3.5-super-vl-120b-a12b`
 - Embedding dimension: `2048`
 
 Important: `nvidia/llama-nemotron-embed-1b-v2` is an asymmetric embedding model. NVIDIA requires `input_type`:

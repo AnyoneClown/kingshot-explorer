@@ -96,7 +96,8 @@ class TranslatorBot:
             temperature=1,
             top_p=0.95,
             max_completion_tokens=16384,
-            model_kwargs={"chat_template_kwargs": {"enable_thinking": True}},
+            seed=42,
+            model_kwargs={"chat_template_kwargs": {"enable_thinking": True}, "parallel_tool_calls": True},
         )
         self.chatbot_service = ChatbotService(
             self.nvidia_chat_client,

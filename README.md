@@ -57,8 +57,8 @@ ADMIN_USER_ID=your_discord_user_id
 COCKROACHDB_URL=cockroachdb+asyncpg://postgres:password@host:26257/database-name
 NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
-NVIDIA_MODEL=openai/gpt-oss-120b
-NVIDIA_CHAT_MODEL=nvidia/nemotron-3-ultra-550b-a55b
+NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
+NVIDIA_CHAT_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
 ENABLE_VOICE_REPLIES=false
 NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
 NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
@@ -283,14 +283,17 @@ main.py      Application entrypoint
 - Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
 
 Contextual replies use `langchain-nvidia-ai-endpoints` with `ChatNVIDIA.astream()` and
-the `NVIDIA_CHAT_MODEL`. The default is `nvidia/nemotron-3-ultra-550b-a55b` with thinking
-enabled, temperature `1`, top-p `0.95`, and a 16,384-token completion ceiling. Internal
+the `NVIDIA_CHAT_MODEL`. The default is `nvidia/nemotron-3.5-super-vl-120b-a12b` with thinking
+enabled, temperature `1`, top-p `0.95`, seed `42`, parallel tool calls enabled, and a
+16,384-token completion ceiling. Internal
 reasoning chunks are discarded; only final answer content is parsed and posted to Discord.
 Direct mentions and replies get one retry with thinking disabled if generation fails
 or returns no usable answer. If both attempts fail, the bot reports a generation failure
 instead of asking for more context. Stream summaries log stop reasons and token usage
 for diagnosis. See [contextual chat recovery](docs/contextual-chat.md) for details.
-`NVIDIA_MODEL` remains the model setting for translation and KingShot RAG requests.
+`NVIDIA_MODEL` controls translation and KingShot RAG requests and defaults to the same
+Nemotron 3.5 Super VL model. These short requests disable thinking to reserve their
+completion budget for the final translation or answer.
 The chat persona favors concise, context-specific dry humor and playful sarcasm while
 avoiding hostile teasing, sensitive topics, and generic bot-like filler.
 Discord user, role, and channel mentions are resolved to readable names before the current

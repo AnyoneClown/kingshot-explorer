@@ -16,8 +16,8 @@ class BotConfig:
     command_prefix: str = "!"
     translator_role_name: str = "Translator"
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = "openai/gpt-oss-120b"
-    nvidia_chat_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    nvidia_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    nvidia_chat_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     nvidia_embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2"
     enable_voice_replies: bool = False
     nvidia_tts_server: str = "grpc.nvcf.nvidia.com:443"
@@ -128,10 +128,10 @@ class BotConfig:
             command_prefix=os.getenv("COMMAND_PREFIX", "!"),
             translator_role_name=os.getenv("TRANSLATOR_ROLE", "Translator"),
             nvidia_base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-            nvidia_model=os.getenv("NVIDIA_MODEL", "openai/gpt-oss-120b"),
+            nvidia_model=os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
             nvidia_chat_model=os.getenv(
                 "NVIDIA_CHAT_MODEL",
-                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3.5-super-vl-120b-a12b",
             ),
             nvidia_embedding_model=os.getenv(
                 "NVIDIA_EMBEDDING_MODEL",

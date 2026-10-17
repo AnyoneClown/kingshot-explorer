@@ -29,7 +29,7 @@ class FakeClient:
 def test_translate_to_english_parses_json_payload():
     service = TranslationService(
         FakeClient(['{"language":"Spanish","text":"Hello everyone"}']),
-        model="openai/gpt-oss-120b",
+        model="nvidia/nemotron-3.5-super-vl-120b-a12b",
     )
 
     result = asyncio.run(service.translate_to_english("Hola a todos"))
@@ -40,7 +40,7 @@ def test_translate_to_english_parses_json_payload():
 def test_translate_to_language_parses_code_fenced_json():
     service = TranslationService(
         FakeClient(['```json\n{"text":"Bonjour"}\n```']),
-        model="openai/gpt-oss-120b",
+        model="nvidia/nemotron-3.5-super-vl-120b-a12b",
     )
 
     result = asyncio.run(service.translate_to_language("Hello", "French"))

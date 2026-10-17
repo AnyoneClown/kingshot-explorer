@@ -58,7 +58,7 @@ class KingshotRAGService:
         client: AsyncOpenAI,
         *,
         embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2",
-        chat_model: str = "openai/gpt-oss-120b",
+        chat_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b",
         max_answer_chars: int = 1800,
     ):
         self._db_manager = db_manager
@@ -319,6 +319,7 @@ class KingshotRAGService:
             temperature=0.2,
             top_p=1,
             max_tokens=700,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
         answer = self._extract_completion_text(response).strip()

@@ -106,7 +106,7 @@ async def test_status_distinguishes_disabled_and_stopped_workers():
 
     assert fields["Scheduler"] == "ISSUE - Stopped"
     assert fields["Gift Polling"] == "INFO - Disabled"
-    assert fields["AI Chat Model"] == "`nvidia/nemotron-3-ultra-550b-a55b`"
+    assert fields["AI Chat Model"] == "`nvidia/nemotron-3.5-super-vl-120b-a12b`"
     assert embed.color == discord.Color.orange()
 
 

@@ -15,7 +15,7 @@ Direct mentions and replies to the bot allow at most two generation attempts:
 The retry override applies to that invocation only. It preserves other configured
 chat-template options and does not mutate the shared client's defaults. Thinking
 remains enabled for subsequent first attempts. NVIDIA documents the thinking
-toggle in the [Nemotron 3 Ultra model card](https://build.nvidia.com/nvidia/nemotron-3-ultra-550b-a55b/modelcard).
+toggle in the [Nemotron 3.5 Super VL model card](https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b/modelcard).
 
 Empty streams, reasoning-only responses, malformed JSON without a usable plain
 answer, and missing, empty, or non-string `reply` fields can trigger the retry.
@@ -78,3 +78,27 @@ On 2026-09-05, all 42 focused tests, all 199 repository tests, and Ruff passed.
 An isolated provider check injected an empty first attempt and obtained a valid
 answer from NVIDIA on the retry. The actual request payload disabled thinking,
 while the shared client's defaults remained unchanged.
+
+## Nemotron 3.5 migration (2026-10-17)
+
+Both `NVIDIA_MODEL` (translation and KingShot RAG) and `NVIDIA_CHAT_MODEL`
+(contextual replies) now default to `nvidia/nemotron-3.5-super-vl-120b-a12b`.
+Deployment must update both values in `.env.local`; an existing environment value
+overrides the code default. Rebuild and recreate the bot service to apply code and
+environment changes.
+
+Contextual chat retains thinking, temperature 1, top-p 0.95, and 16,384 completion
+tokens, with seed 42 and parallel tool calls enabled as in the provider example.
+Translation and RAG explicitly disable thinking because their short completion
+budgets must produce final content. Embedding settings and dependencies are unchanged.
+See the [NVIDIA model API reference](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3_5-super-vl-120b-a12b-infer).
+
+The previous Ultra model returned provider degradation errors, overload errors,
+and 300-second timeouts. The previous GPT-OSS-120B endpoint returned HTTP 410 Gone.
+Pre-deployment checks of the requested 3.5 model also returned provider HTTP 500
+(`Failed to generate completions`) for both full service calls and minimal text
+requests, including with thinking disabled and optional parameters omitted.
+A configuration migration does not resolve an unavailable provider deployment.
+
+Migration validation: Ruff and all 221 repository tests passed on 2026-10-17.
+Live provider failures remain separate from passing local request and parsing tests.

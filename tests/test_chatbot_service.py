@@ -11,7 +11,7 @@ from services.chatbot_service import ChatbotService
 
 class FakeClient:
     def __init__(self, responses):
-        self.model = "nvidia/nemotron-3-ultra-550b-a55b"
+        self.model = "nvidia/nemotron-3.5-super-vl-120b-a12b"
         self.model_kwargs = {"chat_template_kwargs": {"enable_thinking": True, "other_option": "preserved"}}
         self._responses = list(responses)
         self.calls = []
