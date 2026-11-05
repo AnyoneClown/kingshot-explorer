@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from handlers.permissions import AccessPolicy, operator_only_command
 from handlers.ui import EmbedColors, build_status_embed
 from services.kingshot_rag_service import KingshotChunkInput, KingshotRAGError, KingshotRAGService
 
@@ -19,9 +20,10 @@ logger = logging.getLogger(__name__)
 class KingshotRAGHandler:
     """Handles Kingshot knowledge-base Discord commands."""
 
-    def __init__(self, rag_service: KingshotRAGService, bot: commands.Bot):
+    def __init__(self, rag_service: KingshotRAGService, bot: commands.Bot, access_policy: AccessPolicy | None = None):
         self._rag_service = rag_service
         self._bot = bot
+        self._access = access_policy or AccessPolicy()
         logger.info("KingshotRAGHandler initialized")
 
     def register_commands(self):
@@ -39,7 +41,8 @@ class KingshotRAGHandler:
         ):
             await self._handle_ask(interaction, question, entity_type)
 
-        @self._bot.tree.command(name="kingshot_upsert", description="Admin: add or update one Kingshot knowledge item")
+        @self._bot.tree.command(name="kingshot_upsert", description="Operator: add or update one Kingshot knowledge item")
+        @operator_only_command
         @app_commands.describe(
             entity_type="Knowledge type, for example hero, event, building",
             slug="Stable unique key, for example bear-trap",
@@ -93,6 +96,18 @@ class KingshotRAGHandler:
                 cleaned_question,
                 entity_type=self._clean_optional_text(entity_type),
             )
+            if answer == getattr(self._rag_service, "NO_MATCH_ANSWER", None):
+                embed = build_status_embed(
+                    title="No Matching Knowledge",
+                    description=(
+                        "Nothing in the Kingshot knowledge base matches that question closely enough. "
+                        "Try different keywords or drop the entity type filter."
+                    ),
+                    color=EmbedColors.WARNING,
+                )
+                embed.add_field(name="Question", value=self._truncate(cleaned_question, 900), inline=False)
+                await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                return
             embed = build_status_embed(
                 title="Kingshot Knowledge",
                 description=self._truncate(answer, 1900),
@@ -124,17 +139,19 @@ class KingshotRAGHandler:
     ) -> None:
         await interaction.response.defer(thinking=True, ephemeral=True)
 
-        if not self._is_admin(interaction):
+        # The knowledge base is shared by every server, so only bot operators may
+        # change it (a server administrator elsewhere must not poison answers here).
+        if not self._access.is_super_admin(getattr(interaction.user, "id", None)):
             logger.warning(
-                "Rejected Kingshot upsert from non-admin: user_id=%s guild_id=%s slug=%s",
+                "Rejected Kingshot upsert from non-operator: user_id=%s guild_id=%s slug=%s",
                 getattr(interaction.user, "id", None),
                 getattr(interaction.guild, "id", None),
                 slug,
             )
             await interaction.followup.send(
                 embed=build_status_embed(
-                    title="Permission Denied",
-                    description="Only server administrators can update Kingshot knowledge.",
+                    title="🔒 Not allowed",
+                    description="Only the bot operator can update the shared Kingshot knowledge base.",
                     color=EmbedColors.WARNING,
                 ),
                 ephemeral=True,
@@ -218,14 +235,6 @@ class KingshotRAGHandler:
                 ),
                 ephemeral=True,
             )
-
-    @staticmethod
-    def _is_admin(interaction: discord.Interaction) -> bool:
-        return bool(
-            interaction.guild
-            and getattr(interaction.user, "guild_permissions", None)
-            and interaction.user.guild_permissions.administrator
-        )
 
     @staticmethod
     def _parse_json_object(value: Optional[str], *, default: dict) -> dict:

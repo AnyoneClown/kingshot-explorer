@@ -1,16 +1,29 @@
+import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from handlers.ui import EmbedColors, OwnedView, build_status_embed
-from services.event_scheduler_service import IEventSchedulerService, ScheduledEvent
+from handlers.confirm_view import ConfirmView
+from handlers.permissions import AccessPolicy, manager_only_command
+from handlers.ui import EmbedColors, OwnedView, build_status_embed, edit_panel_message
+from services.event_scheduler_service import (
+    DEFAULT_GRACE_PERIOD,
+    IEventSchedulerService,
+    ScheduledEvent,
+)
 
 logger = logging.getLogger(__name__)
+
+DISCORD_MESSAGE_LIMIT = 2000
+EVERYONE_NAMES = frozenset({"everyone", "@everyone"})
+HERE_NAMES = frozenset({"here", "@here"})
 
 
 def parse_event_time(date: str, time: str, time_zone: str) -> datetime:
@@ -33,6 +46,80 @@ def parse_event_time(date: str, time: str, time_zone: str) -> datetime:
     if len(candidates) > 1:
         raise ValueError("That local time occurs twice when the clocks move back. Enter the intended time in UTC.")
     return candidates.pop()
+
+
+def format_targets(role_names: list[str]) -> str:
+    """Human-readable ping targets for previews and cards (never sent as a mention)."""
+    names = [str(name).strip() for name in role_names or () if str(name).strip()]
+    if not names:
+        return "@everyone"
+    labels = []
+    for name in names:
+        lowered = name.casefold()
+        if lowered in EVERYONE_NAMES:
+            labels.append("@everyone")
+        elif lowered in HERE_NAMES:
+            labels.append("@here")
+        else:
+            labels.append(f"@{name.lstrip('@')}")
+    return discord.utils.escape_markdown(", ".join(dict.fromkeys(labels)))
+
+
+def _short_label(message: str, limit: int = 60) -> str:
+    text = " ".join(str(message).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _chunk_message(content: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split long legacy reminders into Discord-sized messages, preferring line breaks."""
+    chunks = []
+    while len(content) > limit:
+        cut = content.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(content[:cut])
+        content = content[cut:].lstrip("\n")
+    if content:
+        chunks.append(content)
+    return chunks
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    """Result of one attempt to post a reminder."""
+
+    delivered: bool
+    error: Optional[str] = None
+    retry: bool = False
+    # The channel is gone for good: stop the reminder even if it repeats.
+    deactivate: bool = False
+
+
+@dataclass(frozen=True)
+class SchedulerHealth:
+    """Reminder scheduler state since the bot process started."""
+
+    running: bool
+    last_run_at: Optional[datetime]
+    last_success_at: Optional[datetime]
+    last_error: Optional[str]
+    last_error_at: Optional[datetime]
+    failed_count: int
+    sent_count: int
+    missed_count: int
+
+    def summary(self) -> str:
+        """Compact multi-line text for a status embed field (under 1024 characters)."""
+        lines = []
+        if self.last_run_at is None:
+            lines.append("No run yet")
+        else:
+            lines.append(f"Last run <t:{int(self.last_run_at.timestamp())}:R>")
+        lines.append(f"Sent {self.sent_count} · Failed {self.failed_count} · Missed {self.missed_count}")
+        if self.last_error:
+            when = f" (<t:{int(self.last_error_at.timestamp())}:R>)" if self.last_error_at else ""
+            lines.append(f"Last error{when}: {self.last_error[:300]}")
+        return "\n".join(lines)
 
 
 class EventForm(discord.ui.Modal):
@@ -160,8 +247,8 @@ class EventPreview(OwnedView):
             return
         self.saving = True
         await interaction.response.defer()
+        event = self.event
         try:
-            event = self.event
             if event.id is None:
                 saved = await self.handler._scheduler_service.schedule_event(
                     self.channel_id,
@@ -169,6 +256,8 @@ class EventPreview(OwnedView):
                     event.role_names,
                     event.message,
                     event.repeat_every_days,
+                    guild_id=getattr(interaction, "guild_id", None),
+                    created_by_user_id=interaction.user.id,
                 )
             else:
                 saved = await self.handler._scheduler_service.update_event(
@@ -179,8 +268,13 @@ class EventPreview(OwnedView):
                     event.repeat_every_days,
                 )
         except Exception:
+            logger.exception("Could not save reminder for channel %s", self.channel_id)
             self.saving = False
-            raise
+            await self.handler._send_error(
+                interaction,
+                "The reminder could not be saved right now. Press Save reminder again in a moment.",
+            )
+            return
         if not saved:
             self.saving = False
             await self.handler._send_error(
@@ -212,6 +306,8 @@ class EventPreview(OwnedView):
 
 
 class EventListView(OwnedView):
+    PANEL_TIMEOUT_SECONDS = 900.0
+
     def __init__(
         self,
         handler,
@@ -220,7 +316,7 @@ class EventListView(OwnedView):
         events: list[ScheduledEvent],
         can_manage: bool,
     ):
-        super().__init__(author_id)
+        super().__init__(author_id, timeout=self.PANEL_TIMEOUT_SECONDS)
         self.handler, self.channel_id, self.events = handler, channel_id, events
         self.index = 0
         self.edit.disabled = self.cancel.disabled = self.create.disabled = not can_manage
@@ -258,6 +354,16 @@ class EventListView(OwnedView):
             value=self.handler._format_repeat(event.repeat_every_days),
             inline=False,
         )
+        embed.add_field(name="Pings", value=format_targets(event.role_names)[:1024], inline=False)
+        if event.last_sent_at is not None:
+            embed.add_field(
+                name="Last sent",
+                value=self.handler._format_discord_timestamp(event.last_sent_at),
+                inline=False,
+            )
+        if event.last_error:
+            embed.add_field(name="Last problem", value=event.last_error[:1024], inline=False)
+            embed.color = EmbedColors.WARNING
         message = event.message[:1900]
         for offset in range(0, len(message), 950):
             embed.add_field(
@@ -318,30 +424,108 @@ class EventListView(OwnedView):
         if not await self.handler._can_manage(interaction, self.author_id, self.channel_id):
             return
         event_id = int(interaction.data["custom_id"].rsplit(":", 1)[1])
-        await interaction.response.defer()
-        saved = await self.handler._scheduler_service.cancel_event(self.channel_id, event_id)
-        if not saved:
+        event = next((event for event in self.events if event.id == event_id), None)
+        if event is None:
             await self.handler._send_error(interaction, "This event is no longer active. Reopen /events.")
             return
-        self.events = await self.handler._scheduler_service.get_events_for_channel(self.channel_id)
-        if self.events:
-            self.index = min(self.index, len(self.events) - 1)
-            self._refresh_controls()
-            embed = self.embed()
-            embed.description = f"Event #{event_id} cancelled. {len(self.events)} active reminder(s) remain."
-            await interaction.edit_original_response(
-                embed=embed, view=self, allowed_mentions=discord.AllowedMentions.none()
-            )
-        else:
-            self.stop()
+
+        async def confirm(confirm_interaction: discord.Interaction):
+            await self._confirm_cancel(confirm_interaction, event_id)
+
+        label = discord.utils.escape_markdown(_short_label(event.message))
+        prompt = ConfirmView(
+            interaction.user.id,
+            on_confirm=confirm,
+            confirm_label="Cancel event",
+            keep_label="Keep",
+            kept_title="Event kept",
+            kept_description=f"Event #{event_id} is still scheduled.",
+        )
+        await interaction.response.send_message(
+            embed=build_status_embed(
+                title=f"Cancel #{event_id} '{label}'?"[:256],
+                description="The reminder stops immediately. This cannot be undone.",
+                color=EmbedColors.WARNING,
+            ),
+            view=prompt,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            prompt.message = await interaction.original_response()
+        except discord.HTTPException:
+            logger.debug("Could not load the cancel confirmation message", exc_info=True)
+
+    async def _confirm_cancel(self, interaction: discord.Interaction, event_id: int):
+        if not await self.handler._can_manage(interaction, self.author_id, self.channel_id):
+            return
+        await interaction.response.defer()
+        try:
+            cancelled = await self.handler._scheduler_service.cancel_event(self.channel_id, event_id)
+        except Exception:
+            logger.exception("Could not cancel reminder %s", event_id)
             await interaction.edit_original_response(
                 embed=build_status_embed(
-                    title="Event cancelled",
-                    description="There are no active reminders in this channel.",
-                    color=EmbedColors.SUCCESS,
+                    title="Event not cancelled",
+                    description="The reminder could not be cancelled right now. Try again in a moment.",
+                    color=EmbedColors.WARNING,
                 ),
                 view=None,
             )
+            return
+        if not cancelled:
+            await interaction.edit_original_response(
+                embed=build_status_embed(
+                    title="Event not cancelled",
+                    description="This event is no longer active. Reopen /events.",
+                    color=EmbedColors.WARNING,
+                ),
+                view=None,
+            )
+            return
+        await interaction.edit_original_response(
+            embed=build_status_embed(
+                title="Event cancelled",
+                description=f"Event #{event_id} was cancelled.",
+                color=EmbedColors.SUCCESS,
+            ),
+            view=None,
+        )
+        await self._refresh_after_cancel(event_id)
+
+    async def _refresh_after_cancel(self, event_id: int):
+        """Update the public list after a cancellation; failures leave the stale card."""
+        try:
+            self.events = await self.handler._scheduler_service.get_events_for_channel(self.channel_id)
+        except Exception:
+            logger.warning("Could not refresh events after cancelling %s", event_id, exc_info=True)
+            self.events = [event for event in self.events if event.id != event_id]
+        if self.message is None:
+            if not self.events:
+                self.stop()
+            return
+        try:
+            if self.events:
+                self.index = min(self.index, len(self.events) - 1)
+                self._refresh_controls()
+                embed = self.embed()
+                embed.description = f"Event #{event_id} cancelled. {len(self.events)} active reminder(s) remain."
+                await edit_panel_message(
+                    self.message, embed=embed, view=self, allowed_mentions=discord.AllowedMentions.none()
+                )
+            else:
+                self.stop()
+                await edit_panel_message(
+                    self.message,
+                    embed=build_status_embed(
+                        title="Event cancelled",
+                        description="There are no active reminders in this channel.",
+                        color=EmbedColors.SUCCESS,
+                    ),
+                    view=None,
+                )
+        except discord.HTTPException:
+            logger.debug("Could not refresh the events panel", exc_info=True)
 
     @discord.ui.button(label="Create event", row=2)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -350,38 +534,46 @@ class EventListView(OwnedView):
 
 
 class EventHandler:
-    """Handles event scheduling Discord commands."""
+    """Handles event scheduling Discord commands and the reminder scheduler."""
+
+    GRACE_PERIOD = DEFAULT_GRACE_PERIOD
+    SCHEDULER_RESTART_DELAY_SECONDS = 30.0
 
     def __init__(
         self,
         scheduler_service: IEventSchedulerService,
         bot: commands.Bot,
         admin_user_ids: set[int] | None = None,
+        access_policy: AccessPolicy | None = None,
     ):
         self._scheduler_service, self._bot = scheduler_service, bot
         self._admin_user_ids = admin_user_ids or set()
+        self._access = access_policy or AccessPolicy(self._admin_user_ids)
         self._scheduler_loop = None
+        self._scheduler_stopped = False
+        # Occurrences already posted whose bookkeeping could not be saved yet;
+        # they are recorded again without being re-posted.
+        self._delivered_pending: dict[tuple[int, datetime], DeliveryOutcome] = {}
+        self._last_run_at: datetime | None = None
+        self._last_success_at: datetime | None = None
+        self._last_error: str | None = None
+        self._last_error_at: datetime | None = None
+        self._failed_count = 0
+        self._sent_count = 0
+        self._missed_count = 0
 
-    def _is_bot_admin(self, interaction: discord.Interaction) -> bool:
-        return int(interaction.user.id) in self._admin_user_ids
-
-    async def _send_error(self, interaction: discord.Interaction, description: str):
+    async def _send_error(
+        self,
+        interaction: discord.Interaction,
+        description: str,
+        *,
+        title: str = "Reminder not saved",
+    ):
         send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
         await send(
             embed=build_status_embed(
-                title="Reminder not saved",
+                title=title,
                 description=description,
-                color=EmbedColors.WARNING,
-            ),
-            ephemeral=True,
-        )
-
-    async def _send_admin_only_response(self, interaction: discord.Interaction):
-        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        await send(
-            embed=build_status_embed(
-                title="Admin only",
-                description="Only configured bot admins can manage reminders.",
                 color=EmbedColors.WARNING,
             ),
             ephemeral=True,
@@ -393,8 +585,7 @@ class EventHandler:
         author_id: int | None = None,
         channel_id: int | None = None,
     ) -> bool:
-        if not self._is_bot_admin(interaction):
-            await self._send_admin_only_response(interaction)
+        if not await self._access.require_manager(interaction, action="manage reminders"):
             return False
         if author_id is not None and interaction.user.id != author_id:
             await self._send_error(interaction, "Only the person who opened this form can submit it.")
@@ -409,6 +600,7 @@ class EventHandler:
             name="schedule",
             description="Open an event form, or preview a reminder using options",
         )
+        @manager_only_command
         @app_commands.describe(
             date="Event date (YYYY-MM-DD)",
             time="Event time (HH:MM in the selected timezone)",
@@ -444,9 +636,14 @@ class EventHandler:
             await self._handle_list_events(interaction)
 
         @self._bot.tree.command(name="cancel", description="Cancel a scheduled event by its stable ID")
+        @manager_only_command
         @app_commands.describe(event_id="Event ID shown on its /events card")
         async def cancel_event(interaction: discord.Interaction, event_id: str):
             await self._handle_cancel_event(interaction, event_id)
+
+        @cancel_event.autocomplete("event_id")
+        async def cancel_event_autocomplete(interaction: discord.Interaction, current: str):
+            return await self._cancel_choices(interaction, current)
 
     async def open_schedule_form(self, interaction: discord.Interaction, **defaults):
         if await self._can_manage(interaction):
@@ -530,16 +727,17 @@ class EventHandler:
         except ValueError as error:
             await self._send_error(interaction, str(error))
             return
+        role_names = event.role_names if event else ["everyone"]
         draft = ScheduledEvent(
             event.id if event else None,
             reminder_time,
-            event.role_names if event else ["everyone"],
+            role_names,
             message,
             repeat_every_days,
         )
         embed = build_status_embed(
             title="Preview reminder changes" if event else "Preview event",
-            description="Review the times and message, then save. The reminder will ping @everyone.",
+            description=f"Review the times and message, then save. The reminder will ping {format_targets(role_names)}.",
         )
         if event is None:
             embed.add_field(
@@ -579,17 +777,28 @@ class EventHandler:
         view.message = await interaction.original_response()
 
     async def _handle_list_events(self, interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
         if interaction.channel_id is None:
-            await self._send_error(interaction, "Use /events in a channel.")
+            await self._send_error(interaction, "Use /events in a channel.", title="Events unavailable")
             return
-        events = await self._scheduler_service.get_events_for_channel(interaction.channel_id)
+        # Defer privately so errors stay private; the panel itself is posted publicly.
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            events = await self._scheduler_service.get_events_for_channel(interaction.channel_id)
+        except Exception:
+            logger.exception("Could not load events for channel %s", interaction.channel_id)
+            await self._send_error(
+                interaction,
+                "Scheduled events could not be loaded right now. Try /events again in a moment.",
+                title="Events unavailable",
+            )
+            return
         if not events:
             await interaction.followup.send(
                 embed=build_status_embed(
                     title="No scheduled events",
-                    description="There are no active reminders in this channel. Bot admins can use /schedule to create one.",
-                )
+                    description="There are no active reminders in this channel. Server managers can use /schedule to create one.",
+                ),
+                ephemeral=True,
             )
             return
         view = EventListView(
@@ -597,14 +806,40 @@ class EventHandler:
             interaction.user.id,
             interaction.channel_id,
             events,
-            self._is_bot_admin(interaction),
+            await self._access.can_manage(interaction),
         )
+        await interaction.edit_original_response(content="Events ready.")
         view.message = await interaction.followup.send(
             embed=view.embed(),
             view=view,
             wait=True,
+            ephemeral=False,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            logger.debug("Could not remove the private events receipt", exc_info=True)
+
+    async def _cancel_choices(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        """Autocomplete the channel's active reminders by ID or message text."""
+        if interaction.channel_id is None:
+            return []
+        try:
+            events = await self._scheduler_service.get_events_for_channel(interaction.channel_id)
+        except Exception:
+            logger.warning("Could not load cancel suggestions for channel %s", interaction.channel_id, exc_info=True)
+            return []
+        needle = str(current or "").strip().lstrip("#").casefold()
+        choices = []
+        for event in events:
+            if needle and needle not in str(event.id) and needle not in event.message.casefold():
+                continue
+            name = f"#{event.id} · {event.event_time:%Y-%m-%d %H:%M} UTC · {_short_label(event.message, 70)}"
+            choices.append(app_commands.Choice(name=name[:100], value=str(event.id)))
+            if len(choices) == 25:
+                break
+        return choices
 
     async def _handle_cancel_event(self, interaction: discord.Interaction, event_id: str):
         if not await self._can_manage(interaction):
@@ -616,6 +851,7 @@ class EventHandler:
                 await self._send_error(
                     interaction,
                     "This event is no longer active in this channel. Use the event ID on its /events card.",
+                    title="Event not cancelled",
                 )
                 return
             await interaction.followup.send(
@@ -627,35 +863,253 @@ class EventHandler:
                 ephemeral=True,
             )
         except ValueError:
-            await self._send_error(interaction, "Copy the numeric event ID shown on its /events card.")
+            await self._send_error(
+                interaction,
+                "Copy the numeric event ID shown on its /events card.",
+                title="Event not cancelled",
+            )
         except Exception:
             logger.exception("Error cancelling event")
-            await self._send_error(interaction, "This reminder could not be cancelled. Try again.")
+            await self._send_error(
+                interaction,
+                "This reminder could not be cancelled. Try again.",
+                title="Event not cancelled",
+            )
+
+    # ------------------------------------------------------------------ scheduler
 
     def start_scheduler_task(self):
         if self._scheduler_loop and self._scheduler_loop.is_running():
             return
+        self._scheduler_stopped = False
 
         @tasks.loop(minutes=1)
         async def check_scheduled_events():
-            due_events = await self._scheduler_service.check_and_get_due_events()
-            for channel_id, events in due_events.items():
-                channel = self._bot.get_channel(channel_id)
-                if channel:
-                    for event in events:
-                        await self._send_event_notification(channel, event.role_names, event.message)
+            await self.run_scheduler_iteration()
+
+        @check_scheduled_events.error
+        async def on_scheduler_error(error: Exception):
+            # Safety net: iterations catch their own errors, but never let the loop die.
+            self._note_failure(f"Scheduler loop stopped unexpectedly: {error!r}")
+            logger.error(
+                "Event scheduler loop crashed; restarting in %.0fs",
+                self.SCHEDULER_RESTART_DELAY_SECONDS,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            asyncio.get_running_loop().call_later(self.SCHEDULER_RESTART_DELAY_SECONDS, self._restart_scheduler)
 
         self._scheduler_loop = check_scheduled_events
         check_scheduled_events.start()
 
+    def stop_scheduler_task(self):
+        self._scheduler_stopped = True
+        if self._scheduler_loop is not None:
+            self._scheduler_loop.cancel()
+
+    def _restart_scheduler(self):
+        if self._scheduler_stopped or self._scheduler_loop is None or self._scheduler_loop.is_running():
+            return
+        try:
+            self._scheduler_loop.start()
+            logger.info("Event scheduler loop restarted")
+        except RuntimeError:
+            logger.exception("Could not restart the event scheduler loop")
+
     def is_scheduler_running(self) -> bool:
         return bool(self._scheduler_loop and self._scheduler_loop.is_running())
 
-    async def _send_event_notification(self, channel: discord.TextChannel, role_names: list[str], message: str):
-        await channel.send(
-            f"@everyone\n{message}",
-            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
+    def scheduler_health(self) -> SchedulerHealth:
+        return SchedulerHealth(
+            running=self.is_scheduler_running(),
+            last_run_at=self._last_run_at,
+            last_success_at=self._last_success_at,
+            last_error=self._last_error,
+            last_error_at=self._last_error_at,
+            failed_count=self._failed_count,
+            sent_count=self._sent_count,
+            missed_count=self._missed_count,
         )
+
+    def _note_failure(self, message: str):
+        self._failed_count += 1
+        self._last_error = message[:500]
+        self._last_error_at = datetime.now(timezone.utc)
+
+    async def run_scheduler_iteration(self) -> None:
+        """One scheduler pass. Never raises: every failure is logged and recorded."""
+        self._last_run_at = datetime.now(timezone.utc)
+        try:
+            batch = await self._scheduler_service.claim_due_events(self.GRACE_PERIOD)
+        except Exception as error:
+            self._note_failure(f"Could not load due reminders: {error}")
+            logger.exception("Could not load due reminders; retrying next minute")
+            return
+        for event in batch.missed:
+            self._missed_count += 1
+            logger.warning(
+                "Reminder #%s in channel %s was not posted: %s",
+                event.id,
+                event.channel_id,
+                event.last_error,
+            )
+        due_keys = {(event.id, event.event_time) for event in batch.due}
+        self._delivered_pending = {key: value for key, value in self._delivered_pending.items() if key in due_keys}
+        for event in batch.due:
+            try:
+                await self._deliver(event)
+            except Exception as error:
+                self._note_failure(f"Reminder #{event.id}: {error}")
+                logger.exception("Unexpected failure while delivering reminder #%s", event.id)
+        self._last_success_at = datetime.now(timezone.utc)
+
+    async def _deliver(self, event: ScheduledEvent) -> None:
+        key = (event.id, event.event_time)
+        outcome = self._delivered_pending.get(key)
+        if outcome is None:
+            outcome = await self._attempt_send(event)
+            if outcome.delivered:
+                self._sent_count += 1
+                self._delivered_pending[key] = outcome
+            else:
+                self._note_failure(f"Reminder #{event.id}: {outcome.error}")
+                log = logger.warning if outcome.retry else logger.error
+                log(
+                    "Reminder #%s in channel %s failed (%s): %s",
+                    event.id,
+                    event.channel_id,
+                    "will retry" if outcome.retry else "not retrying",
+                    outcome.error,
+                )
+        try:
+            await self._scheduler_service.record_delivery(
+                event,
+                delivered=outcome.delivered,
+                error=outcome.error,
+                retry=outcome.retry,
+                deactivate=outcome.deactivate,
+            )
+        except Exception as error:
+            self._note_failure(f"Could not record reminder #{event.id}: {error}")
+            logger.exception("Could not record delivery of reminder #%s; retrying next minute", event.id)
+            return
+        self._delivered_pending.pop(key, None)
+
+    async def _resolve_channel(self, channel_id: int | None):
+        """Return (channel, failure outcome)."""
+        if channel_id is None:
+            return None, DeliveryOutcome(False, "Reminder has no channel.", retry=False)
+        channel = self._bot.get_channel(channel_id)
+        if channel is not None:
+            return channel, None
+        try:
+            return await self._bot.fetch_channel(channel_id), None
+        except discord.NotFound:
+            return None, DeliveryOutcome(False, "The channel no longer exists.", deactivate=True)
+        except discord.Forbidden:
+            return None, DeliveryOutcome(False, "The bot can no longer access this channel.", retry=False)
+        except discord.HTTPException as error:
+            return None, self._http_failure(error, "loading the channel")
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            return None, DeliveryOutcome(False, f"Network error while loading the channel: {error}", retry=True)
+
+    @staticmethod
+    def _http_failure(error: discord.HTTPException, action: str) -> DeliveryOutcome:
+        status = getattr(error, "status", 0) or 0
+        transient = status >= 500 or status == 429
+        detail = getattr(error, "text", "") or str(error)
+        return DeliveryOutcome(False, f"Discord error {status} while {action}: {detail}", retry=transient)
+
+    async def _attempt_send(self, event: ScheduledEvent) -> DeliveryOutcome:
+        channel, failure = await self._resolve_channel(event.channel_id)
+        if failure is not None:
+            return failure
+        if not hasattr(channel, "send"):
+            return DeliveryOutcome(False, "This channel cannot receive messages.", retry=False)
+        try:
+            warning = await self._send_event_notification(channel, event.role_names, event.message)
+        except discord.Forbidden:
+            return DeliveryOutcome(False, "Missing permission to send messages in this channel.", retry=False)
+        except discord.NotFound:
+            return DeliveryOutcome(False, "The channel no longer exists.", deactivate=True)
+        except discord.HTTPException as error:
+            return self._http_failure(error, "sending the reminder")
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            return DeliveryOutcome(False, f"Network error while sending the reminder: {error}", retry=True)
+        except Exception as error:
+            logger.exception("Unexpected error while sending reminder #%s", event.id)
+            return DeliveryOutcome(False, f"Unexpected error while sending the reminder: {error}", retry=True)
+        return DeliveryOutcome(True, warning)
+
+    @staticmethod
+    def _find_role(guild, name: str):
+        roles = list(getattr(guild, "roles", None) or ())
+        bare = name.strip()
+        if bare.startswith("<@&") and bare.endswith(">"):
+            bare = bare[3:-1]
+        if bare.isdigit():
+            match = next((role for role in roles if getattr(role, "id", None) == int(bare)), None)
+            if match is not None:
+                return match
+        bare = bare.lstrip("@")
+        exact = next((role for role in roles if getattr(role, "name", None) == bare), None)
+        if exact is not None:
+            return exact
+        folded = bare.casefold()
+        return next((role for role in roles if str(getattr(role, "name", "")).casefold() == folded), None)
+
+    def _resolve_mentions(self, guild, role_names: list[str]):
+        """Return (mention text, allowed mentions, missing role names)."""
+        names = [str(name).strip() for name in role_names or () if str(name).strip()] or ["everyone"]
+        parts, roles, missing = [], [], []
+        everyone = False
+        for name in names:
+            lowered = name.casefold()
+            if lowered in EVERYONE_NAMES or lowered in HERE_NAMES:
+                everyone = True
+                parts.append("@here" if lowered in HERE_NAMES else "@everyone")
+                continue
+            role = self._find_role(guild, name)
+            if role is None:
+                missing.append(name)
+            elif getattr(role, "is_default", lambda: False)():
+                everyone = True
+                parts.append("@everyone")
+            elif role not in roles:
+                roles.append(role)
+                parts.append(role.mention)
+        allowed = discord.AllowedMentions(
+            everyone=everyone,
+            users=False,
+            roles=roles if roles else False,
+            replied_user=False,
+        )
+        return " ".join(dict.fromkeys(parts)), allowed, missing
+
+    async def _send_event_notification(
+        self,
+        channel: discord.abc.Messageable,
+        role_names: list[str],
+        message: str,
+    ) -> Optional[str]:
+        """Post a reminder pinging its roles (or @everyone). Returns a warning, if any."""
+        mentions, allowed, missing = self._resolve_mentions(getattr(channel, "guild", None), role_names)
+        content = f"{mentions}\n{message}" if mentions else message
+        chunks = _chunk_message(content)
+        # The first chunk carries the ping; failures there propagate so the send is retried.
+        await channel.send(chunks[0], allowed_mentions=allowed)
+        warnings = []
+        for chunk in chunks[1:]:
+            try:
+                await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+            except Exception as error:
+                # Once the ping went out, a retry would ping everyone again: treat the
+                # reminder as delivered and record the partial post instead.
+                logger.warning("Reminder continuation could not be posted: %s", error)
+                warnings.append(f"Only part of the reminder was posted: {error}")
+                break
+        if missing:
+            warnings.append(f"Role(s) not found, so they were not pinged: {', '.join(missing)}")
+        return " ".join(warnings)[:500] or None
 
     @staticmethod
     def _format_discord_timestamp(value: datetime) -> str:

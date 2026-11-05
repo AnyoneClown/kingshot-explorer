@@ -76,7 +76,7 @@ def make_handler(
 
 
 @pytest.mark.asyncio
-async def test_auto_redemption_announces_when_every_result_failed(monkeypatch):
+async def test_auto_redemption_is_not_announced_without_a_success(monkeypatch):
     class FakeChannel:
         def __init__(self):
             self.sent_embeds = []
@@ -100,8 +100,8 @@ async def test_auto_redemption_announces_when_every_result_failed(monkeypatch):
         ],
     )
 
-    assert len(channel.sent_embeds) == 1
-    assert channel.sent_embeds[0].title == "❌ Auto-Redemption Failed"
+    # Announcements are only posted when at least one player got the code.
+    assert channel.sent_embeds == []
 
 
 @pytest.mark.asyncio
@@ -129,7 +129,8 @@ async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatc
     )
 
     assert len(channel.sent_embeds) == 1
-    assert "✅ **Success**: 1" in channel.sent_embeds[0].fields[1].value
+    assert "**✅ Success:** 1" in channel.sent_embeds[0].fields[1].value
+    assert "**🚫 API rejected:** 1" in channel.sent_embeds[0].fields[1].value
 
 
 @pytest.mark.asyncio
@@ -161,9 +162,12 @@ async def test_manual_result_is_posted_as_normal_channel_message():
         ],
     )
 
-    assert len(channel.sent) == 1
-    assert channel.sent[0]["content"].startswith("<@123>")
+    assert len(channel.sent) == 2
     assert channel.sent[0]["embed"].title == "✅ All Gift Codes Redeemed Successfully!"
+    assert "content" not in channel.sent[0]
+    # The ping is a separate new message so Discord notifies the requester.
+    assert channel.sent[1]["content"].startswith("<@123>")
+    assert [user.id for user in channel.sent[1]["allowed_mentions"].users] == [123]
 
 
 @pytest.mark.asyncio
@@ -193,8 +197,8 @@ async def test_manual_redeem_starts_background_job_and_rejects_duplicate(monkeyp
             del kwargs
 
     class FakeRegistry:
-        async def get_registered_players(self, enabled_only=True):
-            assert enabled_only is True
+        async def get_guild_redeem_targets(self, guild_id):
+            assert guild_id == 456
             return [SimpleNamespace(player_id="222", kingdom="830", enabled=True)]
 
     def make_interaction():
@@ -238,17 +242,17 @@ async def test_manual_redeem_starts_background_job_and_rejects_duplicate(monkeyp
     assert captured["gift_code"] == "CODE"
     assert captured["actor_user_id"] == 123
 
+    # One manual job per server at a time, and one job per code.
     second_interaction = make_interaction()
     await handler._handle_redeem_gift_code_slash(second_interaction, "OTHER")
-
     assert second_interaction.followup.sent[0]["embed"].title == "⏳ Redemption Job Already Running"
 
-    task = handler._manual_redemption_task
-    assert task is not None
+    job = handler._jobs.get("code")
+    assert job is not None and job.kind == "manual" and captured["job"] is job
     release_job.set()
-    await task
+    await job.task
     await asyncio.sleep(0)
-    assert handler._manual_redemption_task is None
+    assert handler._jobs.get("CODE") is None
 
 
 @pytest.mark.asyncio
@@ -492,8 +496,8 @@ async def test_transient_redemption_failures_retry(monkeypatch):
     async def no_sleep(delay):
         del delay
 
-    monkeypatch.setattr("handlers.gift_code_handler.asyncio.sleep", no_sleep)
-    monkeypatch.setattr("handlers.gift_code_handler.random.uniform", lambda _start, _end: 0)
+    monkeypatch.setattr("services.gift_redemption_service.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("services.gift_redemption_service.random.uniform", lambda _start, _end: 0)
 
     gift_service = RetryGiftCodeService()
     handler = make_handler(gift_service)
@@ -525,8 +529,8 @@ async def test_rate_limit_retries_use_bounded_budget(monkeypatch):
     async def no_sleep(delay):
         del delay
 
-    monkeypatch.setattr("handlers.gift_code_handler.asyncio.sleep", no_sleep)
-    monkeypatch.setattr("handlers.gift_code_handler.random.uniform", lambda _start, _end: 0)
+    monkeypatch.setattr("services.gift_redemption_service.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("services.gift_redemption_service.random.uniform", lambda _start, _end: 0)
 
     gift_service = RateLimitedGiftCodeService()
     handler = make_handler(gift_service)
@@ -558,8 +562,8 @@ async def test_non_rate_limit_transient_failures_keep_standard_budget(monkeypatc
     async def no_sleep(delay):
         del delay
 
-    monkeypatch.setattr("handlers.gift_code_handler.asyncio.sleep", no_sleep)
-    monkeypatch.setattr("handlers.gift_code_handler.random.uniform", lambda _start, _end: 0)
+    monkeypatch.setattr("services.gift_redemption_service.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("services.gift_redemption_service.random.uniform", lambda _start, _end: 0)
 
     gift_service = FailingGiftCodeService()
     handler = make_handler(gift_service)

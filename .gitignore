@@ -140,8 +140,11 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.*.example
 .env.grafana
 .env.local
+.env.prod
 .envrc
 .venv
 env/

@@ -1,7 +1,6 @@
 """Services module for business logic."""
 
 from .alliance_power_service import AlliancePowerService
-from .database_service import DatabaseService
 from .event_scheduler_service import EventSchedulerService
 from .gift_code_service import GiftCodeService
 from .guild_configuration_service import GuildConfigurationService
@@ -28,7 +27,6 @@ __all__ = [
     "InteractionTrackingService",
     "PlayerRegistryService",
     "KVKService",
-    "DatabaseService",
     "KingshotRAGService",
     "KingshotRAGError",
     "KingshotChunkInput",

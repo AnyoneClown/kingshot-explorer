@@ -3,7 +3,20 @@
 from datetime import date, datetime
 from typing import Any, List, Optional
 
-from sqlalchemy import JSON, BigInteger, Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import UserDefinedType
@@ -115,11 +128,57 @@ class RegisteredPlayer(Base):
 
     # Relationships
     added_by: Mapped["User"] = relationship("User", back_populates="registered_players")
+    guild_registrations: Mapped[List["GuildPlayerRegistration"]] = relationship(
+        "GuildPlayerRegistration",
+        back_populates="player",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return (
             f"<RegisteredPlayer(id={self.id}, player_id={self.player_id}, player_name={self.player_name}, "
             f"player_uid={self.player_uid}, kingdom={self.kingdom}, castle_level={self.castle_level}, "
+            f"enabled={self.enabled})>"
+        )
+
+
+class GuildPlayerRegistration(Base):
+    """Links a shared player profile to a Discord guild's gift-code roster.
+
+    Player profiles in ``registered_players`` are shared across guilds (one in-game
+    account is redeemed once per code). Each guild keeps its own roster entry with
+    its own enabled flag and owner. Profiles without any registration are legacy
+    (pre multi-guild) rows that stay in the global auto-redeem run until a bot
+    admin assigns them to a guild.
+    """
+
+    __tablename__ = "guild_player_registrations"
+    __table_args__ = (
+        PrimaryKeyConstraint("guild_id", "player_id"),
+        Index("ix_guild_player_registrations_player_id", "player_id"),
+    )
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    player_id: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("registered_players.player_id", ondelete="CASCADE", onupdate="CASCADE"),
+        nullable=False,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    added_by_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    player: Mapped["RegisteredPlayer"] = relationship("RegisteredPlayer", back_populates="guild_registrations")
+
+    def __repr__(self) -> str:
+        return (
+            f"<GuildPlayerRegistration(guild_id={self.guild_id}, player_id={self.player_id}, "
             f"enabled={self.enabled})>"
         )
 
@@ -173,6 +232,14 @@ class GiftCode(Base):
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at_api: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # "pending" until the automatic redemption run for this code has processed every
+    # eligible player; pending codes are resumed (e.g. after a restart) while valid.
+    # The server default is "completed" so rows inserted without an explicit status
+    # (and all rows that existed before this column) are never re-run by accident.
+    auto_redeem_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="completed"
+    )
+    auto_redeem_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self) -> str:
         return f"<GiftCode(id={self.id}, code={self.code})>"
@@ -184,12 +251,16 @@ class ScheduledReminder(Base):
     __tablename__ = "scheduled_reminders"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     reminder_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     role_names_json: Mapped[str] = mapped_column(Text, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     repeat_every_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    last_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -210,6 +281,12 @@ class GuildConfiguration(Base):
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Discord guild ID
     use_voice_replies: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     use_random_replies: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Members with this role can manage the bot in this guild (besides Manage Server).
+    manager_role_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # Where gift-code redemption summaries for this guild's roster are posted.
+    gift_code_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # Where automatic alliance reports (roster changes, inactivity) are posted.
+    alliance_report_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

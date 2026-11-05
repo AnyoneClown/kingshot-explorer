@@ -168,6 +168,24 @@ class KVKService(IKVKService):
             },
         }
 
+    async def get_head_to_head(self, kingdom_a: int, kingdom_b: int) -> Dict[str, Any]:
+        """Direct KVK matches between two kingdoms, summarized from both sides."""
+        result = await self._fetch_matches(kingdom_a, opponent_number=kingdom_b, limit=100)
+        if not result.get("success"):
+            return result
+
+        raw_matches = result.get("data", [])
+        matches_a = self._normalize_matches(kingdom_a, raw_matches)
+        matches_b = self._normalize_matches(kingdom_b, raw_matches)
+        return {
+            "success": True,
+            "data": {
+                "matches": matches_a,
+                "kingdom_a": self._build_kingdom_summary(kingdom_a, matches_a),
+                "kingdom_b": self._build_kingdom_summary(kingdom_b, matches_b),
+            },
+        }
+
     async def _fetch_matches(
         self,
         kingdom_number: int,

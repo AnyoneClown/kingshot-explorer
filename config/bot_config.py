@@ -36,8 +36,21 @@ class BotConfig:
     ks_data_base_url: str = "https://ks.jeab.dev"
     ks_data_timeout_seconds: int = 30
     admin_user_ids: set = None
+    # Discord user IDs that the bot ignores (slash commands, translation, chat).
     banned_players: set = None
+    # Legacy global announcement channels for gift-code summaries. Servers can set
+    # their own channel in /configure; these remain as a fallback for operators.
     auto_redeem_channels: set = None
+    # Gift-code roster limits per Discord server.
+    max_players_per_guild: int = 300
+    max_self_registered_players: int = 3
+    llm_timeout_seconds: float = 30.0
+    # Stored translation text is deleted after this many days (0 keeps it forever).
+    translation_log_retention_days: int = 30
+    # Minimum seconds between AI replies to the same user (direct mentions/replies).
+    chat_user_cooldown_seconds: float = 10.0
+    # Knowledge chunks farther than this cosine distance are ignored (0..2).
+    kingshot_rag_max_distance: float = 0.7
 
     def __post_init__(self):
         """Initialize mutable default values."""
@@ -61,6 +74,18 @@ class BotConfig:
             raise ValueError("NVIDIA_TTS_SAMPLE_RATE_HZ must be >= 8000")
         if self.nvidia_tts_max_text_chars < 1:
             raise ValueError("NVIDIA_TTS_MAX_TEXT_CHARS must be >= 1")
+        if self.max_players_per_guild < 1:
+            raise ValueError("MAX_PLAYERS_PER_GUILD must be >= 1")
+        if self.max_self_registered_players < 0:
+            raise ValueError("MAX_SELF_REGISTERED_PLAYERS must be >= 0")
+        if self.llm_timeout_seconds <= 0:
+            raise ValueError("LLM_TIMEOUT_SECONDS must be > 0")
+        if self.translation_log_retention_days < 0:
+            raise ValueError("TRANSLATION_LOG_RETENTION_DAYS must be >= 0")
+        if self.chat_user_cooldown_seconds < 0:
+            raise ValueError("CHAT_USER_COOLDOWN_SECONDS must be >= 0")
+        if not 0 < self.kingshot_rag_max_distance <= 2:
+            raise ValueError("KINGSHOT_RAG_MAX_DISTANCE must be in (0, 2]")
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -160,4 +185,10 @@ class BotConfig:
             admin_user_ids=admin_user_ids,
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,
+            max_players_per_guild=int(os.getenv("MAX_PLAYERS_PER_GUILD", "300")),
+            max_self_registered_players=int(os.getenv("MAX_SELF_REGISTERED_PLAYERS", "3")),
+            llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
+            translation_log_retention_days=int(os.getenv("TRANSLATION_LOG_RETENTION_DAYS", "30")),
+            chat_user_cooldown_seconds=float(os.getenv("CHAT_USER_COOLDOWN_SECONDS", "10")),
+            kingshot_rag_max_distance=float(os.getenv("KINGSHOT_RAG_MAX_DISTANCE", "0.7")),
         )

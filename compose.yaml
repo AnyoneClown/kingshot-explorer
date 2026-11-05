@@ -1,6 +1,19 @@
 name: ds-translator
 
 services:
+  # One-off: applies database migrations, then exits. The bot waits for it.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.local
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
   translator-bot-local:
     build:
       context: .
@@ -10,7 +23,12 @@ services:
       - .env.local
     environment:
       BOT_INSTANCE: local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
+    # Give in-flight gift-code batches time to persist on `docker stop`.
+    stop_grace_period: 30s
     dns:
       - 8.8.8.8
       - 1.1.1.1

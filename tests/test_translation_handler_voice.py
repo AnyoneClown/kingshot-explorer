@@ -51,6 +51,15 @@ class FakeChannel:
         return self._referenced_message
 
 
+class FakeSentMessage:
+    def __init__(self, kwargs):
+        self.kwargs = kwargs
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+
+
 class FakeContext:
     def __init__(self, referenced_message):
         self.author = SimpleNamespace(
@@ -68,7 +77,14 @@ class FakeContext:
         return FakeTyping()
 
     async def reply(self, *args, **kwargs):
-        self.replies.append({"args": args, "kwargs": kwargs})
+        sent = FakeSentMessage(kwargs)
+        self.replies.append({"args": args, "kwargs": kwargs, "sent": sent})
+        return sent
+
+
+async def run_and_wait(handler, coro):
+    await coro
+    await handler.wait_for_background_tasks()
 
 
 class FakeGuildConfigService:
@@ -94,7 +110,7 @@ def test_translate_to_language_attaches_voice_file():
     )
     ctx = FakeContext(FakeMessage("Hello everyone"))
 
-    asyncio.run(handler._handle_translate_to_language(ctx, "Spanish"))
+    asyncio.run(run_and_wait(handler, handler._handle_translate_to_language(ctx, "Spanish")))
 
     assert voice_service.calls == [
         (
@@ -105,9 +121,29 @@ def test_translate_to_language_attaches_voice_file():
             },
         )
     ]
-    reply_kwargs = ctx.replies[0]["kwargs"]
-    assert reply_kwargs["embed"].title == "Translated to Spanish"
-    assert reply_kwargs["file"].filename == "reply.ogg"
+    reply = ctx.replies[0]
+    # Text goes out first without waiting for TTS; the audio is added by editing it.
+    assert reply["kwargs"]["embed"].title == "Translated to Spanish"
+    assert "file" not in reply["kwargs"]
+    assert reply["kwargs"]["allowed_mentions"].users is False
+    assert [attachment.filename for attachment in reply["sent"].edits[0]["attachments"]] == ["reply.ogg"]
+
+
+def test_translate_to_english_speaks_english_not_the_source_language():
+    voice_service = FakeVoiceService()
+    handler = TranslationHandler(
+        translation_service=FakeTranslationService(),
+        chatbot_service=FakeChatbotService(),
+        voice_message_service=voice_service,
+        bot=SimpleNamespace(user=None),
+        config=SimpleNamespace(banned_players=set()),
+    )
+    ctx = FakeContext(FakeMessage("Hola a todos"))
+
+    asyncio.run(run_and_wait(handler, handler._handle_translate_to_english(ctx)))
+
+    assert ctx.replies[0]["kwargs"]["embed"].title == "Translated from Spanish"
+    assert voice_service.calls[0][1]["language_hint"] == "English"
 
 
 def test_translate_to_language_skips_voice_when_guild_config_disables_it():
@@ -122,12 +158,13 @@ def test_translate_to_language_skips_voice_when_guild_config_disables_it():
     )
     ctx = FakeContext(FakeMessage("Hello everyone"))
 
-    asyncio.run(handler._handle_translate_to_language(ctx, "Spanish"))
+    asyncio.run(run_and_wait(handler, handler._handle_translate_to_language(ctx, "Spanish")))
 
     assert voice_service.calls == []
-    reply_kwargs = ctx.replies[0]["kwargs"]
-    assert reply_kwargs["embed"].title == "Translated to Spanish"
-    assert "file" not in reply_kwargs
+    reply = ctx.replies[0]
+    assert reply["kwargs"]["embed"].title == "Translated to Spanish"
+    assert "file" not in reply["kwargs"]
+    assert reply["sent"].edits == []
 
 
 def test_direct_reply_detection_fetches_unresolved_reference():

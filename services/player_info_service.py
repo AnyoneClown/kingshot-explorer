@@ -2,9 +2,15 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
-from services.kingshot_api import KingshotAPIClient
-
 logger = logging.getLogger(__name__)
+
+
+class PlayerLookupUnavailable(Exception):
+    """The player lookup service could not answer (outage, auth, missing key).
+
+    Distinct from "player not found" (``get_player_info`` returns ``None``), so
+    callers can tell users to retry later instead of telling them the ID is wrong.
+    """
 
 
 class IPlayerInfoService(ABC):
@@ -12,66 +18,83 @@ class IPlayerInfoService(ABC):
 
     @abstractmethod
     async def get_player_info(self, player_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch player information by ID."""
+        """Fetch player information by Governor ID.
+
+        Returns the normalized profile, ``None`` when the player does not exist, and
+        raises ``PlayerLookupUnavailable`` when the lookup service is unavailable.
+        """
         pass
 
 
 class PlayerInfoService(IPlayerInfoService):
-    """Service responsible for fetching player information from external API."""
+    """Validates Governor IDs and fetches basic profiles through the KingShot Data API.
 
-    def __init__(self):
-        """
-        Initialize player info service.
-        """
-        logger.info("PlayerInfoService initialized using original Kingshot API")
+    The original gift-code API is reserved for redemptions (it is rate limited to
+    30 requests/minute), so lookups go through ``/v1/players/by-fid/{fid}``.
+    """
+
+    def __init__(self, kingshot_data_service=None):
+        self._kingshot_data_service = kingshot_data_service
+        logger.info("PlayerInfoService initialized using the KingShot Data API")
+
+    @staticmethod
+    def _normalize(raw_data: Dict[str, Any], player_id: str) -> Dict[str, Any]:
+        uid = raw_data.get("uid")
+        alliance = raw_data.get("alliance") if isinstance(raw_data.get("alliance"), dict) else {}
+        return {
+            "name": raw_data.get("name"),
+            "playerId": str(raw_data.get("fid") or player_id),
+            "playerUid": str(uid) if uid not in (None, "", 0, "0") else None,
+            "level": raw_data.get("stove_lv"),
+            "kingdom": raw_data.get("kid"),
+            "power": raw_data.get("power"),
+            "allianceTag": alliance.get("abbr"),
+            "profilePhoto": raw_data.get("avatar_image"),
+        }
 
     async def get_player_info(self, player_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch player information from the API.
-
-        Args:
-            player_id: The player ID to look up
-
-        Returns:
-            Dictionary containing player information, or None if request failed
-        """
-        logger.info(f"Fetching player info for ID: {player_id}")
-        try:
-            async with KingshotAPIClient() as client:
-                response = await client.get_player(player_id)
-                # Success response should have code 0
-                if response.get("code") == 0:
-                    raw_data = response.get("data", {})
-                    if raw_data:
-                        # Normalize to old format to minimize handler changes
-                        player_data = {
-                            "name": raw_data.get("nickname"),
-                            "playerId": str(raw_data.get("fid", player_id)),
-                            "playerUid": str(raw_data.get("uid")) if raw_data.get("uid") is not None else None,
-                            "level": raw_data.get("stove_lv"),
-                            "kingdom": raw_data.get("kid"),
-                            "profilePhoto": raw_data.get("avatar_image"),
-                        }
-                        logger.info(
-                            f"Successfully fetched player info for ID {player_id}: "
-                            f"{player_data.get('name', 'Unknown')} (Kingdom {player_data.get('kingdom', 'N/A')})"
-                        )
-                    else:
-                        player_data = {}
-                        logger.warning(f"API returned code 0 but no data for player ID: {player_id}")
-                    return player_data
-                elif response.get("err_code") == 40004 or "not exist" in str(response.get("msg", "")).lower():
-                    logger.warning(f"Player not found: {player_id}")
-                    return None
-                else:
-                    logger.error(f"API error for player {player_id}: {response}")
-                    return None
-        except Exception as e:
-            logger.error(
-                f"Unexpected error fetching player info for {player_id}: {e}",
-                exc_info=True,
-            )
+        player_id = str(player_id).strip()
+        logger.info("Fetching player info for ID: %s", player_id)
+        if not player_id.isdigit():
             return None
+        if self._kingshot_data_service is None:
+            raise PlayerLookupUnavailable("KingShot Data API is not configured.")
+
+        try:
+            result = await self._kingshot_data_service.get_player_by_fid(player_id)
+        except Exception as exc:  # network stack errors are already mapped, but be safe
+            logger.error("Player lookup failed for %s: %s", player_id, exc, exc_info=True)
+            raise PlayerLookupUnavailable(str(exc)) from exc
+
+        if not result.get("success"):
+            status_code = result.get("status_code")
+            if status_code == 404:
+                return None
+            logger.warning(
+                "Player lookup unavailable for %s: %s %s",
+                player_id,
+                result.get("error_code"),
+                result.get("error_message"),
+            )
+            raise PlayerLookupUnavailable(result.get("error_message") or "Player lookup failed.")
+
+        raw_data = result.get("data")
+        if not isinstance(raw_data, dict) or raw_data.get("error"):
+            logger.info("Player not found: %s", player_id)
+            return None
+        # Unknown ids can come back as null-filled profiles.
+        if raw_data.get("uid") in (None, 0, "0") and not raw_data.get("name"):
+            logger.info("Player not found (empty profile): %s", player_id)
+            return None
+
+        player_data = self._normalize(raw_data, player_id)
+        logger.info(
+            "Fetched player info for ID %s: %s (Kingdom %s)",
+            player_id,
+            player_data.get("name") or "Unknown",
+            player_data.get("kingdom") or "N/A",
+        )
+        return player_data
 
     def format_player_stats(self, player_data: Dict[str, Any]) -> str:
         """

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from db.session import DatabaseManager, get_db
@@ -13,10 +15,23 @@ from repositories.discord_repositories import (
     TranslationLogRepository,
     UserRepository,
 )
+from services.transactions import run_db_operation
+
+logger = logging.getLogger(__name__)
+
+# Rows deleted per transaction when purging translation logs (keeps CockroachDB
+# transactions small).
+TRANSLATION_PURGE_BATCH_SIZE = 5000
 
 
 class InteractionTrackingService:
-    """Tracks user activity and related persistence side effects."""
+    """Tracks user activity and related persistence side effects.
+
+    Writes that create rows on first sight (users, player profiles) are
+    read-then-insert, so they run through ``run_in_transaction`` with
+    ``retry_on_integrity_error=True``: a concurrent insert of the same key makes the
+    loser retry and find the existing row instead of failing.
+    """
 
     def __init__(self, db_manager: DatabaseManager | None = None):
         self._db_manager = db_manager
@@ -34,10 +49,20 @@ class InteractionTrackingService:
         async with db.session() as session:
             yield session
 
+    async def _run(self, operation, *, session=None, retry_on_integrity_error: bool = False):
+        if session is not None:
+            return await operation(session)
+        return await run_db_operation(
+            await self._get_db_manager(),
+            operation,
+            retry_on_integrity_error=retry_on_integrity_error,
+        )
+
     async def track_user(self, *, session=None, user_id, username, discriminator, display_name):
-        async with self._session(session) as db_session:
-            user_repo = UserRepository(db_session)
-            return await user_repo.upsert(user_id, username, discriminator, display_name)
+        async def operation(db_session):
+            return await UserRepository(db_session).upsert(user_id, username, discriminator, display_name)
+
+        return await self._run(operation, session=session, retry_on_integrity_error=True)
 
     async def track_translation(
         self,
@@ -54,18 +79,11 @@ class InteractionTrackingService:
         display_name: Optional[str] = None,
         session: Optional[Any] = None,
     ):
-        async with self._session(session) as db_session:
+        async def operation(db_session):
             if username is not None:
-                await self.track_user(
-                    session=db_session,
-                    user_id=user_id,
-                    username=username,
-                    discriminator=discriminator,
-                    display_name=display_name,
-                )
+                await UserRepository(db_session).upsert(user_id, username, discriminator, display_name)
 
-            translation_repo = TranslationLogRepository(db_session)
-            await translation_repo.create(
+            await TranslationLogRepository(db_session).create(
                 user_id=user_id,
                 original_text=original_text,
                 translated_text=translated_text,
@@ -75,6 +93,33 @@ class InteractionTrackingService:
                 guild_id=guild_id,
                 channel_id=channel_id,
             )
+
+        await self._run(operation, session=session, retry_on_integrity_error=True)
+
+    async def purge_old_translation_logs(self, older_than_days: int) -> int:
+        """Delete translation logs older than ``older_than_days`` days; return the count.
+
+        Deletes in batches of ``TRANSLATION_PURGE_BATCH_SIZE`` rows, one transaction
+        per batch, so a large backlog never builds one huge transaction.
+        """
+        if older_than_days < 1:
+            raise ValueError("older_than_days must be >= 1")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+        async def operation(db_session) -> int:
+            return await TranslationLogRepository(db_session).delete_older_than(
+                cutoff, limit=TRANSLATION_PURGE_BATCH_SIZE
+            )
+
+        total = 0
+        while True:
+            deleted = await self._run(operation)
+            total += deleted
+            if deleted < TRANSLATION_PURGE_BATCH_SIZE:
+                break
+        if total:
+            logger.info("Purged %s translation logs older than %s days", total, older_than_days)
+        return total
 
     async def track_player_lookup(
         self,
@@ -92,16 +137,24 @@ class InteractionTrackingService:
         display_name: Optional[str] = None,
         session: Optional[Any] = None,
     ):
-        del guild_id, channel_id
-        async with self._session(session) as db_session:
+        """Record a lookup: refresh the user and cache the player's profile.
+
+        Lookups never add a player to a server's gift-code roster; profiles created
+        here start disabled, so they are not auto-redeemed. There is no lookup log
+        table, so ``guild_id``/``channel_id`` are only used for diagnostics.
+        """
+        logger.debug(
+            "Player lookup by user %s for %s (success=%s, guild=%s, channel=%s)",
+            user_id,
+            player_id,
+            success,
+            guild_id,
+            channel_id,
+        )
+
+        async def operation(db_session):
             if username is not None:
-                await self.track_user(
-                    session=db_session,
-                    user_id=user_id,
-                    username=username,
-                    discriminator=discriminator,
-                    display_name=display_name,
-                )
+                await UserRepository(db_session).upsert(user_id, username, discriminator, display_name)
 
             if not success:
                 return None
@@ -115,6 +168,8 @@ class InteractionTrackingService:
                 added_by_user_id=user_id,
             )
 
+        return await self._run(operation, session=session, retry_on_integrity_error=True)
+
     async def sync_player_metadata(
         self,
         player_id: str,
@@ -125,7 +180,7 @@ class InteractionTrackingService:
         added_by_user_id: Optional[int] = None,
         session: Optional[Any] = None,
     ) -> bool:
-        async with self._session(session) as db_session:
+        async def operation(db_session):
             return await RegisteredPlayerRepository(db_session).sync_metadata(
                 player_id=player_id,
                 player_uid=player_uid,
@@ -135,13 +190,17 @@ class InteractionTrackingService:
                 added_by_user_id=added_by_user_id,
             )
 
+        return await self._run(operation, session=session, retry_on_integrity_error=True)
+
     async def sync_player_metadata_many(
         self,
         players: list[dict[str, Any]],
         session: Optional[Any] = None,
     ) -> int:
-        async with self._session(session) as db_session:
+        async def operation(db_session):
             return await RegisteredPlayerRepository(db_session).sync_metadata_many(players)
+
+        return await self._run(operation, session=session, retry_on_integrity_error=True)
 
     async def log_gift_code_redemption(
         self,
@@ -156,9 +215,8 @@ class InteractionTrackingService:
         channel_id: Optional[int] = None,
         session: Optional[Any] = None,
     ):
-        async with self._session(session) as db_session:
-            redemption_repo = GiftCodeRedemptionRepository(db_session)
-            await redemption_repo.create(
+        async def operation(db_session):
+            await GiftCodeRedemptionRepository(db_session).create(
                 user_id=user_id,
                 player_id=player_id,
                 gift_code=gift_code,
@@ -169,14 +227,17 @@ class InteractionTrackingService:
                 channel_id=channel_id,
             )
 
+        await self._run(operation, session=session)
+
     async def log_gift_code_redemptions_many(
         self,
         rows: list[dict[str, Any]],
         session: Optional[Any] = None,
     ):
-        async with self._session(session) as db_session:
-            redemption_repo = GiftCodeRedemptionRepository(db_session)
-            return await redemption_repo.create_many(rows)
+        async def operation(db_session):
+            return await GiftCodeRedemptionRepository(db_session).create_many(rows)
+
+        return await self._run(operation, session=session)
 
     async def is_voice_replies_enabled(self, guild_id: int, default_enabled: bool = True) -> bool:
         async with self._session() as db_session:

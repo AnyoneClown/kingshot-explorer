@@ -94,3 +94,171 @@ def test_comparison_direct_history_has_all_matches():
         assert "Dead heat" in view.build_embed().description
 
     asyncio.run(check())
+
+
+def _interaction():
+    return SimpleNamespace(
+        user=SimpleNamespace(id=1, name="Tester", discriminator="0"),
+        guild=None,
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock(), edit_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))),
+    )
+
+
+def test_history_lines_use_clear_win_loss_markers_and_long_timeouts():
+    handler = KVKHandler(SimpleNamespace(), object())
+    line = handler._format_history_line(
+        {"season_id": 13, "season_date": "2026-04-25", "opponent": 892, "side": "defender",
+         "castleResult": "win", "prepResult": "loss"}
+    )
+    assert line.startswith("#13 · 2026-04-25 · vs **K892** · 🛡️ Defense")
+    assert "Castle ✅ Win · Prep ❌ Loss" in line
+    unknown = handler._format_history_line({"season_id": None, "castleResult": None})
+    assert "#? " in unknown and "Castle ❔ Unknown" in unknown and "vs **K?**" in unknown
+    assert "Castle ✅ Win" in handler._build_latest_match_summary(
+        {"season_id": 13, "opponent": 892, "castleResult": "win", "prepResult": "loss"}
+    )
+
+    async def build_view():
+        return KVKHistoryView(handler, 830, {"history": []}, 1)
+
+    assert asyncio.run(build_view()).timeout == 900
+
+
+def test_kvk_commands_use_ranges_and_validate_before_deferring():
+    from discord import Intents
+    from discord.ext import commands
+
+    bot = commands.Bot(command_prefix="!", intents=Intents.none())
+    KVKHandler(SimpleNamespace(), bot, dossier_service=SimpleNamespace()).register_commands()
+    for name, parameters in (("kvk", ["kingdom_number"]), ("kvk_compare", ["kingdom_a", "kingdom_b"]),
+                             ("kvk_prep", ["kingdom_a", "kingdom_b"])):
+        command = bot.tree.get_command(name)
+        for parameter in parameters:
+            option = command.get_parameter(parameter)
+            assert (option.min_value, option.max_value) == (1, 99999), (name, parameter)
+    assert bot.tree.get_command("kvk_prep").checks  # per-user cooldown
+
+    plain_bot = commands.Bot(command_prefix="!", intents=Intents.none())
+    KVKHandler(SimpleNamespace(), plain_bot).register_commands()
+    assert plain_bot.tree.get_command("kvk_prep") is None
+
+    async def check():
+        handler = KVKHandler(SimpleNamespace(get_kingdom_stats=AsyncMock(), compare_kingdoms=AsyncMock()), object(),
+                             dossier_service=SimpleNamespace(build_dossier=AsyncMock()))
+        cases = [
+            (handler._handle_get_kvk_stats_slash, (0,)),
+            (handler._handle_get_kvk_stats_slash, (100000,)),
+            (handler._handle_compare_kvk_slash, (830, 830)),
+            (handler._handle_compare_kvk_slash, (830, -1)),
+            (handler._handle_kvk_prep, (830, 830)),
+        ]
+        for method, args in cases:
+            interaction = _interaction()
+            await method(interaction, *args)
+            interaction.response.defer.assert_not_awaited()
+            assert interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+        handler._kvk_service.get_kingdom_stats.assert_not_awaited()
+        handler._dossier_service.build_dossier.assert_not_awaited()
+
+    asyncio.run(check())
+
+
+def _dossier(**overrides):
+    def ok(data):
+        return {"ok": True, "data": data, "error": None}
+
+    castle = {
+        "owner_kid": 830, "foreign_owner": False, "king": {"name": "Nyan", "abbr": "TMN", "home_kid": 830,
+                                                            "is_foreign": False},
+        "recent_reigns": [{"name": "Zero", "abbr": "J4F", "home_kid": 556, "ts": 1762626159,
+                           "is_cross_mode": True, "is_invader": True}],
+        "top_kings": [{"name": "Nyan", "abbr": "TMN", "king_terms": 18, "high_king_terms": 3}],
+        "kvk": {"victories": 5, "last_opponent_kid": 565, "last_ts": 1779549621}, "kvk_included": True,
+    }
+    rows = [{"rank": index, "name": f"Player {index}", "abbr": "TOP", "score": 1_230_000_000 // index}
+            for index in range(1, 6)]
+    history = {"matchCount": 3, "wins": 2, "losses": 1, "prepWins": 1, "prepLosses": 2, "currentStreak": "W2",
+               "recent": [{"season_id": 13, "opponent": 892, "castleResult": "win", "prepResult": "loss"}]}
+    intel = {
+        "castle": ok(castle),
+        "alliances": ok([{"abbr": "TOP", "name": "Top Alliance", "power": 12_300_000_000}]),
+        "top_power": ok(rows), "top_kills": ok(rows), "kvk_history": ok(history),
+    }
+    intel_b = dict(intel, castle=ok(dict(castle, owner_kid=845, foreign_owner=True)))
+    dossier = {
+        "kingdom_a": intel, "kingdom_b": intel_b,
+        "head_to_head": ok({"match_count": 1, "kingdom_a": {"wins": 0, "losses": 1, "prepWins": 1, "prepLosses": 0},
+                            "recent": [{"season_id": 9, "opponent": 831, "castleResult": "loss", "prepResult": "win"}]}),
+    }
+    dossier.update(overrides)
+    return dossier
+
+
+def test_prep_dossier_embed_is_readable_and_tolerates_missing_sections():
+    handler = KVKHandler(SimpleNamespace(), object())
+    embed = handler._build_dossier_embed(830, 831, _dossier())
+    fields = {field.name: field.value for field in embed.fields}
+
+    assert embed.title == "🛡️ KvK Prep · K830 vs K831"
+    assert "K831's castle is held by **K845**" in embed.description
+    assert "Met 1× before · K830 castle 0-1" in embed.description
+    assert "👑 King: **Nyan `[TMN]`** · K830" in fields["🏰 Kingdom 830 · Castle & throne"]
+    assert "⚠️ Castle occupied by K845" in fields["🏰 Kingdom 831 · Castle & throne"]
+    assert "Zero `[J4F]` · <t:1762626159:d> · ⚔️ KvK · 🚩 from K556" in fields["🏰 Kingdom 830 · Castle & throne"]
+    assert fields["🤝 K830 top alliances"] == "1. `[TOP]` Top Alliance · 12.3B"
+    assert fields["💪 K830 top power"].startswith("1. `[TOP]` Player 1 · 1.23B")
+    assert "Castle ❌ Loss · Prep ✅ Win" in fields["📜 KvK record"]
+    assert len(embed.fields) <= 25 and len(embed) <= 6000
+
+    broken = {"ok": False, "data": None, "error": "game gateway error"}
+    partial = _dossier(head_to_head=broken)
+    partial["kingdom_a"] = dict(partial["kingdom_a"], castle=broken, alliances=broken, kvk_history=broken)
+    partial["kingdom_b"] = dict(partial["kingdom_b"], top_kills={"ok": True, "data": [], "error": None})
+    embed = handler._build_dossier_embed(830, 831, partial)
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["🏰 Kingdom 830 · Castle & throne"] == "Unavailable (game gateway error)"
+    assert fields["🤝 K830 top alliances"] == "Unavailable (game gateway error)"
+    assert fields["🗡️ K831 top kills"] == "No ranking returned"
+    assert "Direct match history unavailable" in embed.description
+
+    huge = _dossier()
+    long_row = {"rank": 1, "name": "N" * 500, "abbr": "TOP", "score": 1}
+    for intel in (huge["kingdom_a"], huge["kingdom_b"]):
+        intel["top_power"] = {"ok": True, "data": [long_row] * 100, "error": None}
+        intel["castle"]["data"]["recent_reigns"] = [{"name": "@everyone" + "x" * 500, "ts": 1}] * 50
+    embed = handler._build_dossier_embed(830, 831, huge)
+    assert len(embed) <= 6000 and all(len(field.value) <= 1024 for field in embed.fields)
+    assert "@everyone" not in str(embed.fields[0].value)
+
+
+def test_compare_panel_offers_public_prep_dossier():
+    async def check():
+        summary = {"history": [], "matchCount": 0, "wins": 0, "losses": 0}
+        service = SimpleNamespace(compare_kingdoms=AsyncMock(return_value={"success": True, "data": {
+            "kingdom_a": summary, "kingdom_b": summary, "score": {"830": 0, "831": 0},
+            "head_to_head": {"available": True, "matches": [], "kingdom_a": summary, "kingdom_b": summary},
+        }}))
+        dossier_service = SimpleNamespace(build_dossier=AsyncMock(return_value=_dossier()))
+        handler = KVKHandler(service, object(), dossier_service=dossier_service)
+        interaction = _interaction()
+        await handler._handle_compare_kvk_slash(interaction, 830, 831)
+        view = interaction.followup.send.call_args.kwargs["view"]
+        assert view.timeout == 900
+        assert view.dossier_button is not None and view.dossier_button in view.children
+        assert "Prep dossier posts a new message" in view.build_embed().footer.text
+
+        click = _interaction()
+        await view.dossier_button.callback(click)
+        dossier_service.build_dossier.assert_awaited_once_with(830, 831)
+        click.response.defer.assert_awaited_once_with(thinking=True)
+        sent = click.followup.send.call_args
+        assert sent.kwargs["embed"].title == "🛡️ KvK Prep · K830 vs K831"
+        assert "ephemeral" not in sent.kwargs
+
+        plain = KVKHandler(service, object())
+        plain_interaction = _interaction()
+        await plain._handle_compare_kvk_slash(plain_interaction, 830, 831)
+        assert plain_interaction.followup.send.call_args.kwargs["view"].dossier_button is None
+
+    asyncio.run(check())

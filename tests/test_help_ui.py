@@ -144,7 +144,7 @@ async def test_admin_access_is_rechecked_when_form_is_submitted():
 @pytest.mark.asyncio
 async def test_import_alliance_guides_users_to_native_autocomplete():
     bot, calls = make_bot(local=True)
-    handler = HelpHandler(bot)
+    handler = HelpHandler(bot, {1})
     ctx = interaction()
     await handler.open_command(ctx, name="addalliance", label="Import alliance")
     ctx.response.send_modal.assert_not_awaited()
@@ -185,7 +185,6 @@ async def test_help_is_registered_with_all_workflows_and_native_alliance_autocom
     from config.bot_config import BotConfig
     from main import TranslatorBot
 
-    monkeypatch.setattr("main.ChatNVIDIA", lambda **kwargs: SimpleNamespace())
     config = BotConfig(
         discord_token="test-token",
         database_url="postgresql+asyncpg://user:pass@localhost/test",
@@ -202,3 +201,24 @@ async def test_help_is_registered_with_all_workflows_and_native_alliance_autocom
     await app.db_manager.close()
     if app.nvidia_client:
         await app.nvidia_client.close()
+
+
+@pytest.mark.asyncio
+async def test_panel_edit_falls_back_to_bot_token_after_interaction_token_expires():
+    from unittest.mock import Mock
+
+    from handlers.ui import edit_panel_message
+
+    expired = discord.HTTPException(Mock(status=401, reason="Unauthorized"), "Invalid Webhook Token")
+    partial = SimpleNamespace(edit=AsyncMock(return_value="edited"))
+    channel = SimpleNamespace(get_partial_message=Mock(return_value=partial))
+    message = SimpleNamespace(
+        id=42, channel=channel, flags=SimpleNamespace(ephemeral=False), edit=AsyncMock(side_effect=expired)
+    )
+
+    assert await edit_panel_message(message, view=None) == "edited"
+    channel.get_partial_message.assert_called_once_with(42)
+
+    message.flags.ephemeral = True
+    with pytest.raises(discord.HTTPException):
+        await edit_panel_message(message, view=None)

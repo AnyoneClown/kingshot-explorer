@@ -1,14 +1,38 @@
 """Database session management and configuration."""
 
+import asyncio
 import logging
+import random
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable, TypeVar
 
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from db.models import Base
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# CockroachDB reports transaction contention as SQLSTATE 40001 and expects the
+# client to retry the whole transaction.
+_RETRYABLE_SQLSTATES = {"40001"}
+
+
+def is_retryable_db_error(error: BaseException) -> bool:
+    """Return True for CockroachDB serialization failures that should be retried."""
+    if not isinstance(error, DBAPIError):
+        return False
+    candidates = [error.orig, getattr(error.orig, "__cause__", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        code = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if code in _RETRYABLE_SQLSTATES:
+            return True
+    message = str(error).lower()
+    return "restart transaction" in message or "40001" in message
 
 
 class DatabaseManager:
@@ -76,6 +100,43 @@ class DatabaseManager:
                 raise
             finally:
                 await session.close()
+
+    async def run_in_transaction(
+        self,
+        operation: Callable[[AsyncSession], Awaitable[T]],
+        *,
+        attempts: int = 4,
+        retry_on_integrity_error: bool = False,
+    ) -> T:
+        """Run ``operation`` in its own transaction, retrying CockroachDB contention.
+
+        ``operation`` receives a fresh session for every attempt and must not keep
+        state between attempts. Set ``retry_on_integrity_error`` for read-then-insert
+        upserts, where a concurrent insert of the same key surfaces as a unique
+        violation and the retry then finds the existing row.
+        """
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self.session() as session:
+                    return await operation(session)
+            except IntegrityError as error:
+                if not retry_on_integrity_error or attempt == attempts:
+                    raise
+                last_error = error
+            except DBAPIError as error:
+                if not is_retryable_db_error(error) or attempt == attempts:
+                    raise
+                last_error = error
+            delay = min(2.0, 0.05 * (2 ** (attempt - 1))) * (0.5 + random.random())
+            logger.warning(
+                "Retrying database transaction (attempt %s/%s) after: %s",
+                attempt + 1,
+                attempts,
+                last_error,
+            )
+            await asyncio.sleep(delay)
+        raise RuntimeError("unreachable") from last_error
 
     async def close(self):
         """Close the database connection pool."""

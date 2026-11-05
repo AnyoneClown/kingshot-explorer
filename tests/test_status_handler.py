@@ -70,6 +70,7 @@ def make_config():
         discord_token="token",
         database_url="postgresql+asyncpg://user:pass@localhost/test",
         nvidia_api_key="key",
+        admin_user_ids={111},
     )
 
 
@@ -77,8 +78,15 @@ def field_values(embed: discord.Embed) -> dict[str, str]:
     return {field.name: field.value for field in embed.fields}
 
 
-async def render_status(handler: StatusHandler):
-    interaction = SimpleNamespace(response=FakeResponse(), followup=FakeFollowup())
+OPERATOR_ID = 111
+
+
+async def render_status(handler: StatusHandler, user_id: int = OPERATOR_ID):
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=user_id),
+        response=FakeResponse(),
+        followup=FakeFollowup(),
+    )
     await handler._handle_status(interaction)
     assert interaction.response.deferred is True
     assert interaction.response.defer_kwargs == {"thinking": True, "ephemeral": True}
@@ -104,10 +112,15 @@ async def test_status_distinguishes_disabled_and_stopped_workers():
     embed = await render_status(handler)
     fields = field_values(embed)
 
-    assert fields["Scheduler"] == "ISSUE - Stopped"
-    assert fields["Gift Polling"] == "INFO - Disabled"
+    assert fields["Scheduler"] == "⚠️ Stopped"
+    assert fields["Gift Polling"] == "⏸️ Disabled"
     assert fields["AI Chat Model"] == "`nvidia/nemotron-3-ultra-550b-a55b`"
     assert embed.color == discord.Color.orange()
+
+    member_fields = field_values(await render_status(handler, user_id=999))
+    assert "AI Chat Model" not in member_fields
+    assert "Guilds" not in member_fields
+    assert member_fields["Scheduler"] == "⚠️ Stopped"
 
 
 @pytest.mark.asyncio
@@ -127,11 +140,11 @@ async def test_enabled_gift_polling_and_data_gateway_failures_affect_health():
     embed = await render_status(handler)
     fields = field_values(embed)
 
-    assert fields["Database"] == "ISSUE - Unavailable"
+    assert fields["Database"] == "⚠️ Unavailable"
     assert "do-not-leak" not in str(embed.to_dict())
-    assert fields["KingShot Data API"] == "ISSUE - Degraded"
-    assert fields["Scheduler"] == "OK - Running"
-    assert fields["Gift Polling"] == "ISSUE - Stopped"
+    assert fields["KingShot Data API"] == "⚠️ Degraded"
+    assert fields["Scheduler"] == "✅ Running"
+    assert fields["Gift Polling"] == "⚠️ Stopped"
     assert embed.color == discord.Color.orange()
 
 

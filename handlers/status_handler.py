@@ -33,6 +33,7 @@ class StatusHandler:
         started_at: datetime,
         scheduler_enabled: bool | None = None,
         gift_polling_enabled: bool | None = None,
+        access_policy=None,
     ):
         self._bot = bot
         self._config = config
@@ -41,6 +42,7 @@ class StatusHandler:
         self._alliance_power_handler = alliance_power_handler
         self._kingshot_data_service = kingshot_data_service
         self._started_at = started_at
+        self._access = access_policy
         self._database_health_service = database_health_service or DatabaseHealthService()
         self._scheduler_enabled = True if scheduler_enabled is None else scheduler_enabled
         self._gift_polling_enabled = True if gift_polling_enabled is None else gift_polling_enabled
@@ -96,6 +98,9 @@ class StatusHandler:
             required_checks.append(power_polling_state == "running")
         color = EmbedColors.SUCCESS if all(required_checks) else EmbedColors.WARNING
 
+        scheduler_health = self._scheduler_health()
+        is_operator = self._is_operator(interaction)
+
         embed = build_status_embed(
             title="Bot Status",
             description=(
@@ -103,7 +108,7 @@ class StatusHandler:
                 else "Some features are unavailable. Check the affected services below."
             ),
             color=color,
-            footer="Private status response",
+            footer="Private status response" + (" · operator details included" if is_operator else ""),
         )
         embed.timestamp = now
         embed.add_field(name="Discord", value=status_value(not self._bot.is_closed()), inline=True)
@@ -115,24 +120,63 @@ class StatusHandler:
         else:
             data_api_value = status_value(data_api_health[0], "Reachable", data_api_health[1])
         embed.add_field(name="KingShot Data API", value=data_api_value, inline=True)
-        embed.add_field(name="Scheduler", value=self._component_value(scheduler_state), inline=True)
+        scheduler_value = self._component_value(scheduler_state)
+        summary = self._scheduler_summary(scheduler_health)
+        if summary and scheduler_state == "running":
+            scheduler_value = f"{scheduler_value}\n{summary}"[:1024]
+        embed.add_field(name="Scheduler", value=scheduler_value, inline=True)
         embed.add_field(name="Gift Polling", value=self._component_value(gift_polling_state), inline=True)
         embed.add_field(name="Power Tracking", value=self._component_value(power_polling_state), inline=True)
-        embed.add_field(name="Guilds", value=str(len(self._bot.guilds)), inline=True)
-        embed.add_field(
-            name="AI Chat Model",
-            value=f"`{self._config.nvidia_chat_model}`",
-            inline=True,
-        )
-        embed.add_field(name="Chat Context", value=f"{self._config.chat_history_limit} messages", inline=True)
-        embed.add_field(name="Random Replies", value=f"{self._config.random_reply_chance:.0%}", inline=True)
-        embed.add_field(
-            name="Auto-Redeem Channels",
-            value=str(len(self._config.auto_redeem_channels)),
-            inline=True,
-        )
+
+        # Deployment details are only useful to (and only shown to) bot operators.
+        if is_operator:
+            embed.add_field(name="Guilds", value=str(len(self._bot.guilds)), inline=True)
+            embed.add_field(
+                name="AI Chat Model",
+                value=f"`{self._config.nvidia_chat_model}`",
+                inline=True,
+            )
+            embed.add_field(name="Chat Context", value=f"{self._config.chat_history_limit} messages", inline=True)
+            embed.add_field(name="Random Replies", value=f"{self._config.random_reply_chance:.0%}", inline=True)
+            embed.add_field(
+                name="Auto-Redeem Channels",
+                value=str(len(self._config.auto_redeem_channels)),
+                inline=True,
+            )
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    def _is_operator(self, interaction: discord.Interaction) -> bool:
+        user = getattr(interaction, "user", None)
+        user_id = getattr(user, "id", None)
+        if self._access is not None:
+            return self._access.is_super_admin(user_id)
+        return user_id is not None and int(user_id) in (self._config.admin_user_ids or set())
+
+    def _scheduler_health(self) -> Any:
+        reader = getattr(self._event_handler, "scheduler_health", None)
+        if reader is None:
+            return None
+        try:
+            return reader()
+        except Exception:
+            logger.exception("Could not read scheduler health")
+            return None
+
+    @staticmethod
+    def _scheduler_summary(health: Any) -> str:
+        """Short delivery stats; warns when reminders failed or the loop looks stuck."""
+        if health is None:
+            return ""
+        summary = getattr(health, "summary", None)
+        text = summary() if callable(summary) else ""
+        last_success = getattr(health, "last_success_at", None)
+        if last_success is not None:
+            if last_success.tzinfo is None:
+                last_success = last_success.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - last_success).total_seconds() > 300:
+                text = f"⚠️ No successful run for over 5 minutes\n{text}"
+        return text
 
     async def _check_database(self) -> tuple[bool, str]:
         try:
@@ -185,10 +229,10 @@ class StatusHandler:
     @staticmethod
     def _component_value(state: str) -> str:
         if state == "running":
-            return "OK - Running"
+            return "✅ Running"
         if state == "disabled":
-            return "INFO - Disabled"
-        return "ISSUE - Stopped"
+            return "⏸️ Disabled"
+        return "⚠️ Stopped"
 
     @staticmethod
     def _format_duration(total_seconds: int) -> str:

@@ -76,3 +76,22 @@ def test_build_kingdom_summary_counts_kvk_match_outcomes():
     assert summary["defensesHeld"] == 1
     assert summary["currentStreak"] == "W2"
     assert summary["latestMatch"]["season_id"] == 13
+
+
+def test_head_to_head_summarizes_direct_matches_from_both_sides():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    service = KVKService()
+    service._fetch_matches = AsyncMock(return_value={"success": True, "data": RAW_MATCHES[:1]})
+
+    result = asyncio.run(service.get_head_to_head(830, 892))
+
+    service._fetch_matches.assert_awaited_once_with(830, opponent_number=892, limit=100)
+    data = result["data"]
+    assert result["success"] and data["matches"][0]["opponent"] == 892
+    assert (data["kingdom_a"]["wins"], data["kingdom_a"]["prepLosses"]) == (1, 1)
+    assert (data["kingdom_b"]["losses"], data["kingdom_b"]["prepWins"]) == (1, 1)
+
+    service._fetch_matches = AsyncMock(return_value={"success": False, "message": "down"})
+    assert asyncio.run(service.get_head_to_head(830, 892)) == {"success": False, "message": "down"}

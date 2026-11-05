@@ -3,6 +3,7 @@
 from db.models import (
     Base,
     GuildConfiguration,
+    GuildPlayerRegistration,
     KingshotChunk,
     KingshotEntity,
     RegisteredPlayer,
@@ -19,6 +20,7 @@ __all__ = [
     "RegisteredPlayer",
     "ScheduledReminder",
     "GuildConfiguration",
+    "GuildPlayerRegistration",
     "KingshotEntity",
     "KingshotChunk",
     "DatabaseManager",

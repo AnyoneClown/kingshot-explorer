@@ -132,3 +132,19 @@ Amane can blind people.
   - `KingshotRAGService.EMBEDDING_DIMENSIONS`
   - SQL casts in `KingshotRAGService`
   - tests
+
+## Retrieval Cutoff and Chat Tools
+
+- `KingshotRAGService.search()` ignores chunks whose cosine distance exceeds
+  `max_distance` (env `KINGSHOT_RAG_MAX_DISTANCE`, default `0.7`, i.e. similarity ≥ 0.3).
+  The default is a starting guess; tune it from the distances logged by `/kingshot_ask`.
+- When nothing passes the cutoff, `answer_question` returns a fixed "no matching
+  knowledge" answer without calling the chat model, and `/kingshot_ask` shows a
+  **No Matching Knowledge** embed.
+- Retrieved text and the question are wrapped in `<knowledge>` / `<question>` tags and
+  marked as untrusted data in the prompt.
+- Mention chat can search the knowledge base through the `search_kingshot_knowledge` chat tool
+  (`services/chat_tools.py`), alongside server-scoped alliance, reminder, gift-code and
+  Governor ID tools.
+- `/kingshot_upsert` is restricted to bot operators (`ADMIN_USER_IDS`) because the
+  knowledge base is shared by every server.

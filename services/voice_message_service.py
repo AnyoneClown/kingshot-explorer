@@ -2,11 +2,21 @@ import asyncio
 import inspect
 import io
 import logging
+import re
+import threading
 import wave
 from dataclasses import dataclass
 from typing import Any
 
+from services.text_utils import truncate_cleanly
+
 logger = logging.getLogger(__name__)
+
+# Mentions, custom emoji, timestamps and links are noise when spoken.
+_SPOKEN_MARKUP = re.compile(
+    r"<a?:\w+:\d+>|<@[!&]?\d+>|<#\d+>|</[\w\- ]+:\d+>|<t:-?\d+(?::\w)?>|<?https?://[^\s>]+>?"
+)
+_MARKDOWN_CHARS = re.compile(r"(?m)^\s*>+\s?|[*_~`|]")
 
 
 @dataclass
@@ -19,7 +29,12 @@ class VoiceMessageAudio:
 
 
 class RivaTtsBackend:
-    """Thin adapter around NVIDIA's Riva Python client."""
+    """Thin adapter around NVIDIA's Riva Python client.
+
+    The gRPC channel (and its auth metadata) is created once and reused; gRPC channels
+    are thread-safe and reconnect on their own. A failed call drops the cached channel
+    so the next call starts from a fresh connection.
+    """
 
     def __init__(
         self,
@@ -33,6 +48,49 @@ class RivaTtsBackend:
         self._use_ssl = use_ssl
         self._api_key = api_key
         self._function_id = function_id
+        self._lock = threading.Lock()
+        self._service = None
+
+    SYNTHESIS_TIMEOUT_SECONDS = 20.0
+
+    @staticmethod
+    def _riva_client():
+        try:
+            import riva.client
+        except ImportError as exc:
+            raise RuntimeError(
+                "nvidia-riva-client is not installed. Run `uv sync`."
+            ) from exc
+        return riva.client
+
+    def _get_service(self):
+        with self._lock:
+            if self._service is None:
+                riva_client = self._riva_client()
+                metadata_args = [
+                    ("function-id", self._function_id),
+                    ("authorization", f"Bearer {self._api_key}"),
+                ]
+                auth = riva_client.Auth(uri=self._server, use_ssl=self._use_ssl, metadata_args=metadata_args)
+                self._service = riva_client.SpeechSynthesisService(auth)
+            return self._service
+
+    def _drop_service(self, service) -> None:
+        with self._lock:
+            if self._service is not service:
+                return
+            self._service = None
+        self._close_service(service)
+
+    @staticmethod
+    def _close_service(service) -> None:
+        channel = getattr(getattr(service, "auth", None), "channel", None)
+        close = getattr(channel, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Closing the TTS gRPC channel failed", exc_info=True)
 
     def synthesize(
         self,
@@ -43,28 +101,40 @@ class RivaTtsBackend:
         sample_rate_hz: int,
         audio_encoding: str,
     ) -> bytes:
+        riva_client = self._riva_client()
+        service = self._get_service()
+        encoding = getattr(riva_client.AudioEncoding, audio_encoding)
         try:
-            import riva.client
-        except ImportError as exc:
-            raise RuntimeError(
-                "nvidia-riva-client is not installed. Run `uv sync`."
-            ) from exc
-
-        metadata_args = [
-            ("function-id", self._function_id),
-            ("authorization", f"Bearer {self._api_key}"),
-        ]
-        auth = riva.client.Auth(uri=self._server, use_ssl=self._use_ssl, metadata_args=metadata_args)
-        service = riva.client.SpeechSynthesisService(auth)
-        encoding = getattr(riva.client.AudioEncoding, audio_encoding)
-        response = service.synthesize(
-            text=text,
-            language_code=language_code,
-            sample_rate_hz=sample_rate_hz,
-            encoding=encoding,
-            voice_name=voice_name,
-        )
+            # Riva's blocking call has no deadline; use the gRPC future so a stalled
+            # endpoint cannot park a worker thread forever.
+            pending = service.synthesize(
+                text=text,
+                language_code=language_code,
+                sample_rate_hz=sample_rate_hz,
+                encoding=encoding,
+                voice_name=voice_name,
+                future=True,
+            )
+            if hasattr(pending, "result"):
+                try:
+                    response = pending.result(timeout=self.SYNTHESIS_TIMEOUT_SECONDS)
+                except Exception:
+                    cancel = getattr(pending, "cancel", None)
+                    if cancel is not None:
+                        cancel()
+                    raise
+            else:
+                response = pending
+        except Exception:
+            self._drop_service(service)
+            raise
         return response.audio
+
+    def close(self) -> None:
+        with self._lock:
+            service, self._service = self._service, None
+        if service is not None:
+            self._close_service(service)
 
 
 class VoiceMessageService:
@@ -129,6 +199,9 @@ class VoiceMessageService:
         self._audio_encoding = audio_encoding.upper()
         self._sample_rate_hz = sample_rate_hz
         self._max_text_chars = max_text_chars
+        # Synthesis runs in the default thread pool, which is shared with image
+        # rendering and DNS lookups: keep only a couple of calls in flight.
+        self._synthesis_slots: asyncio.Semaphore | None = None
 
     @classmethod
     def from_nvidia(
@@ -220,8 +293,21 @@ class VoiceMessageService:
         )
 
     def _clean_text(self, text: str) -> str:
-        cleaned = " ".join((text or "").split()).strip()
-        return cleaned[: self._max_text_chars]
+        """Drop Discord markup that should not be read aloud and cut at a natural boundary."""
+        cleaned = _SPOKEN_MARKUP.sub(" ", text or "")
+        cleaned = _MARKDOWN_CHARS.sub("", cleaned)
+        cleaned = " ".join(cleaned.split()).strip()
+        # Ending on a full sentence sounds far better than stopping mid-phrase.
+        return truncate_cleanly(cleaned, self._max_text_chars, ellipsis="", sentence_min_ratio=0.25)
+
+    async def close(self) -> None:
+        """Release the TTS connection (safe to call more than once)."""
+        close = getattr(self._backend, "close", None)
+        if not callable(close):
+            return
+        result = await asyncio.to_thread(close)
+        if inspect.isawaitable(result):
+            await result
 
     def _resolve_language_code(self, language_hint: str | None) -> str:
         if not language_hint:
@@ -239,7 +325,16 @@ class VoiceMessageService:
             return self._default_voice
         return self._DEFAULT_VOICES.get(language_code, self._default_voice)
 
+    MAX_CONCURRENT_SYNTHESES = 2
+    SYNTHESIS_DEADLINE_SECONDS = 25.0
+
     async def _synthesize(self, **kwargs) -> bytes:
+        if self._synthesis_slots is None:
+            self._synthesis_slots = asyncio.Semaphore(self.MAX_CONCURRENT_SYNTHESES)
+        async with self._synthesis_slots:
+            return await asyncio.wait_for(self._call_backend(**kwargs), timeout=self.SYNTHESIS_DEADLINE_SECONDS)
+
+    async def _call_backend(self, **kwargs) -> bytes:
         synthesize = self._backend.synthesize
         if inspect.iscoroutinefunction(synthesize):
             return await synthesize(**kwargs)

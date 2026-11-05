@@ -5,6 +5,7 @@ from functools import partial
 import discord
 from discord.ext import commands
 
+from handlers.permissions import AccessPolicy, interaction_guild_id
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 
 
@@ -14,43 +15,72 @@ GROUPS = {
         (
             ("stats", "View player", "/stats player_id:123456"),
             ("scout", "Scout kingdom", "/scout kingdom_number:830 limit:5"),
-            ("listplayers", "Registered players", "/listplayers"),
+            ("listplayers", "Server roster", "/listplayers"),
         ),
     ),
     "KVK": (
-        "Browse match history or compare two kingdoms.",
+        "Browse match history, compare two kingdoms, or build a prep dossier before a KvK.",
         (
             ("kvk", "Kingdom history", "/kvk kingdom_number:830"),
             ("kvk_compare", "Compare kingdoms", "/kvk_compare kingdom_a:830 kingdom_b:831"),
+            ("kvk_prep", "Prep dossier", "/kvk_prep kingdom_a:830 kingdom_b:831"),
         ),
     ),
     "Alliance": (
-        "Track daily and weekly member power. A configured bot admin can start tracking with "
-        "/alliance kid:830 alliance:<selection>. Choose the alliance from autocomplete; "
+        "Track daily and weekly member power, roster changes and possibly inactive members. "
+        "A server manager starts tracking with /alliance kid:830 alliance:<selection>; "
         "history starts with the first complete daily snapshot.",
         (("alliance", "Power trends", "/alliance"),),
     ),
     "Gifts": (
-        "Find active codes and manage the players enrolled for redemption. "
-        "Bulk redemption requires a configured bot admin.",
+        "Find active codes and add your Governor ID with /addplayer to receive new codes "
+        "automatically. Server managers can import alliances and run /redeem for this "
+        "server's roster.",
         (
             ("giftcodes", "Available codes", "/giftcodes"),
             ("addplayer", "Add players", "/addplayer player_ids:123456,654321"),
+            ("removeplayer", "Remove player", "/removeplayer player_id:123456"),
             ("addalliance", "Import alliance", "/addalliance kid:830 alliance:FKA"),
             ("redeem", "Redeem code", "/redeem gift_code:EXAMPLE"),
         ),
     ),
     "Events": (
         "Review upcoming reminders. Creating, editing, and cancelling reminders "
-        "requires a configured bot admin.",
-        (("events", "Upcoming events", "/events"), ("schedule", "Create event", "/schedule")),
+        "requires a server manager.",
+        (
+            ("events", "Upcoming events", "/events"),
+            ("schedule", "Create event", "/schedule"),
+            ("cancel", "Cancel event", "/cancel event_id:12"),
+        ),
+    ),
+    "Knowledge": (
+        "Ask questions answered from the stored Kingshot knowledge base. You can also mention the "
+        "bot in chat to ask about this server's alliance, events or active gift codes.",
+        (("kingshot_ask", "Ask a question", "/kingshot_ask question:How does Bear Trap work?"),),
     ),
     "Settings": (
-        "These settings affect the whole server and are available to configured bot admins.",
+        "Server-wide settings: gift-code and alliance report channels, the bot manager role, "
+        "voice and AI replies. Available to server managers.",
         (("configure", "Open settings", "/configure"),),
     ),
 }
-ADMIN_COMMANDS = {"redeem", "schedule", "configure"}
+# Actions only offered to server managers (Manage Server, the manager role, or bot operators).
+ADMIN_COMMANDS = {"redeem", "schedule", "cancel", "configure", "addalliance"}
+# Friendlier form labels for slash-command parameters.
+FIELD_LABELS = {
+    "player_ids": "Player IDs",
+    "player_id": "Player ID",
+    "kid": "Kingdom ID",
+    "gift_code": "Gift code",
+    "event_id": "Event ID",
+    "kingdom_number": "Kingdom number",
+    "kingdom_a": "First kingdom",
+    "kingdom_b": "Second kingdom",
+}
+
+
+def field_label(name: str) -> str:
+    return FIELD_LABELS.get(name) or name.replace("_", " ").capitalize().replace(" id", " ID")
 
 
 class CommandInputModal(discord.ui.Modal):
@@ -66,7 +96,7 @@ class CommandInputModal(discord.ui.Modal):
             if not parameter.required:
                 continue
             field = discord.ui.TextInput(
-                label=parameter.name.replace("_", " ").title()[:45],
+                label=field_label(parameter.name)[:45],
                 placeholder=parameter.description[:100],
                 max_length=20 if parameter.type == discord.AppCommandOptionType.integer else 1000,
             )
@@ -79,7 +109,7 @@ class CommandInputModal(discord.ui.Modal):
             return
         values = {}
         for parameter, field in self.inputs:
-            label = parameter.name.replace("_", " ").title()
+            label = field_label(parameter.name)
             value = field.value.strip()
             if not value:
                 await interaction.response.send_message(f"Enter {label.lower()}.", ephemeral=True)
@@ -143,20 +173,47 @@ class HelpView(OwnedView):
 
 
 class HelpHandler:
-    def __init__(self, bot: commands.Bot, admin_user_ids: set[int] | None = None):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        admin_user_ids: set[int] | None = None,
+        access_policy: AccessPolicy | None = None,
+    ):
         self._bot = bot
-        self._admin_user_ids = admin_user_ids or set()
+        self._admin_user_ids = admin_user_ids if admin_user_ids is not None else set()
+        self._access_policy = access_policy
+        self._manager_cache: dict[tuple[int, int | None], bool] = {}
+
+    @property
+    def _access(self) -> AccessPolicy:
+        # Without an injected policy, read the admin set live so changes apply immediately.
+        return self._access_policy or AccessPolicy(self._admin_user_ids)
+
+    async def refresh_access(self, interaction: discord.Interaction) -> bool:
+        """Re-evaluate (and remember) whether the user may manage the bot here."""
+        allowed = interaction.guild is not None and await self._access.can_manage(interaction)
+        self._manager_cache[(interaction.user.id, interaction_guild_id(interaction))] = allowed
+        return allowed
+
+    def _is_manager(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            return False
+        cached = self._manager_cache.get((interaction.user.id, interaction_guild_id(interaction)))
+        if cached is not None:
+            return cached
+        return self._access.is_super_admin(interaction.user.id)
 
     def register_commands(self) -> None:
         @self._bot.tree.command(name="help", description="Browse available features and start a workflow")
         async def help_command(interaction: discord.Interaction):
+            await self.refresh_access(interaction)
             view = HelpView(self, interaction)
             await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
             view.message = await interaction.original_response()
 
     def available_groups(self, interaction: discord.Interaction) -> dict:
         groups = {}
-        is_admin = interaction.guild is not None and interaction.user.id in self._admin_user_ids
+        is_admin = self._is_manager(interaction)
         for category, (description, actions) in GROUPS.items():
             available = tuple(
                 action for action in actions
@@ -182,6 +239,7 @@ class HelpHandler:
         )
 
     async def open_command(self, interaction: discord.Interaction, *, name: str, label: str) -> None:
+        await self.refresh_access(interaction)
         if not self._allowed(interaction, name):
             await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
             return
@@ -208,6 +266,7 @@ class HelpHandler:
 
     async def run_command(self, interaction: discord.Interaction, name: str, values: dict) -> None:
         command = self._bot.tree.get_command(name)
+        await self.refresh_access(interaction)
         if command is None or not self._allowed(interaction, name):
             await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
             return

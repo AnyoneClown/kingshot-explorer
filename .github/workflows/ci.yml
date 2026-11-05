@@ -19,7 +19,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
@@ -32,6 +32,15 @@ jobs:
       - name: Run Ruff
         run: uv run ruff check .
 
+      - name: Check single Alembic head
+        run: |
+          heads="$(uv run alembic heads | grep -c '(head)')"
+          if [ "$heads" -ne 1 ]; then
+            uv run alembic heads
+            echo "Expected exactly one Alembic head, found $heads" >&2
+            exit 1
+          fi
+
   test:
     name: Tests
     runs-on: ubuntu-latest
@@ -43,7 +52,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
@@ -55,3 +64,14 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -q
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --tag ds-translator:ci .

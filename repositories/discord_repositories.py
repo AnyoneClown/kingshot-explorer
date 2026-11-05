@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Any, Optional, Set
+from datetime import datetime, timezone
+from typing import Any, Iterable, Iterator, Optional, Sequence, Set
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
     GiftCode,
     GiftCodeRedemption,
     GuildConfiguration,
+    GuildPlayerRegistration,
     RegisteredPlayer,
     TranslationLog,
     User,
@@ -20,9 +21,30 @@ from db.models import (
 
 logger = logging.getLogger(__name__)
 
+# Keep IN (...) lists comfortably below driver/planner limits.
+_IN_CLAUSE_CHUNK = 500
+
+AUTO_REDEEM_PENDING = "pending"
+AUTO_REDEEM_COMPLETED = "completed"
+
+
+def _chunks(values: Sequence[Any], size: int = _IN_CLAUSE_CHUNK) -> Iterator[Sequence[Any]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _unique(values: Iterable[Any]) -> list[Any]:
+    return list(dict.fromkeys(values))
+
 
 class UserRepository:
-    """Repository for user records."""
+    """Repository for user records.
+
+    ``upsert`` is read-then-insert: two concurrent first interactions of the same
+    user race on the primary key. Callers run it through
+    ``DatabaseManager.run_in_transaction(..., retry_on_integrity_error=True)`` so the
+    loser retries and then finds the row.
+    """
 
     def __init__(self, session: AsyncSession):
         self._session = session
@@ -35,7 +57,7 @@ class UserRepository:
         user = await self.get_by_id(user_id)
 
         if user:
-            user.last_seen = datetime.utcnow()
+            user.last_seen = datetime.now(timezone.utc)
             user.username = username
             user.discriminator = discriminator
             if display_name:
@@ -60,6 +82,17 @@ class TranslationLogRepository:
 
     def __init__(self, session: AsyncSession):
         self._session = session
+
+    async def delete_older_than(self, cutoff: datetime, *, limit: int) -> int:
+        """Delete up to ``limit`` logs created before ``cutoff``; return the count deleted."""
+        result = await self._session.execute(
+            select(TranslationLog.id).where(TranslationLog.created_at < cutoff).limit(limit)
+        )
+        ids = list(result.scalars().all())
+        if not ids:
+            return 0
+        await self._session.execute(delete(TranslationLog).where(TranslationLog.id.in_(ids)))
+        return len(ids)
 
     async def create(
         self,
@@ -320,7 +353,18 @@ class RegisteredPlayerRepository:
         logger.info("Upserted registered player %s (enabled=%s)", player_id, enabled)
         return player
 
-    async def add_or_update_many(self, players: list[dict[str, Any]]) -> list[RegisteredPlayer]:
+    async def add_or_update_many(
+        self,
+        players: list[dict[str, Any]],
+        *,
+        overwrite_owner: bool = True,
+    ) -> list[RegisteredPlayer]:
+        """Create or refresh profiles in one round trip.
+
+        A row's ``enabled`` of ``None`` leaves an existing profile's flag unchanged
+        (new profiles are created enabled). ``overwrite_owner=False`` keeps the
+        original ``added_by_user_id`` of shared profiles.
+        """
         if not players:
             return []
 
@@ -366,7 +410,7 @@ class RegisteredPlayerRepository:
                     player_name=row.get("player_name"),
                     kingdom=row.get("kingdom"),
                     castle_level=row.get("castle_level"),
-                    enabled=row.get("enabled", True),
+                    enabled=row.get("enabled") is not False,
                     added_by_user_id=row["added_by_user_id"],
                 )
                 self._session.add(player)
@@ -383,7 +427,7 @@ class RegisteredPlayerRepository:
                     castle_level=row.get("castle_level"),
                     enabled=row.get("enabled", True),
                     added_by_user_id=row.get("added_by_user_id"),
-                    overwrite_owner=True,
+                    overwrite_owner=overwrite_owner,
                 )
                 updated_count += 1
 
@@ -397,6 +441,59 @@ class RegisteredPlayerRepository:
             updated_count,
         )
         return upserted_players
+
+    @staticmethod
+    def _has_registration():
+        return exists().where(GuildPlayerRegistration.player_id == RegisteredPlayer.player_id)
+
+    @staticmethod
+    def _has_enabled_registration():
+        return exists().where(
+            GuildPlayerRegistration.player_id == RegisteredPlayer.player_id,
+            GuildPlayerRegistration.enabled.is_(True),
+        )
+
+    async def list_auto_redeem_targets(self) -> list[RegisteredPlayer]:
+        """Profiles the global auto-redeem run covers, each once.
+
+        A profile qualifies when its global flag is enabled and it is enabled in at
+        least one server roster. Legacy profiles without any server registration
+        (created before per-server rosters) stay included for backward compatibility.
+        """
+        query = (
+            select(RegisteredPlayer)
+            .where(RegisteredPlayer.enabled.is_(True))
+            .where(or_(self._has_enabled_registration(), ~self._has_registration()))
+            .order_by(RegisteredPlayer.player_id)
+        )
+        result = await self._session.execute(query)
+        return list(result.scalars().all())
+
+    async def list_unassigned(self, *, enabled_only: bool = False, limit: int | None = None) -> list[RegisteredPlayer]:
+        """Legacy profiles that are not registered to any server."""
+        query = select(RegisteredPlayer).where(~self._has_registration())
+        if enabled_only:
+            query = query.where(RegisteredPlayer.enabled.is_(True))
+        query = query.order_by(RegisteredPlayer.enabled.desc(), RegisteredPlayer.player_id)
+        if limit is not None:
+            query = query.limit(limit)
+        result = await self._session.execute(query)
+        return list(result.scalars().all())
+
+    async def count_unassigned(self, *, enabled_only: bool = False) -> int:
+        query = select(func.count()).select_from(RegisteredPlayer).where(~self._has_registration())
+        if enabled_only:
+            query = query.where(RegisteredPlayer.enabled.is_(True))
+        result = await self._session.execute(query)
+        return int(result.scalar_one())
+
+    async def set_enabled(self, player_id: str, enabled: bool) -> bool:
+        player = await self._get(player_id)
+        if player is None:
+            return False
+        player.enabled = enabled
+        await self._session.flush()
+        return True
 
     async def remove(self, player_id: str) -> bool:
         player = await self._get(player_id)
@@ -521,6 +618,122 @@ class RegisteredPlayerRepository:
         return synced_count
 
 
+class GuildPlayerRegistrationRepository:
+    """Per-server gift-code rosters on top of the shared player profiles."""
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def get(self, guild_id: int, player_id: str) -> Optional[GuildPlayerRegistration]:
+        result = await self._session.execute(
+            select(GuildPlayerRegistration)
+            .where(GuildPlayerRegistration.guild_id == guild_id)
+            .where(GuildPlayerRegistration.player_id == str(player_id))
+        )
+        return result.scalar_one_or_none()
+
+    async def get_many(self, guild_id: int, player_ids: Sequence[str]) -> dict[str, GuildPlayerRegistration]:
+        registrations: dict[str, GuildPlayerRegistration] = {}
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                select(GuildPlayerRegistration)
+                .where(GuildPlayerRegistration.guild_id == guild_id)
+                .where(GuildPlayerRegistration.player_id.in_(chunk))
+            )
+            registrations.update({row.player_id: row for row in result.scalars().all()})
+        return registrations
+
+    async def get_with_profile(
+        self, guild_id: int, player_id: str
+    ) -> Optional[tuple[GuildPlayerRegistration, RegisteredPlayer]]:
+        result = await self._session.execute(
+            select(GuildPlayerRegistration, RegisteredPlayer)
+            .join(RegisteredPlayer, RegisteredPlayer.player_id == GuildPlayerRegistration.player_id)
+            .where(GuildPlayerRegistration.guild_id == guild_id)
+            .where(GuildPlayerRegistration.player_id == str(player_id))
+        )
+        row = result.first()
+        return (row[0], row[1]) if row is not None else None
+
+    async def list_roster(self, guild_id: int) -> list[tuple[GuildPlayerRegistration, RegisteredPlayer]]:
+        result = await self._session.execute(
+            select(GuildPlayerRegistration, RegisteredPlayer)
+            .join(RegisteredPlayer, RegisteredPlayer.player_id == GuildPlayerRegistration.player_id)
+            .where(GuildPlayerRegistration.guild_id == guild_id)
+            .order_by(RegisteredPlayer.player_id)
+        )
+        return [(registration, player) for registration, player in result.all()]
+
+    async def count(self, guild_id: int, *, added_by_user_id: int | None = None) -> int:
+        query = (
+            select(func.count())
+            .select_from(GuildPlayerRegistration)
+            .where(GuildPlayerRegistration.guild_id == guild_id)
+        )
+        if added_by_user_id is not None:
+            query = query.where(GuildPlayerRegistration.added_by_user_id == added_by_user_id)
+        result = await self._session.execute(query)
+        return int(result.scalar_one())
+
+    async def count_for_player(self, player_id: str) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(GuildPlayerRegistration)
+            .where(GuildPlayerRegistration.player_id == str(player_id))
+        )
+        return int(result.scalar_one())
+
+    def add(self, guild_id: int, player_id: str, added_by_user_id: int, *, enabled: bool = True) -> GuildPlayerRegistration:
+        registration = GuildPlayerRegistration(
+            guild_id=guild_id,
+            player_id=str(player_id),
+            added_by_user_id=added_by_user_id,
+            enabled=enabled,
+        )
+        self._session.add(registration)
+        return registration
+
+    async def delete(self, registration: GuildPlayerRegistration) -> None:
+        await self._session.delete(registration)
+        await self._session.flush()
+
+    async def set_enabled(self, guild_id: int, player_ids: Sequence[str], enabled: bool) -> int:
+        changed = 0
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                update(GuildPlayerRegistration)
+                .where(GuildPlayerRegistration.guild_id == guild_id)
+                .where(GuildPlayerRegistration.player_id.in_(chunk))
+                .values(enabled=enabled)
+            )
+            changed += int(result.rowcount or 0)
+        return changed
+
+    async def list_enabled_targets(self, guild_id: int) -> list[RegisteredPlayer]:
+        """Profiles enabled both in this server's roster and globally."""
+        result = await self._session.execute(
+            select(RegisteredPlayer)
+            .join(GuildPlayerRegistration, GuildPlayerRegistration.player_id == RegisteredPlayer.player_id)
+            .where(GuildPlayerRegistration.guild_id == guild_id)
+            .where(GuildPlayerRegistration.enabled.is_(True))
+            .where(RegisteredPlayer.enabled.is_(True))
+            .order_by(RegisteredPlayer.player_id)
+        )
+        return list(result.scalars().all())
+
+    async def enabled_guilds_by_player(self, player_ids: Sequence[str]) -> dict[str, set[int]]:
+        guilds: dict[str, set[int]] = {}
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                select(GuildPlayerRegistration.player_id, GuildPlayerRegistration.guild_id)
+                .where(GuildPlayerRegistration.player_id.in_(chunk))
+                .where(GuildPlayerRegistration.enabled.is_(True))
+            )
+            for player_id, guild_id in result.all():
+                guilds.setdefault(str(player_id), set()).add(int(guild_id))
+        return guilds
+
+
 class GiftCodeRepository:
     """Repository for gift code catalog records."""
 
@@ -531,6 +744,10 @@ class GiftCodeRepository:
         result = await self._session.execute(select(GiftCode).where(GiftCode.id == code_id))
         return result.scalar_one_or_none()
 
+    async def get_by_code(self, code: str) -> Optional[GiftCode]:
+        result = await self._session.execute(select(GiftCode).where(GiftCode.code == code))
+        return result.scalar_one_or_none()
+
     async def add_or_update(
         self,
         code_id: int,
@@ -538,9 +755,15 @@ class GiftCodeRepository:
         created_at_api: datetime,
         expires_at: Optional[datetime] = None,
     ) -> tuple[bool, GiftCode]:
+        """Track a code from the upstream list; new codes start ``pending`` auto-redemption."""
         existing_code = await self.get(code_id)
+        if existing_code is None:
+            # The upstream list occasionally re-issues a known code under a new ID; the
+            # code string is unique, so treat it as the same code instead of failing.
+            existing_code = await self.get_by_code(code)
         if existing_code:
             existing_code.expires_at = expires_at
+            await self._session.flush()
             logger.debug("Updated existing gift code %s (ID: %s)", code, code_id)
             return False, existing_code
 
@@ -549,6 +772,9 @@ class GiftCodeRepository:
             code=code,
             expires_at=expires_at,
             created_at_api=created_at_api,
+            # The column's server default is "completed" (for pre-existing rows), so
+            # newly discovered codes must be marked pending explicitly.
+            auto_redeem_status=AUTO_REDEEM_PENDING,
         )
         self._session.add(new_code)
         logger.info("Added new tracked gift code: %s (ID: %s)", code, code_id)
@@ -558,6 +784,31 @@ class GiftCodeRepository:
     async def list_all(self):
         result = await self._session.execute(select(GiftCode).order_by(GiftCode.created_at_api.desc()))
         return list(result.scalars().all())
+
+    async def list_pending(self) -> list[GiftCode]:
+        result = await self._session.execute(
+            select(GiftCode)
+            .where(GiftCode.auto_redeem_status == AUTO_REDEEM_PENDING)
+            .order_by(GiftCode.created_at_api, GiftCode.id)
+        )
+        return list(result.scalars().all())
+
+    async def list_recent(self, limit: int) -> list[GiftCode]:
+        result = await self._session.execute(
+            select(GiftCode).order_by(GiftCode.created_at_api.desc(), GiftCode.id.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def mark_completed(self, code_id: int, completed_at: datetime | None = None) -> bool:
+        result = await self._session.execute(
+            update(GiftCode)
+            .where(GiftCode.id == code_id)
+            .values(
+                auto_redeem_status=AUTO_REDEEM_COMPLETED,
+                auto_redeem_completed_at=completed_at or datetime.now(timezone.utc),
+            )
+        )
+        return bool(result.rowcount)
 
 
 class GiftCodeRedemptionRepository:
@@ -609,14 +860,57 @@ class GiftCodeRedemptionRepository:
         return logs
 
     async def find_successful_redemption(self, player_id: int, gift_code: str):
+        """Latest successful redemption of ``gift_code`` for a player, if any."""
         result = await self._session.execute(
             select(GiftCodeRedemption)
             .where(GiftCodeRedemption.player_id == str(player_id))
             .where(GiftCodeRedemption.gift_code == gift_code)
             .where(GiftCodeRedemption.success.is_(True))
             .order_by(GiftCodeRedemption.created_at.desc())
+            .limit(1)
         )
-        return result.scalar_one_or_none()
+        return result.scalars().first()
+
+    async def recorded_outcomes(self, gift_code: str, final_error_codes: Iterable[str]) -> list[Any]:
+        """Rows that settle ``gift_code`` for a player: successes and final failures.
+
+        Returned oldest first as rows with ``player_id``, ``success``, ``error_code``,
+        ``response_message`` and ``user_id``.
+        """
+        codes = sorted(set(final_error_codes))
+        result = await self._session.execute(
+            select(
+                GiftCodeRedemption.player_id,
+                GiftCodeRedemption.success,
+                GiftCodeRedemption.error_code,
+                GiftCodeRedemption.response_message,
+                GiftCodeRedemption.user_id,
+            )
+            .where(GiftCodeRedemption.gift_code == gift_code)
+            .where(or_(GiftCodeRedemption.success.is_(True), GiftCodeRedemption.error_code.in_(codes)))
+            .order_by(GiftCodeRedemption.created_at, GiftCodeRedemption.id)
+        )
+        return list(result.all())
+
+    async def rows_for_codes(self, gift_codes: Sequence[str], player_ids: Sequence[str]) -> list[Any]:
+        """Attempt rows (``gift_code``, ``player_id``, ``success``, ``error_code``) for a roster."""
+        if not gift_codes or not player_ids:
+            return []
+        rows: list[Any] = []
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                select(
+                    GiftCodeRedemption.gift_code,
+                    GiftCodeRedemption.player_id,
+                    GiftCodeRedemption.success,
+                    GiftCodeRedemption.error_code,
+                )
+                .where(GiftCodeRedemption.gift_code.in_(list(gift_codes)))
+                .where(GiftCodeRedemption.player_id.in_(chunk))
+                .order_by(GiftCodeRedemption.created_at, GiftCodeRedemption.id)
+            )
+            rows.extend(result.all())
+        return rows
 
     async def redeemed_player_ids(self, gift_code: str) -> Set[str]:
         result = await self._session.execute(

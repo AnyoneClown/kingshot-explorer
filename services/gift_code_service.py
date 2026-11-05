@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.session import DatabaseManager, get_db
 from repositories.discord_repositories import GiftCodeRedemptionRepository, GiftCodeRepository
 from services.kingshot_api import KingshotAPIClient
+from services.transactions import run_db_operation
 
 logger = logging.getLogger(__name__)
 
@@ -20,29 +21,13 @@ class IGiftCodeService(ABC):
     """Interface for gift code service - Interface Segregation Principle."""
 
     @abstractmethod
-    async def redeem_gift_code(
-        self,
-        session: AsyncSession | None,
-        player_id: int,
-        gift_code: str,
-        kingdom_id: str | int | None = None,
-    ) -> Dict[str, Any]:
-        """Redeem a gift code for a player."""
-
-    @abstractmethod
     async def redeem_gift_code_remote(
         self,
         player_id: int,
         gift_code: str,
         kingdom_id: str | int | None = None,
     ) -> Dict[str, Any]:
-        """Redeem a gift code for a player through the remote API only."""
-
-    @abstractmethod
-    async def check_already_redeemed(
-        self, session: AsyncSession | None, player_id: int, gift_code: str
-    ) -> Optional[dict[str, Any]]:
-        """Check if a gift code has already been successfully redeemed for a player."""
+        """Redeem a gift code for a player through the remote API only (one attempt)."""
 
     @abstractmethod
     async def get_redeemed_players(self, session: AsyncSession | None, gift_code: str) -> set[str]:
@@ -100,21 +85,6 @@ class GiftCodeService(IGiftCodeService):
             await self._client.close()
             self._client = None
 
-    async def check_already_redeemed(
-        self, session: AsyncSession | None, player_id: int, gift_code: str
-    ) -> Optional[dict[str, Any]]:
-        """
-        Check if a gift code has already been successfully redeemed for a player.
-        """
-
-        async def _inner(db_session: AsyncSession):
-            return await GiftCodeRedemptionRepository(db_session).find_successful_redemption(
-                player_id=player_id,
-                gift_code=gift_code,
-            )
-
-        return await self._with_session(session, _inner)
-
     async def get_redeemed_players(self, session: AsyncSession | None, gift_code: str) -> set[str]:
         """
         Get set of player IDs who have already successfully redeemed this gift code.
@@ -136,7 +106,11 @@ class GiftCodeService(IGiftCodeService):
         expires_at: Optional[Any] = None,
         session: AsyncSession | None = None,
     ) -> tuple[bool, Any]:
-        """Track a gift code from the external API and return whether it was newly discovered."""
+        """Track a gift code from the external API and return whether it was newly discovered.
+
+        New codes are stored with ``auto_redeem_status="pending"`` until the automatic
+        run has handled every eligible player.
+        """
 
         async def _inner(db_session: AsyncSession):
             return await GiftCodeRepository(db_session).add_or_update(
@@ -146,46 +120,43 @@ class GiftCodeService(IGiftCodeService):
                 expires_at=expires_at,
             )
 
-        return await self._with_session(session, _inner)
+        if session is not None:
+            return await _inner(session)
+        return await run_db_operation(await self._get_db_manager(), _inner, retry_on_integrity_error=True)
 
-    async def redeem_gift_code(
-        self,
-        session: AsyncSession | None,
-        player_id: int,
-        gift_code: str,
-        kingdom_id: str | int | None = None,
-    ) -> Dict[str, Any]:
-        """
-        Redeem a gift code for a player.
-        """
+    async def list_pending_gift_codes(self) -> list[Any]:
+        """Codes whose automatic redemption has not finished (oldest first)."""
 
-        async def _inner(db_session: AsyncSession) -> Dict[str, Any]:
-            existing_redemption = await GiftCodeRedemptionRepository(db_session).find_successful_redemption(
-                player_id=player_id,
-                gift_code=gift_code,
-            )
-            if existing_redemption:
-                logger.info(
-                    "Gift code '%s' already redeemed for player %s at %s. Skipping API call.",
-                    gift_code,
-                    player_id,
-                    existing_redemption.created_at,
-                )
-                return {
-                    "success": False,
-                    "message": "This gift code has already been redeemed for this player.",
-                    "error_code": "ALREADY_REDEEMED",
-                    "already_redeemed": True,
-                    "already_redeemed_at": existing_redemption.created_at.isoformat(),
-                }
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRepository(db_session).list_pending()
 
-            return await self.redeem_gift_code_remote(
-                player_id=player_id,
-                gift_code=gift_code,
-                kingdom_id=kingdom_id,
-            )
+        return await self._with_session(None, _inner)
 
-        return await self._with_session(session, _inner)
+    async def mark_gift_code_completed(self, code_id: int) -> bool:
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRepository(db_session).mark_completed(code_id)
+
+        return await run_db_operation(await self._get_db_manager(), _inner)
+
+    async def get_recent_gift_codes(self, limit: int = 5) -> list[Any]:
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRepository(db_session).list_recent(limit)
+
+        return await self._with_session(None, _inner)
+
+    async def get_recorded_outcomes(self, gift_code: str, final_error_codes) -> list[Any]:
+        """Successes and final failures already stored for ``gift_code`` (oldest first)."""
+
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRedemptionRepository(db_session).recorded_outcomes(gift_code, final_error_codes)
+
+        return await self._with_session(None, _inner)
+
+    async def get_redemption_rows(self, gift_codes: list[str], player_ids: list[str]) -> list[Any]:
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRedemptionRepository(db_session).rows_for_codes(gift_codes, player_ids)
+
+        return await self._with_session(None, _inner)
 
     async def redeem_gift_code_remote(
         self,
@@ -193,7 +164,11 @@ class GiftCodeService(IGiftCodeService):
         gift_code: str,
         kingdom_id: str | int | None = None,
     ) -> Dict[str, Any]:
-        """Redeem a gift code through the current kingdom-aware upstream API."""
+        """Redeem a gift code through the current kingdom-aware upstream API.
+
+        Makes exactly one paced HTTP attempt. Retries (transient errors, rate limits)
+        are decided by ``GiftRedemptionService.redeem_with_retries`` only.
+        """
         if kingdom_id in (None, "", 0, "0"):
             return {
                 "success": False,

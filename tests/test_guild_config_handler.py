@@ -61,6 +61,9 @@ class FakeResponse:
     async def defer(self, *, ephemeral=False, thinking=False):
         self.deferred = (ephemeral, thinking)
 
+    def is_done(self):
+        return self.deferred is not None or self.sent_message is not None
+
 
 class FakeInteraction:
     def __init__(self, user_id, guild=None):
@@ -145,7 +148,7 @@ def test_interaction_check_rejects_other_users():
     assert interaction.response.sent_message == ("Only the command user can control this panel.", True)
 
 
-def test_configure_rejects_non_env_admin_even_when_server_admin():
+def test_configure_rejects_members_without_manage_server():
     handler = GuildConfigHandler(
         bot=SimpleNamespace(),
         guild_config_service=FakeGuildConfigService(),
@@ -155,11 +158,31 @@ def test_configure_rejects_non_env_admin_even_when_server_admin():
         user_id=222,
         guild=SimpleNamespace(id=999, name="Test Guild"),
     )
-    interaction.user.guild_permissions = SimpleNamespace(administrator=True)
+    interaction.user.guild_permissions = SimpleNamespace(administrator=False, manage_guild=False)
 
     asyncio.run(handler._handle_configure(interaction))
 
-    assert interaction.response.sent_message == ("Only configured bot admins can configure the bot.", True)
+    assert interaction.response.sent_message == (None, True)
+    assert interaction.response.sent_embed.title == "🔒 Not allowed"
+    assert interaction.response.deferred is None
+
+
+def test_configure_allows_server_managers():
+    handler = GuildConfigHandler(
+        bot=SimpleNamespace(),
+        guild_config_service=FakeGuildConfigService(),
+        admin_user_ids={111},
+    )
+    interaction = FakeInteraction(
+        user_id=222,
+        guild=SimpleNamespace(id=999, name="Test Guild"),
+    )
+    interaction.user.guild_permissions = SimpleNamespace(administrator=False, manage_guild=True)
+
+    asyncio.run(handler._handle_configure(interaction))
+
+    assert interaction.response.deferred == (True, True)
+    assert interaction.edited_original_embed.title == "Bot Configuration"
 
 
 def test_configure_allows_env_admin_without_server_admin_permission():
@@ -179,3 +202,67 @@ def test_configure_allows_env_admin_without_server_admin_permission():
     assert interaction.response.deferred == (True, True)
     assert interaction.edited_original_embed.title == "Bot Configuration"
     assert interaction.edited_original_view is not None
+
+
+class FakeRole:
+    def __init__(self, role_id, *, default=False, managed=False):
+        self.id = role_id
+        self.managed = managed
+        self._default = default
+
+    def is_default(self):
+        return self._default
+
+
+def _select_interaction(user_id, *, manage_guild):
+    interaction = FakeInteraction(user_id=user_id)
+    interaction.user.guild_permissions = SimpleNamespace(administrator=False, manage_guild=manage_guild)
+    interaction.followup = SimpleNamespace(send=None)
+    return interaction
+
+
+class UpdatingGuildConfigService(FakeGuildConfigService):
+    def __init__(self):
+        super().__init__()
+        self.guild_config.manager_role_id = None
+        self.guild_config.gift_code_channel_id = None
+        self.guild_config.alliance_report_channel_id = None
+        self.updates = []
+
+    async def update_for_guild(self, guild_id, **changes):
+        self.updates.append(changes)
+        for name, value in changes.items():
+            setattr(self.guild_config, name, value)
+        return self.guild_config
+
+
+def test_manager_role_select_requires_manage_server():
+    service = UpdatingGuildConfigService()
+    interaction = _select_interaction(111, manage_guild=False)
+
+    async def run_test():
+        view = await _create_view(service)
+        view.manager_role_select._values = [FakeRole(5)]
+        await view.manager_role_select.callback(interaction)
+
+    asyncio.run(run_test())
+
+    assert service.updates == []
+    assert interaction.response.sent_embed.title == "🔒 Not allowed"
+
+
+def test_manager_role_select_saves_role_and_rejects_everyone():
+    service = UpdatingGuildConfigService()
+
+    async def run_test(role):
+        interaction = _select_interaction(111, manage_guild=True)
+        view = await _create_view(service)
+        view.manager_role_select._values = [role]
+        await view.manager_role_select.callback(interaction)
+        return interaction
+
+    asyncio.run(run_test(FakeRole(1, default=True)))
+    assert service.updates == []
+    interaction = asyncio.run(run_test(FakeRole(5)))
+    assert service.updates == [{"manager_role_id": 5}]
+    assert "<@&5>" in interaction.edited_original_embed.description

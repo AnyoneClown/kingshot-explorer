@@ -31,12 +31,34 @@ class OwnedView(discord.ui.View):
                 item.disabled = True
         if self.message is not None:
             try:
-                await self.message.edit(view=self)
+                await edit_panel_message(self.message, view=self)
             except discord.HTTPException:
                 logger.debug("Could not disable expired controls", exc_info=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         await send_ui_error(interaction, error)
+
+
+async def edit_panel_message(message, **kwargs):
+    """Edit a panel message, surviving an expired interaction token.
+
+    Followup/original-response messages are edited through the interaction webhook,
+    whose token expires after 15 minutes, while panels may stay active longer. Public
+    messages are then edited through the bot token instead (ephemeral ones cannot be).
+    """
+    try:
+        return await message.edit(**kwargs)
+    except discord.HTTPException as error:
+        channel = getattr(message, "channel", None)
+        flags = getattr(message, "flags", None)
+        if (
+            getattr(error, "status", None) not in (401, 404)
+            or channel is None
+            or not hasattr(channel, "get_partial_message")
+            or getattr(flags, "ephemeral", False)
+        ):
+            raise
+        return await channel.get_partial_message(message.id).edit(**kwargs)
 
 
 async def send_ui_error(interaction: discord.Interaction, error: Exception) -> None:
@@ -71,4 +93,4 @@ def build_status_embed(
 
 def status_value(ok: bool, success_text: str = "Online", failure_text: str = "Unavailable") -> str:
     """Format a boolean health state for embeds."""
-    return f"OK - {success_text}" if ok else f"ISSUE - {failure_text}"
+    return f"✅ {success_text}" if ok else f"⚠️ {failure_text}"

@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from handlers.kingshot_rag_handler import KingshotRAGHandler
+from handlers.permissions import AccessPolicy
 
 
 class FakeResponse:
@@ -20,10 +21,16 @@ class FakeFollowup:
         self.sent.append(kwargs)
 
 
+OPERATOR_ID = 42
+
+
 class FakeInteraction:
     def __init__(self, *, is_admin=False):
         self.guild = SimpleNamespace(id=123)
-        self.user = SimpleNamespace(guild_permissions=SimpleNamespace(administrator=is_admin))
+        self.user = SimpleNamespace(
+            id=OPERATOR_ID if is_admin else 7,
+            guild_permissions=SimpleNamespace(administrator=True),
+        )
         self.response = FakeResponse()
         self.followup = FakeFollowup()
 
@@ -44,7 +51,7 @@ class FakeRAGService:
 
 def test_handle_ask_delegates_to_service_and_sends_embed():
     service = FakeRAGService()
-    handler = KingshotRAGHandler(service, bot=SimpleNamespace())
+    handler = KingshotRAGHandler(service, bot=SimpleNamespace(), access_policy=AccessPolicy({OPERATOR_ID}))
     interaction = FakeInteraction()
 
     asyncio.run(handler._handle_ask(interaction, " How do rallies work? ", "event"))
@@ -55,7 +62,7 @@ def test_handle_ask_delegates_to_service_and_sends_embed():
 
 def test_handle_upsert_rejects_non_admin_user():
     service = FakeRAGService()
-    handler = KingshotRAGHandler(service, bot=SimpleNamespace())
+    handler = KingshotRAGHandler(service, bot=SimpleNamespace(), access_policy=AccessPolicy({OPERATOR_ID}))
     interaction = FakeInteraction(is_admin=False)
 
     asyncio.run(
@@ -72,12 +79,12 @@ def test_handle_upsert_rejects_non_admin_user():
     )
 
     assert service.upsert_calls == []
-    assert interaction.followup.sent[0]["embed"].title == "Permission Denied"
+    assert interaction.followup.sent[0]["embed"].title == "🔒 Not allowed"
 
 
 def test_handle_upsert_rejects_invalid_json():
     service = FakeRAGService()
-    handler = KingshotRAGHandler(service, bot=SimpleNamespace())
+    handler = KingshotRAGHandler(service, bot=SimpleNamespace(), access_policy=AccessPolicy({OPERATOR_ID}))
     interaction = FakeInteraction(is_admin=True)
 
     asyncio.run(
@@ -99,7 +106,7 @@ def test_handle_upsert_rejects_invalid_json():
 
 def test_handle_upsert_delegates_valid_admin_payload():
     service = FakeRAGService()
-    handler = KingshotRAGHandler(service, bot=SimpleNamespace())
+    handler = KingshotRAGHandler(service, bot=SimpleNamespace(), access_policy=AccessPolicy({OPERATOR_ID}))
     interaction = FakeInteraction(is_admin=True)
 
     asyncio.run(
@@ -121,3 +128,20 @@ def test_handle_upsert_delegates_valid_admin_payload():
     assert call["data"] == {"difficulty": "daily"}
     assert call["chunks"][0].metadata == {"phase": "prep"}
     assert interaction.followup.sent[0]["embed"].title == "Kingshot Knowledge Saved"
+
+
+def test_handle_ask_reports_no_matching_knowledge():
+    class NoMatchService(FakeRAGService):
+        NO_MATCH_ANSWER = "no match"
+
+        async def answer_question(self, question, **kwargs):
+            return self.NO_MATCH_ANSWER
+
+    handler = KingshotRAGHandler(NoMatchService(), bot=SimpleNamespace(), access_policy=AccessPolicy({OPERATOR_ID}))
+    interaction = FakeInteraction()
+
+    asyncio.run(handler._handle_ask(interaction, "best pizza?", None))
+
+    sent = interaction.followup.sent[0]
+    assert sent["embed"].title == "No Matching Knowledge"
+    assert sent["allowed_mentions"].everyone is False

@@ -10,6 +10,7 @@ from handlers.gift_code_handler import (
     PlayerSearchModal,
     RedemptionResultsView,
 )
+from handlers.permissions import AccessPolicy
 from handlers.ui import EmbedColors
 
 
@@ -98,13 +99,18 @@ async def test_gift_actions_paginate_and_recheck_admin_authorization():
     await view.code_select.callback(action)
     assert view.selected_index == 24
 
+    # Codes are copyable plain lines in the message content.
+    assert view.build_content().splitlines() == [f"`CODE{i}`" for i in range(20, 25)]
+
     # Removing an admin after the card was opened must revoke the button too.
-    handler._config.admin_user_ids = []
+    handler._access = AccessPolicy([])
     await view.redeem_button.callback(action)
-    assert action.followup.send.call_args.kwargs["embed"].title == "⛔ Admin Only"
+    assert action.followup.send.call_args.kwargs["embed"].title == "🔒 Not allowed"
     handler._gift_code_service.redeem_gift_code_remote.assert_not_awaited()
     readonly = GiftCodesView(handler, codes, 123, can_redeem=False)
     assert readonly.redeem_button not in readonly.children
+    assert readonly.code_select not in readonly.children
+    assert "centurygame.com" in readonly.build_embed().description
     assert not await view.interaction_check(interaction(456))
     view.message = SimpleNamespace(edit=AsyncMock())
     await view.on_timeout()
@@ -130,12 +136,20 @@ async def test_normal_progress_message_is_throttled_and_replaced_by_summary():
         gift_code="CODE", registered_players=[player(2)], actor_user_id=123,
         guild_id=456, channel=channel,
     )
-    channel.send.assert_awaited_once()
-    assert "0/1 players" in channel.send.call_args.kwargs["embed"].description
+    assert channel.send.await_count == 2
+    progress_card = channel.send.call_args_list[0].kwargs
+    assert "0/1 players" in progress_card["embed"].description
+    assert "▱" in progress_card["embed"].description
+    assert progress_card["view"].cancel_button.label == "Cancel"
     assert message.edit.await_count == 3
     final = message.edit.call_args.kwargs
     assert final["embed"].title == "✅ All Gift Codes Redeemed Successfully!"
     assert final["view"] is None
+    assert "content" not in final  # Edited-in mentions do not notify.
+    ping = channel.send.call_args_list[1].kwargs
+    assert ping["content"].startswith("<@123> redemption finished for `CODE`")
+    assert [user.id for user in ping["allowed_mentions"].users] == [123]
+    assert ping["allowed_mentions"].everyone is False and ping["allowed_mentions"].roles is False
 
 
 @pytest.mark.asyncio
@@ -146,8 +160,8 @@ async def test_bulk_reports_cached_results_rate_limit_wait_and_persistence(monke
         {"success": False, "error_code": "RATE_LIMITED", "message": "Too frequent"},
         {"success": True, "message": "OK"},
     ]
-    monkeypatch.setattr("handlers.gift_code_handler.asyncio.sleep", AsyncMock())
-    monkeypatch.setattr("handlers.gift_code_handler.random.uniform", lambda *args: 0)
+    monkeypatch.setattr("services.gift_redemption_service.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("services.gift_redemption_service.random.uniform", lambda *args: 0)
     updates = []
 
     async def progress(results, phase):
@@ -159,7 +173,7 @@ async def test_bulk_reports_cached_results_rate_limit_wait_and_persistence(monke
     )
     assert updates[0] == (1, "Redeeming players")
     assert any("Rate limited" in phase and "1 waiting" in phase for _, phase in updates)
-    assert updates[-1] == (2, "Saving redemption results")
+    assert updates[-1] == (2, "Finishing")
     assert [row["status_category"] for row in results] == ["already_redeemed", "success"]
     assert handler._gift_code_service.redeem_gift_code_remote.await_count == 2
     handler._tracking_service.log_gift_code_redemptions_many.assert_awaited_once()
@@ -171,7 +185,7 @@ async def test_already_claimed_is_success_and_details_cover_every_issue():
     channel = SimpleNamespace(send=AsyncMock())
     results = [{"status_category": "already_redeemed"}] * 10
     await handler._send_redemption_results_to_channel(channel, 123, "CODE", results)
-    summary = channel.send.call_args.kwargs
+    summary = channel.send.call_args_list[0].kwargs
     assert "Everyone Has Already Claimed" in summary["embed"].title
     assert summary["embed"].color == EmbedColors.SUCCESS
     assert summary["view"] is None
@@ -182,7 +196,7 @@ async def test_already_claimed_is_success_and_details_cover_every_issue():
         for i in range(12)
     ]
     await handler._send_redemption_results_to_channel(channel, 123, "CODE", results + issues)
-    view = channel.send.call_args.kwargs["view"]
+    view = channel.send.call_args_list[2].kwargs["view"]
     assert isinstance(view, RedemptionResultsView)
     assert len(view.issues) == 12
     action = interaction()

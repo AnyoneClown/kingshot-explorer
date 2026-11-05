@@ -84,36 +84,32 @@ class KingshotAPIClient:
         url = f"{HOSTNAME}/api{path}"
         session = await self.ensure_session()
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                await self._wait_for_request_slot()
-                async with session.post(
-                    url, data=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 429:
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2 * (attempt + 1))
-                            continue
-                        return {"code": 1, "msg": "API rate limit exceeded (429 Too Many Requests).", "err_code": 429}
+        # Exactly one HTTP attempt per call. The single retry layer lives in
+        # GiftRedemptionService.redeem_with_retries, which knows which results are
+        # transient and reports rate-limit waits; retrying here as well multiplied
+        # the request count (3 transport retries x 3-4 result retries per player).
+        try:
+            await self._wait_for_request_slot()
+            async with session.post(
+                url, data=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 429:
+                    return {"code": 1, "msg": "API rate limit exceeded (429 Too Many Requests).", "err_code": 429}
 
-                    try:
-                        # E.g. {'code': 1, 'msg': 'role not exist.', 'data': [], 'err_code': 40004}
-                        return await response.json()
-                    except Exception as e:
-                        text = await response.text()
-                        if response.status != 200:
-                            return {"code": 1, "msg": f"HTTP Error {response.status}", "err_code": response.status}
-                        raise ValueError(f"Failed to parse JSON response: {text}") from e
-            except aiohttp.ClientError as e:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                raise ValueError(f"HTTP request failed: {e}") from e
-            except Exception as e:
-                raise ValueError(f"Unexpected request error: {e}") from e
-
-        return {"code": 1, "msg": "Max retries exceeded.", "err_code": 500}
+                try:
+                    # E.g. {'code': 1, 'msg': 'role not exist.', 'data': [], 'err_code': 40004}
+                    return await response.json()
+                except Exception as e:
+                    if response.status != 200:
+                        return {"code": 1, "msg": f"HTTP Error {response.status}", "err_code": response.status}
+                    text = await response.text()
+                    raise ValueError(f"Failed to parse JSON response: {text[:200]}") from e
+        except ValueError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise ValueError(f"HTTP request failed: {e or type(e).__name__}") from e
+        except Exception as e:
+            raise ValueError(f"Unexpected request error: {e}") from e
 
     async def redeem_code(self, player_id: str, kingdom_id: str, gift_code: str) -> Dict[str, Any]:
         """Redeem a gift code using the current kingdom-aware API payload."""

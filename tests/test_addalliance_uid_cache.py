@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from handlers.gift_code_handler import GiftCodeHandler
+from services.player_registry_service import RegistrationOutcome
 
 
 class FakeResponse:
@@ -22,6 +23,7 @@ class FakeFollowup:
 
 class FakeInteraction:
     def __init__(self):
+        self.guild_id = 999
         self.user = SimpleNamespace(
             id=111,
             name="tester",
@@ -56,14 +58,14 @@ class FakeRegistryService:
             if str(player_uid) in self.cached_by_uid
         }
 
-    async def add_registered_player(self, **kwargs):
-        self.added_players.append(kwargs)
-        return SimpleNamespace(**kwargs)
-
-    async def add_registered_players(self, players):
-        self.added_player_batches.append(players)
-        self.added_players.extend(players)
-        return [SimpleNamespace(**player) for player in players]
+    async def register_players_for_guild(self, guild_id, profiles, **kwargs):
+        assert guild_id == 999
+        assert kwargs["added_by_user_id"] == 111
+        assert kwargs["enable_existing"] is True
+        self.registration_kwargs = kwargs
+        self.added_player_batches.append(profiles)
+        self.added_players.extend(profiles)
+        return RegistrationOutcome(added=[profile["player_id"] for profile in profiles], roster_size=len(profiles))
 
 
 class FakeKingshotDataService:
@@ -100,7 +102,7 @@ def build_handler(registry, kingshot):
         gift_code_service=SimpleNamespace(),
         player_info_service=SimpleNamespace(),
         bot=SimpleNamespace(),
-        config=SimpleNamespace(),
+        config=SimpleNamespace(max_players_per_guild=300),
         interaction_tracking_service=FakeTrackingService(),
         player_registry_service=registry,
         kingshot_data_service=kingshot,
@@ -126,8 +128,17 @@ def test_addalliance_uses_cached_uid_without_resolving_profile():
 
     assert kingshot.player_calls == []
     assert kingshot.full_alliance_calls == []
-    assert registry.added_player_batches == []
-    assert registry.added_players == []
+    # The cached fid is registered into this server's roster without an API lookup.
+    assert registry.added_players == [
+        {
+            "player_id": "123456789",
+            "player_uid": "30669791",
+            "player_name": "Cached Name",
+            "kingdom": "830",
+            "castle_level": "30",
+        }
+    ]
+    assert registry.registration_kwargs["max_total"] == 300
     assert "Added 1 Alliance Member" in interaction.followup.sent_embed.title
 
 
@@ -156,12 +167,10 @@ def test_addalliance_resolves_uncached_uid_and_stores_uid_mapping():
     assert registry.added_players == [
         {
             "player_id": "123456789",
-            "added_by_user_id": 111,
             "player_uid": "30669791",
             "player_name": "Resolved Name",
             "kingdom": "830",
             "castle_level": "30",
-            "enabled": True,
         }
     ]
     assert "Added 1 Alliance Member" in interaction.followup.sent_embed.title
@@ -202,20 +211,17 @@ def test_addalliance_only_resolves_cache_misses():
     assert kingshot.player_calls == ["30669792"]
     assert kingshot.full_alliance_calls == []
     assert len(registry.added_player_batches) == 1
-    assert registry.added_players == [
-        {
-            "player_id": "987654321",
-            "added_by_user_id": 111,
-            "player_uid": "30669792",
-            "player_name": "Missing Cache Name",
-            "kingdom": "830",
-            "castle_level": "29",
-            "enabled": True,
-        },
-    ]
+    assert [player["player_id"] for player in registry.added_players] == ["123456789", "987654321"]
+    assert registry.added_players[1] == {
+        "player_id": "987654321",
+        "player_uid": "30669792",
+        "player_name": "Missing Cache Name",
+        "kingdom": "830",
+        "castle_level": "29",
+    }
 
 
-def test_addalliance_reenables_cached_disabled_player():
+def test_addalliance_registers_cached_disabled_player_for_this_server():
     cached_player = SimpleNamespace(
         player_id="123456789",
         player_name="Cached Name",
@@ -238,11 +244,9 @@ def test_addalliance_reenables_cached_disabled_player():
     assert registry.added_players == [
         {
             "player_id": "123456789",
-            "added_by_user_id": 111,
             "player_uid": "30669791",
             "player_name": "Cached Name",
             "kingdom": "830",
             "castle_level": "30",
-            "enabled": True,
         }
     ]

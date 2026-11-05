@@ -107,9 +107,19 @@ class KingshotDataService:
         """Fetch alliance summary and roster."""
         return await self._request("GET", f"/v1/alliances/{aid}", params={"kid": str(kid)})
 
+    # /full fetches every member profile server-side with polite pacing, so it is slow
+    # for big alliances: give it a long read timeout and never repeat it on timeout.
+    FULL_ROSTER_TIMEOUT_SECONDS = 85.0
+
     async def get_alliance_full(self, aid: str | int, kid: int | str) -> Dict[str, Any]:
         """Fetch alliance summary and full member profiles."""
-        return await self._request("GET", f"/v1/alliances/{aid}/full", params={"kid": str(kid)})
+        return await self._request(
+            "GET",
+            f"/v1/alliances/{aid}/full",
+            params={"kid": str(kid)},
+            timeout=self.FULL_ROSTER_TIMEOUT_SECONDS,
+            retry_on_timeout=False,
+        )
 
     async def get_ranked_alliances(
         self,
@@ -465,6 +475,60 @@ class KingshotDataService:
             },
         )
 
+    async def get_kingdom_castle(
+        self,
+        kid: int | str,
+        *,
+        history: bool = True,
+        kvk: bool = False,
+        resolve: bool = False,
+        aid: int | str | None = None,
+    ) -> Dict[str, Any]:
+        """Fetch a kingdom's castle snapshot (``KingdomCastle``).
+
+        Current king and castle owner (``owner_kid``/``foreign_owner``); with
+        ``history`` the reign log and per-king tally; with ``kvk`` the ruling
+        alliance's cross-kingdom wins (one extra gateway lookup; ``aid`` overrides
+        the alliance); with ``resolve`` each tallied king's present-day identity.
+        """
+        params = {
+            "history": self._bool_param(history),
+            "kvk": self._bool_param(kvk),
+            "resolve": self._bool_param(resolve),
+        }
+        if aid is not None:
+            params["aid"] = str(aid)
+        return await self._request("GET", f"/v1/kingdoms/{kid}/castle", params=params)
+
+    async def get_kingdom_kings(self, kid: int | str, *, resolve: bool = False) -> Dict[str, Any]:
+        """Fetch a kingdom's throne reign history and per-player king tally."""
+        return await self._request(
+            "GET",
+            f"/v1/kingdoms/{kid}/kings",
+            params={"resolve": self._bool_param(resolve)},
+        )
+
+    async def get_player_reigns(
+        self,
+        uid: int | str,
+        *,
+        kid: int | str | None = None,
+        resolve: bool = False,
+    ) -> Dict[str, Any]:
+        """Fetch one player's reign tally from a kingdom's hall.
+
+        Without ``kid`` the API reads the player's home-kingdom hall, which does
+        not include conquests of other kingdoms (there is no global index).
+        """
+        params = {"resolve": self._bool_param(resolve)}
+        if kid is not None:
+            params["kid"] = str(kid)
+        return await self._request("GET", f"/v1/players/{uid}/reigns", params=params)
+
+    @staticmethod
+    def _bool_param(value: bool) -> str:
+        return "true" if value else "false"
+
     def _build_headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
         if self._api_key:
@@ -478,6 +542,8 @@ class KingshotDataService:
         *,
         params: Dict[str, str] | None = None,
         require_api_key: bool = True,
+        timeout: float | None = None,
+        retry_on_timeout: bool = True,
     ) -> Dict[str, Any]:
         if require_api_key and not self._api_key:
             logger.warning("KingShot Data API request blocked: missing API key")
@@ -489,11 +555,20 @@ class KingshotDataService:
             }
 
         params = params or {}
+        request_kwargs = {"timeout": timeout} if timeout is not None else {}
         for attempt in range(1, self._max_retries + 1):
             try:
                 client = await self.ensure_client()
-                response = await client.request(method=method, url=path, params=params)
+                response = await client.request(method=method, url=path, params=params, **request_kwargs)
             except (httpx.NetworkError, httpx.TimeoutException) as exc:
+                if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
+                    logger.error("Timed out calling %s (not retried): %s", path, exc)
+                    return {
+                        "success": False,
+                        "status_code": None,
+                        "error_code": "NETWORK_ERROR",
+                        "error_message": f"Timed out: {exc}",
+                    }
                 if attempt >= self._max_retries:
                     logger.error("Network error after retries while calling %s: %s", path, exc)
                     return {

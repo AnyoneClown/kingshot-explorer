@@ -448,3 +448,98 @@ async def test_close_cancels_and_drains_retained_alliance_resolutions():
 
     assert service.cancelled.is_set()
     assert service._ranked_alliance_batches == {}
+
+
+def _castle_service(handle) -> KingshotDataService:
+    service = KingshotDataService(api_key="secret", base_url="https://ks.example", max_retries=1)
+    service._client = httpx.AsyncClient(
+        base_url="https://ks.example",
+        headers=service._build_headers(),
+        transport=httpx.MockTransport(handle),
+    )
+    return service
+
+
+@pytest.mark.asyncio
+async def test_castle_kings_and_reigns_use_documented_paths_and_params():
+    requests: list[httpx.Request] = []
+    castle = {"kid": 555, "owner_kid": 555, "foreign_owner": False, "king": {"uid": 1, "name": "King"}}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/castle"):
+            return httpx.Response(200, json=castle)
+        return httpx.Response(200, json={"count": 0, "history": [], "kings": []})
+
+    service = _castle_service(handle)
+    try:
+        castle_result = await service.get_kingdom_castle(555, kvk=True, resolve=True)
+        snapshot = await service.get_kingdom_castle("556", history=False, aid=56400075)
+        kings = await service.get_kingdom_kings(555, resolve=True)
+        home_reigns = await service.get_player_reigns(21473081)
+        hall_reigns = await service.get_player_reigns(21473081, kid=555)
+    finally:
+        await service.close()
+
+    assert castle_result == {"success": True, "status_code": 200, "data": castle}
+    assert all(result["success"] for result in (snapshot, kings, home_reigns, hall_reigns))
+    calls = [(request.url.path, dict(request.url.params)) for request in requests]
+    assert calls == [
+        ("/v1/kingdoms/555/castle", {"history": "true", "kvk": "true", "resolve": "true"}),
+        ("/v1/kingdoms/556/castle", {"history": "false", "kvk": "false", "resolve": "false", "aid": "56400075"}),
+        ("/v1/kingdoms/555/kings", {"resolve": "true"}),
+        ("/v1/players/21473081/reigns", {"resolve": "false"}),
+        ("/v1/players/21473081/reigns", {"resolve": "false", "kid": "555"}),
+    ]
+    assert all(request.headers["X-API-Key"] == "secret" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_castle_errors_use_standard_envelope_and_require_key():
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"detail": "gateway error"})
+
+    service = _castle_service(handle)
+    try:
+        failed = await service.get_kingdom_castle(555)
+    finally:
+        await service.close()
+
+    assert failed["success"] is False
+    assert failed["status_code"] == 502 and failed["error_code"] == "GATEWAY_ERROR"
+
+    keyless = KingshotDataService(api_key=None, base_url="https://ks.example")
+    assert (await keyless.get_kingdom_kings(555))["error_code"] == "MISSING_API_KEY"
+    assert (await keyless.get_player_reigns(1))["error_code"] == "MISSING_API_KEY"
+    await keyless.close()
+
+
+def test_alliance_full_uses_long_timeout_and_is_not_retried_on_timeout():
+    import httpx
+
+    from services.kingshot_data_service import KingshotDataService
+
+    calls = []
+
+    class TimeoutClient:
+        is_closed = False
+
+        async def request(self, **kwargs):
+            calls.append(kwargs)
+            raise httpx.ReadTimeout("slow")
+
+        async def aclose(self):
+            pass
+
+    service = KingshotDataService(api_key="key", base_url="https://example.test")
+    service._client = TimeoutClient()
+
+    async def no_wait():
+        return service._client
+
+    service.ensure_client = no_wait
+    result = asyncio.run(service.get_alliance_full(1, 2))
+
+    assert result["success"] is False
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == KingshotDataService.FULL_ROSTER_TIMEOUT_SECONDS

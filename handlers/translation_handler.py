@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import logging
 import random
 import time
@@ -8,17 +10,34 @@ import discord
 from discord.ext import commands
 
 from handlers.ui import EmbedColors, build_status_embed
+from services.chat_tools import ToolContext
 from services.chatbot_service import IChatbotService
 from services.guild_configuration_service import GuildConfigurationService
 from services.interaction_tracking_service import InteractionTrackingService
-from services.translation_service import ITranslationService
+from services.text_utils import split_for_discord, truncate_cleanly
+from services.translation_service import (
+    ITranslationService,
+    TranslationUnavailableError,
+    UnknownLanguageError,
+    has_translatable_text,
+    is_english_language,
+    looks_clearly_english,
+)
 from services.voice_message_service import VoiceMessageService
 
 logger = logging.getLogger(__name__)
 
+# Model output (translations, chat replies) must never ping anyone.
+NO_MENTIONS = discord.AllowedMentions.none()
+
 
 class TranslationHandler:
     """Handles translation-related Discord commands and events."""
+
+    DEFAULT_CHAT_USER_COOLDOWN_SECONDS = 10.0
+    EMBED_TEXT_LIMIT = 3800
+    MESSAGE_CHUNK_LIMIT = 1800
+    MAX_TRANSLATION_MESSAGES = 3
 
     def __init__(
         self,
@@ -29,6 +48,7 @@ class TranslationHandler:
         voice_message_service: VoiceMessageService | None = None,
         interaction_tracking_service: InteractionTrackingService | None = None,
         guild_configuration_service: GuildConfigurationService | None = None,
+        access_policy=None,
     ):
         """
         Initialize translation handler.
@@ -37,7 +57,8 @@ class TranslationHandler:
             translation_service: Service for handling translations
             chatbot_service: Service for contextual conversational replies
             bot: Discord bot instance
-            config: Bot configuration containing banned players list
+            config: Bot configuration (role name, chat limits, legacy banned list)
+            access_policy: ``AccessPolicy``; banned users are ignored everywhere
         """
         self._translation_service = translation_service
         self._chatbot_service = chatbot_service
@@ -45,8 +66,11 @@ class TranslationHandler:
         self._config = config
         self._voice_message_service = voice_message_service
         self._last_chat_reply_at: Dict[int, float] = {}
+        self._last_user_reply_at: Dict[int, float] = {}
+        self._background_tasks: set[asyncio.Task] = set()
         self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
         self._guild_configuration_service = guild_configuration_service
+        self._access = access_policy
 
     def register_commands(self):
         """Register all translation commands with the bot."""
@@ -74,6 +98,10 @@ class TranslationHandler:
             if message.author == self._bot.user or message.author.bot:
                 return
 
+            # Banned users are ignored entirely: no prefix commands, translation or chat.
+            if self._is_banned(message.author.id):
+                return
+
             await self._bot.process_commands(message)
 
             # Stop if command or DM
@@ -83,17 +111,78 @@ class TranslationHandler:
             await self._handle_auto_translation(message)
             await self._handle_contextual_chat(message)
 
-    async def _handle_translate_to_language(self, ctx, target_language: str):
-        """Handle translation to a specific language command."""
-        # Check if user is banned from translation
-        if self._config and ctx.author.id in self._config.banned_players:
+    # ------------------------------------------------------------------ access
+
+    def _is_banned(self, user_id) -> bool:
+        if self._access is not None:
+            try:
+                if self._access.is_banned(user_id):
+                    return True
+            except Exception:
+                logger.debug("Access policy ban check failed for %s", user_id, exc_info=True)
+        banned = getattr(self._config, "banned_players", None) or ()
+        return user_id in banned
+
+    async def _reply_blocked(self, ctx) -> None:
+        await ctx.reply(
+            embed=build_status_embed(
+                title="Translation Blocked",
+                description="You are currently blocked from using translation commands.",
+                color=EmbedColors.ERROR,
+            )
+        )
+
+    @staticmethod
+    def _unavailable_embed() -> discord.Embed:
+        return build_status_embed(
+            title="Translation Unavailable",
+            description="The translation service is unavailable right now. Try again in a moment.",
+            color=EmbedColors.ERROR,
+        )
+
+    @staticmethod
+    def _nothing_to_translate_embed() -> discord.Embed:
+        return build_status_embed(
+            title="Nothing to Translate",
+            description="The replied-to message only contains emoji, mentions, links or numbers.",
+            color=EmbedColors.WARNING,
+        )
+
+    async def _fetch_replied_text(self, ctx) -> str | None:
+        """Return the replied-to message text, replying with an explanation when unusable."""
+        try:
+            original_message = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             await ctx.reply(
                 embed=build_status_embed(
-                    title="Translation Blocked",
-                    description="You are currently blocked from using translation commands.",
-                    color=EmbedColors.ERROR,
+                    title="Message Unavailable",
+                    description="I couldn't read the replied-to message. It may have been deleted.",
+                    color=EmbedColors.WARNING,
                 )
             )
+            return None
+
+        text_to_translate = original_message.content
+        if not text_to_translate:
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Empty Message",
+                    description="The replied-to message does not contain text to translate.",
+                    color=EmbedColors.WARNING,
+                )
+            )
+            return None
+        if not has_translatable_text(text_to_translate):
+            await ctx.reply(embed=self._nothing_to_translate_embed())
+            return None
+        return text_to_translate
+
+    # ------------------------------------------------------------------ commands
+
+    async def _handle_translate_to_language(self, ctx, target_language: str):
+        """Handle translation to a specific language command."""
+        if self._is_banned(ctx.author.id):
+            await self._reply_blocked(ctx)
             return
 
         if not ctx.message.reference:
@@ -107,99 +196,68 @@ class TranslationHandler:
             return
 
         try:
-            original_message = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            text_to_translate = original_message.content
-
-            if not text_to_translate:
-                await ctx.reply(
-                    embed=build_status_embed(
-                        title="Empty Message",
-                        description="The replied-to message does not contain text to translate.",
-                        color=EmbedColors.WARNING,
-                    )
-                )
+            text_to_translate = await self._fetch_replied_text(ctx)
+            if text_to_translate is None:
                 return
 
-            async with ctx.typing():
-                result = await self._translation_service.translate_to_language(text_to_translate, target_language)
-
-                if result:
-                    translated_text = result.get("text")
-                    if not translated_text:
-                        await ctx.reply(
-                            embed=build_status_embed(
-                                title="Translation Failed",
-                                description="The AI service responded, but no translated text was returned.",
-                                color=EmbedColors.ERROR,
-                            )
-                        )
-                        return
-
-                    quoted_text = self._as_quote_block(self._truncate_for_discord(translated_text, 1500))
-                    embed = build_status_embed(
-                        title=f"Translated to {target_language}",
-                        description=quoted_text,
-                        color=EmbedColors.INFO,
-                        footer="DS Translator",
-                    )
-                    await self._reply_with_optional_voice(
-                        ctx.reply,
-                        embed=embed,
-                        guild_id=ctx.guild.id if ctx.guild else None,
-                        voice_text=translated_text,
-                        language_hint=target_language,
-                        filename_stem="translation",
-                    )
-
-                    # Track in database
-                    try:
-                        await self._interaction_tracking_service.track_translation(
-                            user_id=ctx.author.id,
-                            original_text=text_to_translate,
-                            translated_text=translated_text,
-                            target_language=target_language,
-                            source_language=result.get("language"),
-                            translation_type="command",
-                            guild_id=ctx.guild.id if ctx.guild else None,
-                            channel_id=ctx.channel.id,
-                            username=ctx.author.name,
-                            discriminator=ctx.author.discriminator,
-                            display_name=ctx.author.display_name,
-                        )
-                    except Exception as db_error:
-                        logger.error(f"Database tracking error: {db_error}", exc_info=True)
-                else:
-                    await ctx.reply(
-                        embed=build_status_embed(
-                            title="Translation Failed",
-                            description=(
-                                f"I couldn't translate that to `{target_language}`. "
-                                "Try a common language name like `Spanish`, `French`, or `English`."
-                            ),
-                            color=EmbedColors.ERROR,
-                        )
-                    )
-        except Exception as e:
-            logger.error(f"Error in translate command: {e}")
-            await ctx.reply(
-                embed=build_status_embed(
-                    title="Translation Unavailable",
-                    description="The translation request failed. Try again in a moment.",
-                    color=EmbedColors.ERROR,
+            try:
+                async with ctx.typing():
+                    result = await self._translation_service.translate_to_language(text_to_translate, target_language)
+            except UnknownLanguageError:
+                await ctx.reply(
+                    embed=build_status_embed(
+                        title="Unknown Language",
+                        description=(
+                            f"I don't recognise `{truncate_cleanly(target_language, 40)}` as a language. "
+                            "Try a common language name like `Spanish`, `French`, or `English`."
+                        ),
+                        color=EmbedColors.WARNING,
+                    ),
+                    allowed_mentions=NO_MENTIONS,
                 )
+                return
+            except TranslationUnavailableError:
+                await ctx.reply(embed=self._unavailable_embed())
+                return
+
+            translated_text = (result or {}).get("text")
+            if not translated_text:
+                await ctx.reply(embed=self._nothing_to_translate_embed())
+                return
+
+            embed = build_status_embed(
+                title=f"Translated to {truncate_cleanly(target_language, 60)}",
+                description=self._quote_for_embed(translated_text),
+                color=EmbedColors.INFO,
+                footer="DS Translator",
             )
+            await self._reply_with_optional_voice(
+                ctx.reply,
+                embed=embed,
+                guild_id=ctx.guild.id if ctx.guild else None,
+                voice_text=translated_text,
+                language_hint=target_language,
+                filename_stem="translation",
+            )
+
+            await self._track_translation(
+                ctx.author,
+                original_text=text_to_translate,
+                translated_text=translated_text,
+                target_language=target_language,
+                source_language=result.get("language"),
+                translation_type="command",
+                guild=ctx.guild,
+                channel=ctx.channel,
+            )
+        except Exception as e:
+            logger.error(f"Error in translate command: {e}", exc_info=True)
+            await ctx.reply(embed=self._unavailable_embed())
 
     async def _handle_translate_to_english(self, ctx):
         """Handle translation to English command."""
-        # Check if user is banned from translation
-        if self._config and ctx.author.id in self._config.banned_players:
-            await ctx.reply(
-                embed=build_status_embed(
-                    title="Translation Blocked",
-                    description="You are currently blocked from using translation commands.",
-                    color=EmbedColors.ERROR,
-                )
-            )
+        if self._is_banned(ctx.author.id):
+            await self._reply_blocked(ctx)
             return
 
         if not ctx.message.reference:
@@ -213,69 +271,24 @@ class TranslationHandler:
             return
 
         try:
-            original_message = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            text_to_translate = original_message.content
-
-            if not text_to_translate:
-                await ctx.reply(
-                    embed=build_status_embed(
-                        title="Empty Message",
-                        description="The replied-to message does not contain text to translate.",
-                        color=EmbedColors.WARNING,
-                    )
-                )
+            text_to_translate = await self._fetch_replied_text(ctx)
+            if text_to_translate is None:
                 return
 
-            async with ctx.typing():
-                result = await self._translation_service.translate_to_english(text_to_translate)
+            try:
+                async with ctx.typing():
+                    result = await self._translation_service.translate_to_english(text_to_translate)
+            except TranslationUnavailableError:
+                await ctx.reply(embed=self._unavailable_embed())
+                return
 
-            if result and result.get("language").lower() not in ("english", "en"):
-                translated_text = result.get("text")
-                source_language = result.get("language")
-                if not translated_text:
-                    await ctx.reply(
-                        embed=build_status_embed(
-                            title="Translation Failed",
-                            description="The AI service responded, but no translated text was returned.",
-                            color=EmbedColors.ERROR,
-                        )
-                    )
-                    return
+            if not result or not result.get("text"):
+                await ctx.reply(embed=self._nothing_to_translate_embed())
+                return
 
-                quoted_text = self._as_quote_block(self._truncate_for_discord(translated_text, 1500))
-                embed = build_status_embed(
-                    title=f"Translated from {source_language}",
-                    description=quoted_text,
-                    color=EmbedColors.INFO,
-                    footer="DS Translator",
-                )
-                await self._reply_with_optional_voice(
-                    ctx.reply,
-                    embed=embed,
-                    guild_id=ctx.guild.id if ctx.guild else None,
-                    voice_text=translated_text,
-                    language_hint=source_language,
-                    filename_stem="translation",
-                )
-
-                # Track in database
-                try:
-                    await self._interaction_tracking_service.track_translation(
-                        user_id=ctx.author.id,
-                        original_text=text_to_translate,
-                        translated_text=translated_text,
-                        target_language="en",
-                        source_language=source_language,
-                        translation_type="command",
-                        guild_id=ctx.guild.id if ctx.guild else None,
-                        channel_id=ctx.channel.id,
-                        username=ctx.author.name,
-                        discriminator=ctx.author.discriminator,
-                        display_name=ctx.author.display_name,
-                    )
-                except Exception as db_error:
-                    logger.error(f"Database tracking error: {db_error}", exc_info=True)
-            elif result:
+            translated_text = result["text"]
+            source_language = result.get("language")
+            if is_english_language(source_language) or self._same_text(translated_text, text_to_translate):
                 await ctx.reply(
                     embed=build_status_embed(
                         title="Already English",
@@ -283,23 +296,36 @@ class TranslationHandler:
                         color=EmbedColors.SUCCESS,
                     )
                 )
-            else:
-                await ctx.reply(
-                    embed=build_status_embed(
-                        title="Translation Failed",
-                        description="I couldn't translate that message. Try again with a clearer text message.",
-                        color=EmbedColors.ERROR,
-                    )
-                )
-        except Exception as e:
-            logger.error(f"Error in !en command: {e}")
-            await ctx.reply(
-                embed=build_status_embed(
-                    title="Translation Unavailable",
-                    description="The translation request failed. Try again in a moment.",
-                    color=EmbedColors.ERROR,
-                )
+                return
+
+            embed = build_status_embed(
+                title=f"Translated from {truncate_cleanly(str(source_language or 'unknown'), 60)}",
+                description=self._quote_for_embed(translated_text),
+                color=EmbedColors.INFO,
+                footer="DS Translator",
             )
+            await self._reply_with_optional_voice(
+                ctx.reply,
+                embed=embed,
+                guild_id=ctx.guild.id if ctx.guild else None,
+                voice_text=translated_text,
+                language_hint="English",
+                filename_stem="translation",
+            )
+
+            await self._track_translation(
+                ctx.author,
+                original_text=text_to_translate,
+                translated_text=translated_text,
+                target_language="en",
+                source_language=source_language,
+                translation_type="command",
+                guild=ctx.guild,
+                channel=ctx.channel,
+            )
+        except Exception as e:
+            logger.error(f"Error in !en command: {e}", exc_info=True)
+            await ctx.reply(embed=self._unavailable_embed())
 
     async def _handle_command_error(self, ctx, error):
         """Handle errors for translation commands."""
@@ -321,83 +347,155 @@ class TranslationHandler:
                 )
             )
 
+    # ------------------------------------------------------------------ auto translation
+
+    def _has_translator_role(self, message: discord.Message) -> bool:
+        role_name = self._config.translator_role_name if self._config else "Translator"
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return False
+        role = discord.utils.get(guild.roles, name=role_name)
+        return bool(role and role in getattr(message.author, "roles", ()))
+
     async def _handle_auto_translation(self, message: discord.Message):
         """Automatically translate messages from users with Translator role."""
-        role_name = self._config.translator_role_name if self._config else "Translator"
-        role = discord.utils.get(message.guild.roles, name=role_name)
-
-        if not (role and role in message.author.roles):
+        content = message.content or ""
+        # Skip empty or command-like messages
+        if not content.strip() or content.startswith(("!", "$", "/", "?")):
             return
 
-        # Check if user is banned from auto-translation
-        if self._config and message.author.id in self._config.banned_players:
+        if self._is_banned(message.author.id):
             logger.debug(f"User {message.author.id} is banned from auto-translation")
             return
 
-        # Skip empty or command-like messages
-        if not message.content or message.content.startswith(("!", "$", "/", "?")):
+        if not self._has_translator_role(message):
+            return
+
+        # Cheap local gates before paying for an LLM call.
+        if not has_translatable_text(content) or looks_clearly_english(content):
             return
 
         try:
-            result = await self._translation_service.translate_to_english(message.content)
-            translated_text = None
-            source_language = None
-            if result and result.get("language") != "English":
-                translated_text = result.get("text")
-                source_language = result.get("language")
-
-            if translated_text:
-                await self._reply_with_optional_voice(
-                    message.reply,
-                    content=self._as_quote_block(self._truncate_for_discord(translated_text, 1500)),
-                    guild_id=message.guild.id if message.guild else None,
-                    voice_text=translated_text,
-                    language_hint=source_language,
-                    filename_stem="translation",
-                )
-
-            # Track in database
-            try:
-                await self._interaction_tracking_service.track_translation(
-                    user_id=message.author.id,
-                    original_text=message.content,
-                    translated_text=translated_text or "",
-                    target_language="en",
-                    source_language=source_language or "en",
-                    translation_type="auto",
-                    guild_id=message.guild.id if message.guild else None,
-                    channel_id=message.channel.id,
-                    username=message.author.name,
-                    discriminator=message.author.discriminator,
-                    display_name=message.author.display_name,
-                )
-            except Exception as db_error:
-                logger.error(f"Database tracking error: {db_error}", exc_info=True)
+            result = await self._translation_service.translate_to_english(content)
+        except TranslationUnavailableError as exc:
+            logger.warning("Auto-translation skipped, service unavailable: %s", exc)
+            return
         except Exception as e:
             logger.error(f"Auto-translation error: {e}", exc_info=True)
-            # Don't send error messages for auto-translation to avoid spam
+            return
+
+        if not result:
+            return
+        translated_text = result.get("text")
+        source_language = result.get("language")
+        if (
+            not translated_text
+            or is_english_language(source_language)
+            or self._same_text(translated_text, content)
+        ):
+            return
+
+        try:
+            chunks = split_for_discord(
+                translated_text,
+                self.MESSAGE_CHUNK_LIMIT,
+                max_chunks=self.MAX_TRANSLATION_MESSAGES,
+            )
+            await self._reply_with_optional_voice(
+                message.reply,
+                content=self._quote_for_message(chunks[0]),
+                mention_author=False,
+                guild_id=message.guild.id if message.guild else None,
+                voice_text=translated_text,
+                language_hint="English",
+                filename_stem="translation",
+            )
+            for chunk in chunks[1:]:
+                await message.channel.send(content=self._quote_for_message(chunk), allowed_mentions=NO_MENTIONS)
+        except Exception as e:
+            logger.error(f"Auto-translation reply failed: {e}", exc_info=True)
+            return
+
+        await self._track_translation(
+            message.author,
+            original_text=content,
+            translated_text=translated_text,
+            target_language="en",
+            source_language=source_language,
+            translation_type="auto",
+            guild=message.guild,
+            channel=message.channel,
+        )
+
+    async def _track_translation(
+        self,
+        author,
+        *,
+        original_text: str,
+        translated_text: str,
+        target_language: str,
+        source_language: str | None,
+        translation_type: str,
+        guild,
+        channel,
+    ) -> None:
+        try:
+            await self._interaction_tracking_service.track_translation(
+                user_id=author.id,
+                original_text=original_text,
+                translated_text=translated_text,
+                target_language=target_language,
+                source_language=source_language,
+                translation_type=translation_type,
+                guild_id=guild.id if guild else None,
+                channel_id=channel.id,
+                username=author.name,
+                discriminator=author.discriminator,
+                display_name=author.display_name,
+            )
+        except Exception as db_error:
+            logger.error(f"Database tracking error: {db_error}", exc_info=True)
+
+    # ------------------------------------------------------------------ contextual chat
 
     async def _handle_contextual_chat(self, message: discord.Message):
         """Optionally reply to chat using recent message history as context."""
-        if self._config and message.author.id in self._config.banned_players:
+        if self._is_banned(message.author.id):
             return
 
-        direct_trigger = await self._is_direct_mention_or_reply(message)
-        if not message.content.strip() and not direct_trigger:
+        guild_id = message.guild.id if message.guild else None
+        direct_trigger = self._has_direct_mention_or_resolved_reply(message)
+        if not direct_trigger and self._has_unresolved_reference(message):
+            # Only pay for the referenced-message fetch when replies are on for this server.
+            if await self._ai_replies_enabled_for_guild(guild_id, default_enabled=True):
+                direct_trigger = await self._is_direct_mention_or_reply(message)
+
+        if not (message.content or "").strip() and not direct_trigger:
             return
 
         if not await self._should_attempt_reply(message, direct_trigger=direct_trigger):
             return
 
+        if not self._claim_user_reply_slot(message.author.id):
+            logger.debug("Chat reply skipped for user %s: per-user cooldown", message.author.id)
+            return
+
         try:
             history = await self._collect_conversation_context(message)
             reply_context = await self._collect_reply_context(message)
-            async with message.channel.typing():
+            tool_context = (
+                ToolContext(guild_id=guild_id, channel_id=message.channel.id, user_id=message.author.id)
+                if direct_trigger and guild_id
+                else None
+            )
+            typing = message.channel.typing() if direct_trigger else contextlib.nullcontext()
+            async with typing:
                 reply_text = await self._chatbot_service.generate_contextual_reply(
                     self._content_for_ai(message),
                     history,
                     force_reply=direct_trigger,
                     reply_context=reply_context,
+                    tool_context=tool_context,
                 )
 
             if not reply_text:
@@ -409,15 +507,17 @@ class TranslationHandler:
                 )
                 return
 
+            is_fallback = bool(getattr(reply_text, "is_fallback", False))
             await self._reply_with_optional_voice(
                 message.reply,
-                content=self._truncate_for_discord(
-                    reply_text,
+                content=truncate_cleanly(
+                    str(reply_text),
                     self._config.max_chat_response_chars if self._config else 500,
                 ),
                 mention_author=False,
-                guild_id=message.guild.id if message.guild else None,
-                voice_text=reply_text,
+                guild_id=guild_id,
+                voice_text=None if is_fallback else str(reply_text),
+                language_hint=getattr(reply_text, "language", None),
                 filename_stem="chat-reply",
             )
 
@@ -425,49 +525,92 @@ class TranslationHandler:
         except Exception as e:
             logger.error(f"Contextual chat error: {e}", exc_info=True)
 
+    def _claim_user_reply_slot(self, user_id: int) -> bool:
+        """Allow at most one AI reply attempt per user per cooldown window."""
+        cooldown = getattr(self._config, "chat_user_cooldown_seconds", None)
+        if cooldown is None:
+            cooldown = self.DEFAULT_CHAT_USER_COOLDOWN_SECONDS
+        cooldown = float(cooldown)
+        if cooldown <= 0:
+            return True
+
+        now = time.monotonic()
+        last = self._last_user_reply_at.get(user_id)
+        if last is not None and now - last < cooldown:
+            return False
+        self._last_user_reply_at[user_id] = now
+        if len(self._last_user_reply_at) > 1000:
+            self._last_user_reply_at = {
+                uid: stamp for uid, stamp in self._last_user_reply_at.items() if now - stamp < cooldown
+            }
+        return True
+
+    # ------------------------------------------------------------------ replies and voice
+
     async def _reply_with_optional_voice(
         self,
         reply_callable,
         *,
         content: str | None = None,
         embed: discord.Embed | None = None,
-        mention_author: bool | None = None,
+        mention_author: bool = False,
         guild_id: int | None = None,
         voice_text: str | None = None,
         language_hint: str | None = None,
         filename_stem: str = "reply",
     ):
-        reply_kwargs = {}
+        """Send the text reply now; attach generated audio afterwards if enabled."""
+        reply_kwargs = {"allowed_mentions": NO_MENTIONS, "mention_author": mention_author}
         if content is not None:
             reply_kwargs["content"] = content
         if embed is not None:
             reply_kwargs["embed"] = embed
-        if mention_author is not None:
-            reply_kwargs["mention_author"] = mention_author
 
-        voice_file = await self._build_voice_file(
-            voice_text,
-            guild_id=guild_id,
-            language_hint=language_hint,
-            filename_stem=filename_stem,
-        )
-        if voice_file is not None:
-            reply_kwargs["file"] = voice_file
+        sent = await reply_callable(**reply_kwargs)
 
-        await reply_callable(**reply_kwargs)
+        if voice_text and self._voice_message_service is not None and sent is not None:
+            if await self._voice_replies_enabled_for_guild(guild_id):
+                self._spawn_background(
+                    self._attach_voice(
+                        sent,
+                        voice_text,
+                        language_hint=language_hint,
+                        filename_stem=filename_stem,
+                    )
+                )
+        return sent
+
+    def _spawn_background(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def wait_for_background_tasks(self) -> None:
+        """Wait for pending voice attachments (used by tests and shutdown)."""
+        while self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+
+    async def _attach_voice(self, sent, text: str, *, language_hint: str | None, filename_stem: str) -> None:
+        try:
+            voice_file = await self._build_voice_file(text, language_hint=language_hint, filename_stem=filename_stem)
+            if voice_file is None:
+                return
+            edit = getattr(sent, "edit", None)
+            if edit is None:
+                return
+            await edit(attachments=[voice_file])
+        except Exception as exc:
+            logger.warning("Could not attach voice reply: %s", exc, exc_info=True)
 
     async def _build_voice_file(
         self,
         text: str | None,
         *,
-        guild_id: int | None = None,
         language_hint: str | None = None,
         filename_stem: str = "reply",
     ) -> discord.File | None:
         if not self._voice_message_service or not text:
-            return None
-
-        if not await self._voice_replies_enabled_for_guild(guild_id):
             return None
 
         try:
@@ -525,7 +668,14 @@ class TranslationHandler:
         if self._config.random_reply_chance <= 0:
             return False
 
-        if len(message.content.strip()) < 4:
+        content = (message.content or "").strip()
+        if len(content) < 4:
+            return False
+
+        # Cheap heuristics: random replies need real words and some substance.
+        if not has_translatable_text(content):
+            return False
+        if len(content.split()) < 3 and "?" not in content:
             return False
 
         last_reply_at = self._last_chat_reply_at.get(message.channel.id)
@@ -567,6 +717,14 @@ class TranslationHandler:
         resolved = getattr(reference, "resolved", None)
         return self._message_is_from_bot(resolved)
 
+    @staticmethod
+    def _has_unresolved_reference(message: discord.Message) -> bool:
+        """True when the message replies to something Discord did not include in the event."""
+        reference = getattr(message, "reference", None)
+        if not reference or not getattr(reference, "message_id", None):
+            return False
+        return getattr(reference, "resolved", None) is None
+
     async def _is_direct_mention_or_reply(self, message: discord.Message) -> bool:
         """Detect whether the message is directly aimed at the bot."""
         if self._has_direct_mention_or_resolved_reply(message):
@@ -594,7 +752,10 @@ class TranslationHandler:
             return False
 
         bot_id = getattr(bot_user, "id", None)
-        return any(mention == bot_user or getattr(mention, "id", None) == bot_id for mention in message.mentions)
+        return any(
+            mention == bot_user or getattr(mention, "id", None) == bot_id
+            for mention in getattr(message, "mentions", ())
+        )
 
     def _message_is_from_bot(self, message: object) -> bool:
         bot_user = self._bot.user
@@ -671,12 +832,29 @@ class TranslationHandler:
             "content": content,
         }
 
+    # ------------------------------------------------------------------ formatting
+
+    @staticmethod
+    def _same_text(left: str | None, right: str | None) -> bool:
+        def normalize(value: str | None) -> str:
+            return " ".join(str(value or "").split()).casefold()
+
+        return normalize(left) == normalize(right)
+
     @staticmethod
     def _truncate_for_discord(text: str, limit: int = 1500) -> str:
-        """Truncate long text to avoid Discord message limits."""
-        if len(text) <= limit:
-            return text
-        return text[: limit - 3] + "..."
+        """Truncate long text at a natural boundary to avoid Discord message limits."""
+        return truncate_cleanly(text, limit)
+
+    @classmethod
+    def _quote_for_embed(cls, text: str, limit: int = 4000) -> str:
+        quoted = cls._as_quote_block(truncate_cleanly(text, cls.EMBED_TEXT_LIMIT))
+        return quoted if len(quoted) <= limit else truncate_cleanly(quoted, limit)
+
+    @classmethod
+    def _quote_for_message(cls, text: str, limit: int = 2000) -> str:
+        quoted = cls._as_quote_block(text)
+        return quoted if len(quoted) <= limit else truncate_cleanly(quoted, limit)
 
     @staticmethod
     def _as_quote_block(text: str) -> str:

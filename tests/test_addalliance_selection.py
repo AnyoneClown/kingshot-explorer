@@ -9,15 +9,27 @@ import discord
 import pytest
 from discord.ext import commands
 
-from handlers.gift_code_handler import GiftCodeHandler
+from handlers.gift_code_handler import ALLIANCE_LOADING_VALUE, GiftCodeHandler
+
+LOADING = discord.app_commands.Choice(
+    name="Still loading alliances — type again in a few seconds",
+    value=ALLIANCE_LOADING_VALUE,
+)
 
 
 class FakeResponse:
     def __init__(self):
         self.defer_kwargs = None
+        self.sent = []
 
     async def defer(self, **kwargs):
         self.defer_kwargs = kwargs
+
+    async def send_message(self, content=None, **kwargs):
+        self.sent.append({"content": content, **kwargs})
+
+    def is_done(self):
+        return self.defer_kwargs is not None
 
 
 class FakeFollowup:
@@ -29,13 +41,16 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self, *, kid=None):
+    def __init__(self, *, kid=None, manage_guild=True):
         self.namespace = SimpleNamespace(kid=kid)
+        self.guild_id = 999
         self.user = SimpleNamespace(
             id=111,
             name="tester",
             discriminator="0",
             display_name="Tester",
+            guild_permissions=SimpleNamespace(manage_guild=manage_guild, administrator=False),
+            roles=[],
         )
         self.response = FakeResponse()
         self.followup = FakeFollowup()
@@ -376,9 +391,9 @@ async def test_empty_partial_preview_uses_existing_completion_without_new_previe
     handler = _build_handler(service)
     handler.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS = 0.01
 
-    assert await handler._get_alliance_autocomplete_choices(830, "") == []
+    assert await handler._get_alliance_autocomplete_choices(830, "") == [LOADING]
     await asyncio.wait_for(service.completion_started.wait(), timeout=0.5)
-    assert await handler._get_alliance_autocomplete_choices(830, "") == []
+    assert await handler._get_alliance_autocomplete_choices(830, "") == [LOADING]
     assert service.calls == [(830, 15, False), (830, 15, True)]
 
     service.release_completion.set()
@@ -490,7 +505,8 @@ async def test_autocomplete_timeout_does_not_cancel_shared_lookup(caplog):
     handler = _build_handler(service)
     handler.ALLIANCE_AUTOCOMPLETE_WAIT_SECONDS = 0.01
 
-    assert await handler._get_alliance_autocomplete_choices(830, "") == []
+    # A timeout must not look like "this kingdom has no alliances".
+    assert await handler._get_alliance_autocomplete_choices(830, "") == [LOADING]
     refresh = handler._alliance_refresh_tasks[830]
     assert not refresh.done()
     assert not refresh.cancelled()
@@ -616,3 +632,46 @@ async def test_submission_rejects_values_outside_kingdom_snapshot(selection):
     handler._handle_add_alliance_slash.assert_not_awaited()
     assert service.calls == []
     assert "invalid alliance" in interaction.followup.messages[0]["embed"].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_submitting_the_loading_placeholder_explains_instead_of_failing():
+    service = FakeRankedAllianceService(_result())
+    handler = _build_handler(service)
+    handler._handle_add_alliance_slash = AsyncMock()
+    interaction = FakeInteraction()
+
+    await handler._handle_add_alliance_choice_slash(interaction, 830, ALLIANCE_LOADING_VALUE)
+
+    handler._handle_add_alliance_slash.assert_not_awaited()
+    assert service.calls == []
+    assert interaction.followup.messages[0]["embed"].title == "⏳ Alliances Still Loading"
+
+
+@pytest.mark.asyncio
+async def test_addalliance_is_manager_only_and_denies_before_loading():
+    service = FakeRankedAllianceService(_result())
+    handler = _build_handler(service)
+    handler._handle_add_alliance_slash = AsyncMock()
+    interaction = FakeInteraction(manage_guild=False)
+
+    await handler._handle_add_alliance_choice_slash(interaction, 830, "FKA")
+
+    handler._handle_add_alliance_slash.assert_not_awaited()
+    assert interaction.response.defer_kwargs is None
+    denial = interaction.response.sent[0]
+    assert denial["ephemeral"] is True
+    assert denial["embed"].title == "🔒 Not allowed"
+    assert service.calls == []
+
+
+def test_addalliance_command_is_hidden_from_members_by_default():
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+    handler = _build_handler(FakeRankedAllianceService(_result()), bot=bot)
+    handler.register_commands()
+    command = bot.tree.get_command("addalliance")
+    assert command.default_permissions is not None and command.default_permissions.manage_guild
+    assert bot.tree.get_command("redeem").default_permissions.manage_guild
+    assert bot.tree.get_command("addplayer").default_permissions is None
+    redeem_params = [parameter.name for parameter in bot.tree.get_command("redeem").parameters]
+    assert redeem_params == ["gift_code", "all_servers"]

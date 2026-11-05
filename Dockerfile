@@ -9,7 +9,8 @@
 ARG PYTHON_VERSION=3.12.3
 FROM python:${PYTHON_VERSION}-slim AS base
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Pin uv so image builds are reproducible (bump deliberately).
+COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /uvx /bin/
 
 # Prevents Python from writing pyc files.
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -50,6 +51,11 @@ RUN mkdir -p /app/logs && chown -R appuser:appuser /app/logs
 
 # Switch to the non-privileged user to run the application.
 USER appuser
+
+# The bot handles SIGTERM itself (graceful shutdown: stop background jobs, persist
+# gift-code progress, close the DB pool). Run migrations with the one-off
+# `migrate` service in compose.yaml or `alembic upgrade head` before starting.
+STOPSIGNAL SIGTERM
 
 # Run the application.
 CMD ["python", "main.py"]
