@@ -151,7 +151,7 @@ async def test_import_alliance_guides_users_to_native_autocomplete():
     sent = ctx.response.send_message.call_args.kwargs
     assert sent["ephemeral"] is True
     assert "autocomplete" in sent["embed"].description
-    assert "/addalliance kid:830 alliance:FKA" in sent["embed"].description
+    assert "enter `830` for `kid`, then choose an alliance" in sent["embed"].description
     assert "aid:" not in sent["embed"].description
     assert not calls
 

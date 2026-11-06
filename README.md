@@ -250,7 +250,10 @@ Gift code related commands include:
 - `/redeem gift_code:<code>` (managers) redeems for this server's enabled roster; bot
   operators can add `all_servers:true` to run the global job.
 - `/addplayer player_ids:<ids>` adds Governor IDs to this server's roster (private reply).
-- `/addalliance kid:<id> alliance:<tag>` (managers; top 15 by power, shown as `[TAG] Name - N members`)
+- `/addalliance kid:<id> alliance:<choice>` (managers; top 15 by power with names from
+  MightPulse's public kingdom view; AIDs remain the choice values and appear as fallback
+  labels when names are unavailable). Governor IDs come from the roster, the local UID
+  cache, the optional key-protected MightPulse roster (`MIGHTPULSE_API_KEY`) or player profiles.
 - `/removeplayer player_id:<id>` removes an entry from this server's roster after confirmation.
 - `/listplayers` (alias `/playerlist`) browses this server's roster.
 - `/giftcodes` lists active codes as copyable lines.
@@ -389,12 +392,15 @@ Contextual replies use the OpenAI SDK against the NIM endpoint, streaming
 via `chat_template_kwargs`, temperature `1`, top-p `0.95` and a 4,096-token ceiling.
 Internal reasoning is discarded; only final answer content is posted to Discord.
 Direct mentions may use read-only, server-scoped tools through `NVIDIA_MODEL`; if the
-API rejects tool calls the bot falls back to a plain reply. Random replies first pass a
-cheap yes/no check on `NVIDIA_MODEL`. AI replies have a per-user cooldown
-(`CHAT_USER_COOLDOWN_SECONDS`, default 10 s) and at most two concurrent model requests;
-when NIM is down the bot says AI replies are unavailable. `NVIDIA_MODEL` remains the
-model for translation and KingShot RAG requests. Voice audio is attached a moment after
-the text reply.
+API rejects tool calls the bot falls back to a plain reply. Direct mentions and replies
+get one retry with thinking disabled if generation fails or returns no usable answer;
+if both attempts fail, the bot reports a generation failure instead of asking for more
+context. Stream summaries log stop reasons and token usage for diagnosis. See
+[contextual chat recovery](docs/contextual-chat.md) for details. Random replies first
+pass a cheap yes/no check on `NVIDIA_MODEL` and get a single attempt. AI replies have a
+per-user cooldown (`CHAT_USER_COOLDOWN_SECONDS`, default 10 s) and at most two
+concurrent model requests. `NVIDIA_MODEL` remains the model for translation and
+KingShot RAG requests. Voice audio is attached a moment after the text reply.
 The chat persona favors concise, context-specific dry humor and playful sarcasm while
 avoiding hostile teasing, sensitive topics, and generic bot-like filler.
 Discord user, role, and channel mentions are resolved to readable names before the current

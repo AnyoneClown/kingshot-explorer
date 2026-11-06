@@ -11,7 +11,7 @@ from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_erro
 
 GROUPS = {
     "Players": (
-        "Look up a Governor ID or browse a kingdom's Mystic Trial leaderboard.",
+        "Look up a Governor ID or internal player UID, or browse a kingdom's Mystic Trial leaderboard.",
         (
             ("stats", "View player", "/stats player_id:123456"),
             ("scout", "Scout kingdom", "/scout kingdom_number:830 limit:5"),
@@ -40,7 +40,7 @@ GROUPS = {
             ("giftcodes", "Available codes", "/giftcodes"),
             ("addplayer", "Add players", "/addplayer player_ids:123456,654321"),
             ("removeplayer", "Remove player", "/removeplayer player_id:123456"),
-            ("addalliance", "Import alliance", "/addalliance kid:830 alliance:FKA"),
+            ("addalliance", "Import alliance", "/addalliance kid:830"),
             ("redeem", "Redeem code", "/redeem gift_code:EXAMPLE"),
         ),
     ),
@@ -251,9 +251,10 @@ class HelpHandler:
                     description=(
                         "Run `/addalliance` in this channel. Enter the kingdom number in `kid`, "
                         "then choose `alliance` from Discord's autocomplete list.\n\n"
-                        "The list shows the top 15 alliances by power as `[TAG] Name - N members`. "
-                        "Options may take a moment to load; you can also enter the exact 3-character tag.\n\n"
-                        "Example: `/addalliance kid:830 alliance:FKA`"
+                        "The list shows the top 15 alliances by power. When a tag is unavailable, "
+                        "the alliance ID identifies the choice. Options may take a moment to load; "
+                        "you can also enter an exact 3-character tag.\n\n"
+                        "Example: open `/addalliance`, enter `830` for `kid`, then choose an alliance."
                     ),
                 ),
                 ephemeral=True,

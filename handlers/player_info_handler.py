@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from services import player_card_renderer as card_renderer
-from services.player_info_service import IPlayerInfoService, PlayerLookupUnavailable
+from services.player_info_service import IPlayerInfoService, PlayerInfoUnavailableError
 from services.interaction_tracking_service import InteractionTrackingService
 from services.kingshot_data_service import KingshotDataService
 from handlers.ui import EmbedColors, OwnedView
@@ -164,7 +164,7 @@ class PlayerInfoHandler:
         """Register all player info commands with the bot."""
 
         @self._bot.tree.command(name="stats", description="Fetch and display player statistics")
-        @app_commands.describe(player_id="Governor ID / player ID to look up")
+        @app_commands.describe(player_id="Governor ID or internal player UID to look up")
         async def get_player_stats(interaction: discord.Interaction, player_id: str):
             """Fetch and display player statistics."""
             await self._handle_player_stats_slash(interaction, player_id)
@@ -210,21 +210,9 @@ class PlayerInfoHandler:
         logger.info(f"Stats command for player {player_id} requested by {user_info} in {guild_info}")
 
         try:
-            try:
-                player_data = await self._player_info_service.get_player_info(player_id)
-            except PlayerLookupUnavailable as exc:
-                logger.warning("Player lookup unavailable for %s requested by %s: %s", player_id, user_info, exc)
-                await interaction.followup.send(
-                    embed=discord.Embed(
-                        title="⚠️ Lookup Service Unavailable",
-                        description=(
-                            "The player lookup service is unavailable right now, so this ID could not be checked.\n"
-                            "Try again in a minute."
-                        ),
-                        color=EmbedColors.WARNING,
-                    )
-                )
-                return
+            # Governor IDs first, then internal player UIDs. Outages raise
+            # PlayerInfoUnavailableError, handled below without "not found" tracking.
+            player_data = await self._get_stats_player_data(player_id)
 
             if player_data is None:
                 logger.warning(f"Player {player_id} not found for request by {user_info}")
@@ -255,9 +243,17 @@ class PlayerInfoHandler:
 
             player_name = player_data.get("name") or f"Player {player_id}"
             uid = self._extract_player_uid(player_data, None)
+            # The lookup already returns the full profile (gear included); only fetch it
+            # again when a lookup source did not provide it.
+            known_profile = player_data.get("_profile")
+            profile_lookup = (
+                self._return_profile(known_profile)
+                if isinstance(known_profile, dict)
+                else self._get_kingshot_data_player(player_id, uid=uid)
+            )
             # The profile (gear), Mystic Trial rank and Arena team are independent lookups.
             ks_data, mystic_trial, heroes = await asyncio.gather(
-                self._get_kingshot_data_player(player_id, uid=uid),
+                profile_lookup,
                 self._get_mystic_trial(player_data, None),
                 self._fetch_arena_heroes(uid),
             )
@@ -289,6 +285,7 @@ class PlayerInfoHandler:
                 await self._interaction_tracking_service.track_player_lookup(
                     user_id=interaction.user.id,
                     player_id=resolved_player_id,
+                    player_uid=self._extract_player_uid(player_data, ks_data),
                     player_name=player_name,
                     kingdom=resolved_kingdom,
                     castle_level=resolved_castle_level,
@@ -311,6 +308,18 @@ class PlayerInfoHandler:
             except Exception as db_error:
                 logger.error(f"Database tracking error: {db_error}", exc_info=True)
 
+        except PlayerInfoUnavailableError as e:
+            logger.warning("Player lookup unavailable for ID %s requested by %s: %s", player_id, user_info, e)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Player Lookup Unavailable",
+                    description=(
+                        "The player data service is unavailable right now, so this ID could not be checked. "
+                        "Please try again in a minute."
+                    ),
+                    color=EmbedColors.ERROR,
+                )
+            )
         except Exception as e:
             logger.error(
                 f"Error handling stats command for player {player_id} by {user_info}: {e}",
@@ -439,6 +448,44 @@ class PlayerInfoHandler:
         profile = await self._get_kingshot_data_player(str(fid) if fid is not None else None, uid=uid)
         entry["player"] = profile
         return profile
+
+    @staticmethod
+    async def _return_profile(profile: dict[str, Any]) -> dict[str, Any]:
+        return profile
+
+    async def _get_stats_player_data(self, player_id: str) -> dict[str, Any] | None:
+        """Resolve Governor IDs first, then accept internal UIDs for stats."""
+        player_data = await self._player_info_service.get_player_info(player_id)
+        if player_data is not None or self._kingshot_data_service is None:
+            return player_data
+
+        result = await self._kingshot_data_service.get_player(player_id)
+        if not result.get("success"):
+            raise PlayerInfoUnavailableError(
+                result.get("error_message") or "KingShot Data API UID lookup failed"
+            )
+
+        profile = result.get("data")
+        if not isinstance(profile, dict):
+            raise PlayerInfoUnavailableError("KingShot Data API returned an invalid player profile")
+        if profile.get("error") == "uid not found":
+            return None
+        if profile.get("error"):
+            raise PlayerInfoUnavailableError(str(profile["error"]))
+        # Unknown UIDs return an empty profile with no Governor ID.
+        if not profile.get("fid"):
+            return None
+        if not profile.get("uid"):
+            raise PlayerInfoUnavailableError("KingShot Data API returned an incomplete player profile")
+
+        player_data = self._build_player_data_from_kingshot(profile, {}, profile.get("kid"))
+        avatar = profile.get("avatar_image") or profile.get("avatar_url")
+        player_data["profilePhoto"] = (
+            avatar if isinstance(avatar, str) and avatar.startswith(("https://", "http://")) else None
+        )
+        player_data["_profile"] = profile
+        logger.info("Resolved internal UID %s to Governor ID %s", player_id, player_data["playerId"])
+        return player_data
 
     async def _get_kingshot_data_player(
         self, player_id: str | None = None, *, uid: str | None = None,

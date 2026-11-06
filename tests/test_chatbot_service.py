@@ -261,17 +261,93 @@ def test_generate_contextual_reply_random_candidate_ignores_plain_text_without_j
     assert result is None
 
 
-def test_force_reply_falls_back_to_context_message_when_model_returns_empty_reply():
-    service, _ = make_service(['{"should_reply":false,"reply":""}'])
+def test_force_reply_falls_back_after_two_empty_attempts():
+    service, client = make_service(['{"should_reply":false,"reply":""}', [{"reasoning": "thinking only"}]])
 
     result = asyncio.run(service.generate_contextual_reply("<@123456>", [], force_reply=True))
 
-    assert result == "I saw your message, but I need a little more context to answer."
+    assert result == "I couldn't generate a reply just now. Please try again in a moment."
     assert result.is_fallback is True
+    assert len(client.completions.calls) == 2
+
+
+def test_force_reply_retries_once_with_thinking_disabled():
+    service, client = make_service(["", '{"should_reply":true,"reply":"Here you go"}'])
+
+    result = asyncio.run(service.generate_contextual_reply("help?", [], force_reply=True))
+
+    assert result == "Here you go"
+    first, second = client.completions.calls
+    assert first["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert second["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert first["messages"] == second["messages"]
+    # The shared default is untouched for the next request.
+    assert service._enable_thinking is True
+
+
+def test_force_reply_retries_after_a_stream_error():
+    timeout = openai.APITimeoutError(request=httpx.Request("POST", "https://nim.test"))
+    service, client = make_service([timeout, '{"should_reply":true,"reply":"Recovered"}'])
+
+    result = asyncio.run(service.generate_contextual_reply("hi", [], force_reply=True))
+
+    assert result == "Recovered"
+    assert len(client.completions.calls) == 2
+
+
+def test_random_reply_gets_a_single_attempt():
+    service, client = make_service(["", '{"should_reply":true,"reply":"never used"}'])
+    service._gate_model = None  # skip the yes/no gate for this check
+
+    result = asyncio.run(
+        service.generate_contextual_reply("anyone up for rally?", [{"author": "A", "content": "hi"}])
+    )
+
+    assert result is None
+    assert len(client.completions.calls) == 1
+
+
+def test_cancellation_is_not_retried():
+    class Cancelling:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            raise asyncio.CancelledError()
+
+    service, client = make_service([])
+    cancelling = Cancelling()
+    client.chat.completions = cancelling
+
+    async def run():
+        try:
+            await service.generate_contextual_reply("hi", [], force_reply=True)
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "not cancelled"
+
+    assert asyncio.run(run()) == "cancelled"
+    assert cancelling.calls == 1
+
+
+def test_stream_summary_logs_share_a_request_id(caplog):
+    service, _ = make_service(["", '{"should_reply":true,"reply":"ok"}'])
+
+    with caplog.at_level(logging.INFO, logger="services.chatbot_service"):
+        asyncio.run(service.generate_contextual_reply("hi", [], force_reply=True))
+
+    summaries = [record.getMessage() for record in caplog.records if "Chat stream summary" in record.getMessage()]
+    assert len(summaries) == 2
+    ids = {message.split("request_id=")[1].split()[0] for message in summaries}
+    assert len(ids) == 1
+    assert "thinking_disabled_retry=True" in summaries[1]
+    assert all("thinking only" not in message for message in summaries)
 
 
 def test_api_failure_gives_honest_unavailable_reply_for_direct_mentions():
-    service, _ = make_service([openai.APITimeoutError(request=httpx.Request("POST", "https://nim.test"))])
+    timeout = openai.APITimeoutError(request=httpx.Request("POST", "https://nim.test"))
+    service, _ = make_service([timeout, timeout])
 
     result = asyncio.run(service.generate_contextual_reply("are you there?", [], force_reply=True))
 

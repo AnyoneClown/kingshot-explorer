@@ -12,6 +12,7 @@ from .kingshot_rag_service import KingshotChunkInput, KingshotRAGError, Kingshot
 from .kvk_service import KVKService
 from .player_info_service import PlayerInfoService
 from .kingshot_data_service import KingshotDataService
+from .mightpulse_service import MightPulseAllianceDirectory, MightPulseService
 from .translation_service import TranslationService
 from .voice_message_service import VoiceMessageAudio, VoiceMessageService
 
@@ -21,6 +22,8 @@ __all__ = [
     "EventSchedulerService",
     "PlayerInfoService",
     "KingshotDataService",
+    "MightPulseService",
+    "MightPulseAllianceDirectory",
     "GiftCodeService",
     "GuildConfigurationService",
     "DatabaseHealthService",

@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -100,8 +101,11 @@ _FINAL_ANSWER_NUDGE = "(No more lookups are available. Reply now using the infor
 class ChatbotService(IChatbotService):
     """Service responsible for contextual chat replies."""
 
-    UNAVAILABLE_REPLY = "AI replies are unavailable right now. Please try again in a few minutes."
-    _FORCED_REPLY_FALLBACK = "I saw your message, but I need a little more context to answer."
+    # Sent to direct mentions when both generation attempts fail (see docs/contextual-chat.md).
+    UNAVAILABLE_REPLY = "I couldn't generate a reply just now. Please try again in a moment."
+    _FORCED_REPLY_FALLBACK = UNAVAILABLE_REPLY
+    # Direct mentions: first attempt as configured, retry once with thinking disabled.
+    FORCED_REPLY_ATTEMPTS = 2
     _TOOL_REJECTED_ERRORS = (BadRequestError, UnprocessableEntityError, NotFoundError)
 
     def __init__(
@@ -341,8 +345,21 @@ class ChatbotService(IChatbotService):
 
     # ------------------------------------------------------------------ model calls
 
-    async def _stream_completion(self, messages: List[Dict[str, Any]]) -> str:
-        """Stream a reply from the chat model and keep only the final answer content."""
+    async def _stream_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        enable_thinking: Optional[bool] = None,
+        request_id: Optional[str] = None,
+        attempt: int = 1,
+    ) -> str:
+        """Stream a reply from the chat model and keep only the final answer content.
+
+        ``enable_thinking`` overrides the configured thinking mode for this call only
+        (the retry disables it); the shared defaults are never mutated. Every attempt
+        logs one INFO summary, also when the stream raises.
+        """
+        thinking = self._enable_thinking if enable_thinking is None else enable_thinking
         kwargs: Dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -352,31 +369,75 @@ class ChatbotService(IChatbotService):
             "stream": True,
         }
         if self._enable_thinking:
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": thinking}}
 
         content_parts: list[str] = []
-        reasoning_chunks = 0
-        stream = await self._client.chat.completions.create(**kwargs)
+        stats: Dict[str, Any] = {
+            "chunks": 0,
+            "reasoning_chunks": 0,
+            "reasoning_chars": 0,
+            "finish_reason": None,
+            "usage": None,
+        }
+        started = time.monotonic()
+        status = "error"
+        cleaned = ""
         try:
-            async for chunk in stream:
-                choices = getattr(chunk, "choices", None) or []
-                if not choices:
-                    continue
-                delta = getattr(choices[0], "delta", None)
-                if delta is None:
-                    continue
-                if getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None):
-                    reasoning_chunks += 1
-                content_parts.append(self._content_text(getattr(delta, "content", None)))
+            stream = await self._client.chat.completions.create(**kwargs)
+            try:
+                async for chunk in stream:
+                    stats["chunks"] += 1
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        # Provider totals; they may arrive in a chunk without choices.
+                        stats["usage"] = usage
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    finish_reason = getattr(choices[0], "finish_reason", None)
+                    if finish_reason:
+                        stats["finish_reason"] = finish_reason
+                    delta = getattr(choices[0], "delta", None)
+                    if delta is None:
+                        continue
+                    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if reasoning:
+                        stats["reasoning_chunks"] += 1
+                        stats["reasoning_chars"] += len(str(reasoning))
+                    content_parts.append(self._content_text(getattr(delta, "content", None)))
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+            cleaned = self._strip_reasoning_tags("".join(content_parts))
+            status = "completed" if cleaned.strip() else "empty"
+            return cleaned
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
         finally:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-
-        logger.debug("Chat stream completed; omitted %s reasoning chunk(s)", reasoning_chunks)
-        return self._strip_reasoning_tags("".join(content_parts))
+            usage = stats["usage"]
+            logger.info(
+                "Chat stream summary: request_id=%s attempt=%s status=%s thinking_disabled_retry=%s "
+                "finish_reason=%s input_tokens=%s output_tokens=%s total_tokens=%s chunks=%s "
+                "reasoning_chunks=%s reasoning_chars=%s raw_chars=%s cleaned_chars=%s elapsed=%.2fs",
+                request_id,
+                attempt,
+                status,
+                enable_thinking is False,
+                stats["finish_reason"],
+                getattr(usage, "prompt_tokens", None),
+                getattr(usage, "completion_tokens", None),
+                getattr(usage, "total_tokens", None),
+                stats["chunks"],
+                stats["reasoning_chunks"],
+                stats["reasoning_chars"],
+                sum(len(part) for part in content_parts),
+                len(cleaned),
+                time.monotonic() - started,
+            )
 
     def _tools_available(self, tool_context: Optional[ToolContext]) -> bool:
         return bool(
@@ -525,56 +586,114 @@ class ChatbotService(IChatbotService):
             len(history_lines),
         )
 
+        request_id = uuid.uuid4().hex[:12]
         used_tool_model = False
+        failure: Optional[str] = None
         async with self._semaphore:
             try:
                 if not force_reply and not await self._passes_random_gate(cleaned_message, history_lines):
                     return None
 
-                response_text = ""
                 if force_reply and self._tools_available(tool_context):
                     tool_messages = self._build_messages(
                         cleaned_message, history_lines, replied_to_block, force_reply=True, with_tools=True
                     )
                     try:
                         async with asyncio.timeout(self._reply_timeout_seconds):
-                            response_text = await self._run_tool_loop(tool_messages, tool_context)
-                        used_tool_model = bool(response_text.strip())
+                            tool_text = await self._run_tool_loop(tool_messages, tool_context)
                     except self._TOOL_REJECTED_ERRORS as exc:
                         logger.warning("Tool-calling chat rejected by the API, using plain reply: %s", exc)
                         self._tools_disabled_until = time.monotonic() + self._tool_retry_after_seconds
-                        response_text = ""
+                        tool_text = ""
+                    except Exception as exc:
+                        logger.warning(
+                            "Tool-calling chat failed (request_id=%s), using plain reply: %s", request_id, exc
+                        )
+                        tool_text = ""
+                    reply = self._finalize_reply(tool_text, force_reply=True, allow_fallback=False)
+                    if reply is not None:
+                        used_tool_model = True
+                        return self._log_ready(reply, force_reply, used_tool_model, request_id)
 
-                if not response_text.strip():
-                    plain_messages = self._build_messages(
-                        cleaned_message, history_lines, replied_to_block, force_reply=force_reply, with_tools=False
-                    )
-                    async with asyncio.timeout(self._reply_timeout_seconds):
-                        response_text = await self._stream_completion(plain_messages)
+                plain_messages = self._build_messages(
+                    cleaned_message, history_lines, replied_to_block, force_reply=force_reply, with_tools=False
+                )
+                # Random candidates get one attempt and stay silent on failure.
+                attempts = self.FORCED_REPLY_ATTEMPTS if force_reply else 1
+                for attempt in range(1, attempts + 1):
+                    retry_without_thinking = attempt > 1
+                    try:
+                        async with asyncio.timeout(self._reply_timeout_seconds):
+                            response_text = await self._stream_completion(
+                                plain_messages,
+                                enable_thinking=False if retry_without_thinking else None,
+                                request_id=request_id,
+                                attempt=attempt,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        failure = f"error: {type(exc).__name__}"
+                        logger.warning(
+                            "Chat attempt %s/%s failed (request_id=%s, category=%s): %s",
+                            attempt, attempts, request_id, failure, exc,
+                        )
+                        continue
+                    logger.debug("Contextual reply raw model response: %r", _truncate_for_log(response_text, 300))
+                    reply = self._finalize_reply(response_text, force_reply=force_reply, allow_fallback=False)
+                    if reply is not None:
+                        return self._log_ready(reply, force_reply, used_tool_model, request_id)
+                    if not force_reply:
+                        return None  # the model declined (or answered unusably): stay silent
+                    failure = "empty or unusable reply" if response_text.strip() else "empty reply"
+                    if attempt < attempts:
+                        logger.warning(
+                            "Chat attempt %s/%s produced no usable reply (request_id=%s, category=%s); "
+                            "retrying with thinking disabled",
+                            attempt, attempts, request_id, failure,
+                        )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                logger.error("Contextual reply generation failed: %s", exc, exc_info=True)
-                return ChatReply(self.UNAVAILABLE_REPLY, is_fallback=True) if force_reply else None
+                logger.error("Contextual reply generation failed (request_id=%s): %s", request_id, exc, exc_info=True)
+                failure = f"error: {type(exc).__name__}"
 
-        logger.debug("Contextual reply raw model response: %r", _truncate_for_log(response_text, 300))
-        reply = self._finalize_reply(response_text, force_reply=force_reply)
-        if reply is not None:
-            logger.info(
-                "Contextual reply ready: force_reply=%s tool_model=%s chars=%s fallback=%s",
-                force_reply,
-                used_tool_model,
-                len(reply),
-                getattr(reply, "is_fallback", False),
-            )
+        if not force_reply:
+            return None
+        logger.warning("Sending chat fallback reply (request_id=%s, category=%s)", request_id, failure)
+        return ChatReply(truncate_cleanly(self.UNAVAILABLE_REPLY, self._max_chat_response_chars), is_fallback=True)
+
+    @staticmethod
+    def _log_ready(reply: "ChatReply", force_reply: bool, used_tool_model: bool, request_id: str) -> "ChatReply":
+        logger.info(
+            "Contextual reply ready: request_id=%s force_reply=%s tool_model=%s chars=%s",
+            request_id,
+            force_reply,
+            used_tool_model,
+            len(reply),
+        )
         return reply
 
-    def _finalize_reply(self, response_text: str, *, force_reply: bool) -> Optional[ChatReply]:
+    def _finalize_reply(
+        self, response_text: str, *, force_reply: bool, allow_fallback: bool = True
+    ) -> Optional[ChatReply]:
+        """Parse a model answer; ``None`` means no usable reply (or a declined random reply).
+
+        With ``allow_fallback`` a forced reply with no usable content becomes the
+        fallback text; the generation loop disables it to retry instead.
+        """
+        fallback = (
+            ChatReply(truncate_cleanly(self._FORCED_REPLY_FALLBACK, self._max_chat_response_chars), is_fallback=True)
+            if force_reply and allow_fallback
+            else None
+        )
         payload = self._extract_json_payload(response_text)
         if not payload:
             if force_reply:
                 plain_reply = self._extract_plain_reply(response_text)
                 if plain_reply:
                     return ChatReply(truncate_cleanly(plain_reply, self._max_chat_response_chars))
-                return ChatReply(self._FORCED_REPLY_FALLBACK, is_fallback=True)
+                return fallback
             logger.debug("Contextual reply skipped: model response did not contain a JSON payload")
             return None
 
@@ -582,9 +701,10 @@ class ChatbotService(IChatbotService):
             logger.debug("Contextual reply skipped: model decided not to reply")
             return None
 
-        reply = str(payload.get("reply") or "").strip()
+        reply = payload.get("reply")
+        reply = reply.strip() if isinstance(reply, str) else ""
         if not reply:
-            return ChatReply(self._FORCED_REPLY_FALLBACK, is_fallback=True) if force_reply else None
+            return fallback
 
         language = payload.get("language")
         language = language.strip()[:40] if isinstance(language, str) and language.strip() else None
