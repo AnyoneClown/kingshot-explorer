@@ -87,8 +87,8 @@ ADMIN_USER_ID=your_discord_user_id
 COCKROACHDB_URL=cockroachdb+asyncpg://postgres:password@host:26257/database-name
 NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
-NVIDIA_MODEL=openai/gpt-oss-120b
-NVIDIA_CHAT_MODEL=nvidia/nemotron-3-ultra-550b-a55b
+NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
+NVIDIA_CHAT_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
 ENABLE_VOICE_REPLIES=false
 NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
 NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
@@ -388,19 +388,25 @@ main.py      Application entrypoint
 - Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
 
 Contextual replies use the OpenAI SDK against the NIM endpoint, streaming
-`NVIDIA_CHAT_MODEL` (default `nvidia/nemotron-3-ultra-550b-a55b`) with thinking enabled
-via `chat_template_kwargs`, temperature `1`, top-p `0.95` and a 4,096-token ceiling.
-Internal reasoning is discarded; only final answer content is posted to Discord.
-Direct mentions may use read-only, server-scoped tools through `NVIDIA_MODEL`; if the
-API rejects tool calls the bot falls back to a plain reply. Direct mentions and replies
-get one retry with thinking disabled if generation fails or returns no usable answer;
-if both attempts fail, the bot reports a generation failure instead of asking for more
-context. Stream summaries log stop reasons and token usage for diagnosis. See
+`NVIDIA_CHAT_MODEL` (default `nvidia/nemotron-3.5-super-vl-120b-a12b`) with thinking
+enabled via `chat_template_kwargs`, temperature `1`, top-p `0.95`, seed `42` and a
+4,096-token ceiling. Internal reasoning is discarded; only final answer content is
+posted to Discord. Direct mentions may use read-only, server-scoped tools through
+`NVIDIA_MODEL` (parallel tool calls enabled); if the API rejects tool calls the bot falls
+back to a plain reply. Direct mentions and replies retry with thinking disabled if
+generation fails or returns no usable answer. Temporary provider errors (timeouts,
+connection errors, 429, 5xx) allow up to four attempts with 2-, 4- and 8-second backoff;
+empty or malformed answers allow two attempts; permanent HTTP errors are not retried.
+Each stream is limited to 30 seconds and the complete reply to 60 seconds. If all
+attempts fail, the bot reports a generation failure instead of asking for more context.
+Stream summaries log stop reasons and token usage for diagnosis. See
 [contextual chat recovery](docs/contextual-chat.md) for details. Random replies first
 pass a cheap yes/no check on `NVIDIA_MODEL` and get a single attempt. AI replies have a
 per-user cooldown (`CHAT_USER_COOLDOWN_SECONDS`, default 10 s) and at most two
-concurrent model requests. `NVIDIA_MODEL` remains the model for translation and
-KingShot RAG requests. Voice audio is attached a moment after the text reply.
+concurrent model requests. `NVIDIA_MODEL` controls translation and KingShot RAG requests
+and defaults to the same Nemotron 3.5 Super VL model; these short requests (and the
+random-reply check) disable thinking to reserve their completion budget for the answer.
+Voice audio is attached a moment after the text reply.
 The chat persona favors concise, context-specific dry humor and playful sarcasm while
 avoiding hostile teasing, sensitive topics, and generic bot-like filler.
 Discord user, role, and channel mentions are resolved to readable names before the current

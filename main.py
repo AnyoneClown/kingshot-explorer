@@ -263,6 +263,7 @@ class TranslatorBot:
         self.chatbot_service = ChatbotService(
             self.nvidia_client,
             model=config.nvidia_chat_model,
+            seed=42,
             tool_model=config.nvidia_model,
             gate_model=config.nvidia_model,
             tools=self.chat_tool_registry,

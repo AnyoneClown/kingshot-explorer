@@ -17,7 +17,15 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from openai import AsyncOpenAI, BadRequestError, NotFoundError, UnprocessableEntityError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    BadRequestError,
+    NotFoundError,
+    UnprocessableEntityError,
+)
 
 from services.chat_tools import ChatToolRegistry, ToolContext
 from services.text_utils import truncate_cleanly
@@ -104,15 +112,23 @@ class ChatbotService(IChatbotService):
     # Sent to direct mentions when both generation attempts fail (see docs/contextual-chat.md).
     UNAVAILABLE_REPLY = "I couldn't generate a reply just now. Please try again in a moment."
     _FORCED_REPLY_FALLBACK = UNAVAILABLE_REPLY
-    # Direct mentions: first attempt as configured, retry once with thinking disabled.
+    # Direct mentions: first attempt as configured, retries with thinking disabled.
+    # Empty/unusable answers and unknown errors get 2 attempts; temporary provider
+    # errors (timeouts, connection errors, 429, 5xx) get up to 4 with 2/4/8 s backoff;
+    # permanent HTTP errors are not retried. See docs/contextual-chat.md.
     FORCED_REPLY_ATTEMPTS = 2
+    MAX_TRANSIENT_ATTEMPTS = 4
+    PROVIDER_ATTEMPT_TIMEOUT_SECONDS = 30.0
+    TOTAL_REPLY_TIMEOUT_SECONDS = 60.0
+    RETRY_BACKOFF_BASE_SECONDS = 2.0
+    _TRANSIENT_MARKERS = ("degraded function", "temporarily overloaded")
     _TOOL_REJECTED_ERRORS = (BadRequestError, UnprocessableEntityError, NotFoundError)
 
     def __init__(
         self,
         client: AsyncOpenAI,
         *,
-        model: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b",
         max_chat_response_chars: int = 500,
         temperature: float = 1.0,
         top_p: float = 0.95,
@@ -128,6 +144,7 @@ class ChatbotService(IChatbotService):
         max_concurrent_requests: int = 2,
         reply_timeout_seconds: float = 90.0,
         tool_retry_after_seconds: float = 600.0,
+        seed: Optional[int] = None,
     ):
         self._client = client
         self._model = model
@@ -147,6 +164,7 @@ class ChatbotService(IChatbotService):
         self._reply_timeout_seconds = reply_timeout_seconds
         self._tool_retry_after_seconds = tool_retry_after_seconds
         self._tools_disabled_until = 0.0
+        self._seed = seed
         logger.info(
             "ChatbotService initialized: chat_model=%s tool_model=%s tools=%s gate_model=%s",
             model,
@@ -368,6 +386,8 @@ class ChatbotService(IChatbotService):
             "max_tokens": self._max_tokens,
             "stream": True,
         }
+        if self._seed is not None:
+            kwargs["seed"] = self._seed
         if self._enable_thinking:
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": thinking}}
 
@@ -462,9 +482,12 @@ class ChatbotService(IChatbotService):
                 "top_p": 1,
                 "max_tokens": self._tool_max_tokens,
             }
+            if self._seed is not None:
+                kwargs["seed"] = self._seed
             if offer_tools:
                 kwargs["tools"] = definitions
                 kwargs["tool_choice"] = "auto"
+                kwargs["parallel_tool_calls"] = True
             else:
                 # A user turn (not a mid-conversation system message, which some chat
                 # templates reject) asks for the final answer without more tool calls.
@@ -541,6 +564,7 @@ class ChatbotService(IChatbotService):
                 temperature=0,
                 top_p=1,
                 max_tokens=self._gate_max_tokens,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
         except Exception as exc:
             logger.warning("Random reply gate failed, skipping reply: %s", exc)
@@ -619,39 +643,58 @@ class ChatbotService(IChatbotService):
                     cleaned_message, history_lines, replied_to_block, force_reply=force_reply, with_tools=False
                 )
                 # Random candidates get one attempt and stay silent on failure.
-                attempts = self.FORCED_REPLY_ATTEMPTS if force_reply else 1
-                for attempt in range(1, attempts + 1):
-                    retry_without_thinking = attempt > 1
+                max_attempts = self.MAX_TRANSIENT_ATTEMPTS if force_reply else 1
+                deadline = time.monotonic() + self.TOTAL_REPLY_TIMEOUT_SECONDS
+                attempt = 0
+                while attempt < max_attempts:
+                    attempt += 1
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        failure = "reply deadline"
+                        break
+                    transient = False
+                    retryable = True
                     try:
-                        async with asyncio.timeout(self._reply_timeout_seconds):
+                        async with asyncio.timeout(min(self.PROVIDER_ATTEMPT_TIMEOUT_SECONDS, remaining)):
                             response_text = await self._stream_completion(
                                 plain_messages,
-                                enable_thinking=False if retry_without_thinking else None,
+                                enable_thinking=False if attempt > 1 else None,
                                 request_id=request_id,
                                 attempt=attempt,
                             )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        failure = f"error: {type(exc).__name__}"
+                        transient = self._is_transient_provider_error(exc)
+                        retryable = transient or self._provider_status(exc) is None
+                        failure = f"{'transient ' if transient else ''}error: {type(exc).__name__}"
                         logger.warning(
-                            "Chat attempt %s/%s failed (request_id=%s, category=%s): %s",
-                            attempt, attempts, request_id, failure, exc,
+                            "Chat attempt %s failed (request_id=%s, category=%s): %s",
+                            attempt, request_id, failure, exc,
                         )
-                        continue
-                    logger.debug("Contextual reply raw model response: %r", _truncate_for_log(response_text, 300))
-                    reply = self._finalize_reply(response_text, force_reply=force_reply, allow_fallback=False)
-                    if reply is not None:
-                        return self._log_ready(reply, force_reply, used_tool_model, request_id)
-                    if not force_reply:
-                        return None  # the model declined (or answered unusably): stay silent
-                    failure = "empty or unusable reply" if response_text.strip() else "empty reply"
-                    if attempt < attempts:
-                        logger.warning(
-                            "Chat attempt %s/%s produced no usable reply (request_id=%s, category=%s); "
-                            "retrying with thinking disabled",
-                            attempt, attempts, request_id, failure,
-                        )
+                    else:
+                        logger.debug("Contextual reply raw model response: %r", _truncate_for_log(response_text, 300))
+                        reply = self._finalize_reply(response_text, force_reply=force_reply, allow_fallback=False)
+                        if reply is not None:
+                            return self._log_ready(reply, force_reply, used_tool_model, request_id)
+                        if not force_reply:
+                            return None  # the model declined (or answered unusably): stay silent
+                        failure = "empty or unusable reply" if response_text.strip() else "empty reply"
+
+                    retry_limit = max_attempts if transient else min(max_attempts, self.FORCED_REPLY_ATTEMPTS)
+                    if not retryable or attempt >= retry_limit:
+                        break
+                    delay = self.RETRY_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1) if transient else 0
+                    if deadline - time.monotonic() <= delay:
+                        failure = "reply deadline"
+                        break
+                    logger.warning(
+                        "Retrying chat reply with thinking disabled (request_id=%s, attempt=%s, category=%s, "
+                        "delay=%ss)",
+                        request_id, attempt, failure, delay,
+                    )
+                    if delay:
+                        await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -662,6 +705,24 @@ class ChatbotService(IChatbotService):
             return None
         logger.warning("Sending chat fallback reply (request_id=%s, category=%s)", request_id, failure)
         return ChatReply(truncate_cleanly(self.UNAVAILABLE_REPLY, self._max_chat_response_chars), is_fallback=True)
+
+    @staticmethod
+    def _provider_status(exc: BaseException) -> Optional[int]:
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int):
+            return status
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        return status if isinstance(status, int) else None
+
+    @classmethod
+    def _is_transient_provider_error(cls, exc: BaseException) -> bool:
+        if isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError, ConnectionError)):
+            return True
+        status = cls._provider_status(exc) if isinstance(exc, APIStatusError) or hasattr(exc, "status_code") else None
+        if status == 429 or (status is not None and 500 <= status <= 599):
+            return True
+        return any(marker in str(exc).lower() for marker in cls._TRANSIENT_MARKERS)
 
     @staticmethod
     def _log_ready(reply: "ChatReply", force_reply: bool, used_tool_model: bool, request_id: str) -> "ChatReply":

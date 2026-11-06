@@ -105,7 +105,7 @@ Optional:
 ```bash
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_EMBEDDING_MODEL=nvidia/llama-nemotron-embed-1b-v2
-NVIDIA_MODEL=openai/gpt-oss-120b
+NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
 ```
 
 Run upload:

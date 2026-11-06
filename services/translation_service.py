@@ -301,6 +301,7 @@ class TranslationService(ITranslationService):
             temperature=temperature,
             top_p=1,
             max_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
         if not response.choices:

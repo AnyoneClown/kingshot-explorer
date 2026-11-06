@@ -83,7 +83,9 @@ class FakeClient:
 def make_service(responses, **kwargs):
     client = FakeClient(responses)
     kwargs.setdefault("model", CHAT_MODEL)
-    return ChatbotService(client, **kwargs), client
+    service = ChatbotService(client, **kwargs)
+    service.RETRY_BACKOFF_BASE_SECONDS = 0  # keep retry tests fast
+    return service, client
 
 
 def prompt_text(call):
@@ -540,3 +542,60 @@ def test_direct_reply_without_tool_context_uses_plain_reply():
     asyncio.run(service.generate_contextual_reply("hi bot", [], force_reply=True))
 
     assert client.completions.calls[0]["model"] == CHAT_MODEL
+
+
+def _status_error(status):
+    request = httpx.Request("POST", "https://nim.test/v1/chat/completions")
+    response = httpx.Response(status, request=request)
+    return openai.APIStatusError(f"HTTP {status}", response=response, body=None)
+
+
+def test_transient_provider_errors_get_up_to_four_attempts():
+    service, client = make_service([
+        _status_error(503),
+        _status_error(429),
+        openai.APIConnectionError(request=httpx.Request("POST", "https://nim.test")),
+        '{"should_reply":true,"reply":"finally"}',
+    ])
+
+    result = asyncio.run(service.generate_contextual_reply("hi", [], force_reply=True))
+
+    assert result == "finally"
+    assert len(client.completions.calls) == 4
+    assert all(
+        call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+        for call in client.completions.calls[1:]
+    )
+
+
+def test_permanent_http_errors_are_not_retried():
+    service, client = make_service([_status_error(401), '{"should_reply":true,"reply":"unused"}'])
+
+    result = asyncio.run(service.generate_contextual_reply("hi", [], force_reply=True))
+
+    assert result.is_fallback is True
+    assert len(client.completions.calls) == 1
+
+
+def test_transient_retries_back_off_exponentially(monkeypatch):
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    service, _ = make_service([_status_error(500)] * 4)
+    service.RETRY_BACKOFF_BASE_SECONDS = 2.0
+    monkeypatch.setattr("services.chatbot_service.asyncio.sleep", fake_sleep)
+
+    result = asyncio.run(service.generate_contextual_reply("hi", [], force_reply=True))
+
+    assert result.is_fallback is True
+    assert delays == [2.0, 4.0, 8.0]
+
+
+def test_seed_is_sent_when_configured():
+    service, client = make_service(['{"should_reply":true,"reply":"ok"}'], seed=42)
+
+    asyncio.run(service.generate_contextual_reply("hi", [], force_reply=True))
+
+    assert client.completions.calls[0]["seed"] == 42
