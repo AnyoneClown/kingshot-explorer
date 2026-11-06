@@ -545,6 +545,13 @@ class AlliancePowerHandler:
                 logger.debug("Could not remove the private power report receipt", exc_info=True)
             if captured is True:
                 self._run_in_background(self.post_daily_reports([(kid, alliance_id)]))
+            elif configuring and captured is None:
+                await interaction.followup.send(
+                    "Tracking is saved, but the KingShot Data API returned incomplete member profiles, so the "
+                    "first snapshot isn't complete yet. The bot retries automatically every hour; this report "
+                    "fills in once a complete snapshot is captured.",
+                    ephemeral=True,
+                )
         except ValueError as error:
             await interaction.followup.send(str(error), ephemeral=True)
         except Exception as error:

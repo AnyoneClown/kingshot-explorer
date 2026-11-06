@@ -74,6 +74,7 @@ def power_setup():
     api.get_player = AsyncMock(side_effect=get_player)
     clock = SimpleNamespace(value=datetime(2026, 9, 5, 12, tzinfo=timezone.utc))
     service = AlliancePowerService(SimpleNamespace(session=session), api, now_provider=lambda: clock.value)
+    service.MEMBER_RETRY_DELAYS_SECONDS = (0,)  # keep retry rounds instant in tests
     yield service, api, clock, engine
     engine.dispose()
 
@@ -99,9 +100,10 @@ async def test_shared_daily_capture_resolves_lean_roster_with_bounded_requests_a
     assert report["daily"] is None and report["weekly"] is None
     assert report["previous"] is None and report["changes"] is None
     assert report["inactive"] == {7: None, 14: None}
-    # One paced /full call replaces the lean roster plus one profile call per member.
+    # One paced /full call replaces one profile call per member; the lean roster is
+    # only read to validate each selection.
     assert api.get_alliance_full.await_count == 1
-    assert api.get_alliance.await_count == 0 and api.get_player.await_count == 0
+    assert api.get_alliance.await_count == 3 and api.get_player.await_count == 0
 
     assert not await service.stop_tracking(1, 830, 20)
     assert not await service.stop_tracking(1, 900, 10)
@@ -141,29 +143,40 @@ async def test_report_uses_exact_daily_weekly_dates_and_does_not_fill_gaps(power
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [
-    "api_failure", "partial_roster", "partial_profile", "null_power", "duplicate_uid", "count_mismatch",
-    "wrong_uid", "wrong_kingdom", "wrong_alliance",
-])
-async def test_incomplete_capture_keeps_prior_selection_and_history_until_successful_retry(power_setup, failure):
+@pytest.mark.parametrize("failure", ["api_failure", "partial_roster", "duplicate_uid", "count_mismatch"])
+async def test_invalid_alliance_roster_keeps_prior_selection_and_history(power_setup, failure):
     service, api, clock, engine = power_setup
     await service.track_alliance(1, 830, 10)
-    original_roster = deepcopy(api.rosters[20])
-    original_profile = deepcopy(api.profiles["2000"])
     roster = api.rosters[20]
-    profile = api.profiles["2000"]
     if failure == "api_failure":
         roster["success"] = False
     elif failure == "partial_roster":
         roster["data"]["partial"] = True
-    elif failure == "partial_profile":
-        profile["partial"] = True
-    elif failure == "null_power":
-        profile["data"]["power"] = None
     elif failure == "duplicate_uid":
         roster["data"]["members"][1] = roster["data"]["members"][0]
     elif failure == "count_mismatch":
         roster["data"]["count"] += 1
+
+    with pytest.raises(ValueError, match="could not be loaded"):
+        await service.track_alliance(1, 830, 20)
+    assert (await service.get_report(1))["alliance_id"] == 10
+    with Session(engine) as session:
+        assert [snapshot.alliance_id for snapshot in session.scalars(select(AlliancePowerSnapshot))] == [10]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["partial_profile", "null_power", "empty_profile", "wrong_uid", "wrong_kingdom", "wrong_alliance"])
+async def test_member_capture_failure_saves_tracking_and_retries_hourly(power_setup, failure):
+    service, api, clock, engine = power_setup
+    await service.track_alliance(1, 830, 10)
+    original_profile = deepcopy(api.profiles["2000"])
+    profile = api.profiles["2000"]
+    if failure == "partial_profile":
+        profile["partial"] = True
+    elif failure == "null_power":
+        profile["data"]["power"] = None
+    elif failure == "empty_profile":
+        profile["data"] = {"uid": 2000, "fid": None, "name": None, "power": None, "kid": None}
     elif failure == "wrong_uid":
         profile["data"]["uid"] = 999
     elif failure == "wrong_kingdom":
@@ -171,20 +184,59 @@ async def test_incomplete_capture_keeps_prior_selection_and_history_until_succes
     elif failure == "wrong_alliance":
         profile["data"]["alliance"]["aid"] = 999
 
-    with pytest.raises(ValueError, match="existing history is preserved"):
-        await service.track_alliance(1, 830, 20)
-    assert (await service.get_report(1))["alliance_id"] == 10
+    # The alliance itself is valid, so the selection is saved; no snapshot is stored.
+    assert await service.track_alliance(1, 830, 20) is None
+    report = await service.get_report(1)
+    assert report["alliance_id"] == 20 and report["latest"] is None
     with Session(engine) as session:
         assert [snapshot.alliance_id for snapshot in session.scalars(select(AlliancePowerSnapshot))] == [10]
 
-    api.rosters[20] = original_roster
     api.profiles["2000"] = original_profile
+    assert await service.collect_due_snapshots({1}) == [(830, 20)]
+    assert (await service.get_report(1))["latest"].alliance_id == 20
+
+
+@pytest.mark.asyncio
+async def test_empty_profiles_are_retried_until_complete(power_setup):
+    service, api, clock, _ = power_setup
+    api.full_failure = True
+    flaky = {"1003": 2, "1007": 1}  # empty answers before the real profile
+    real_get_player = api.get_player.side_effect
+
+    async def get_player(uid):
+        if flaky.get(uid):
+            flaky[uid] -= 1
+            return {"success": True, "data": {"uid": int(uid), "fid": None, "name": None, "power": None, "kid": None}}
+        return await real_get_player(uid)
+
+    api.get_player.side_effect = get_player
+    assert await service.track_alliance(1, 830, 10) is True
+    members = (await service.get_report(1))["latest"].members
+    assert len(members) == 12 and members["1003"]["power"] == 300
+    assert sorted(call.args[0] for call in api.get_player.await_args_list).count("1003") == 3
+
+
+@pytest.mark.asyncio
+async def test_full_roster_without_any_power_is_skipped_for_later_captures(power_setup):
+    service, api, clock, _ = power_setup
+    real_full = api.get_alliance_full.side_effect
+
+    async def full_without_power(aid, kid):
+        roster = await real_full(aid, kid)
+        for member in roster["data"]["members"]:
+            member.pop("error", None)
+            member["player"] = {"uid": member["uid"], "power": None, "name": "x", "kid": 830}
+        return roster
+
+    for uid, profile in api.profiles.items():
+        profile["data"]["power"] = int(uid) % 100 * 100
+    api.get_alliance_full.side_effect = full_without_power
+
+    assert await service.track_alliance(1, 830, 10) is True
+    assert api.get_alliance_full.await_count == 1
     clock.value += timedelta(days=1)
-    await service.track_alliance(1, 830, 20)
-    assert (await service.get_report(1))["latest"].snapshot_date == date(2026, 9, 6)
-    assert (await service.get_report(1))["alliance_id"] == 20
-    with Session(engine) as session:
-        assert {snapshot.alliance_id for snapshot in session.scalars(select(AlliancePowerSnapshot))} == {10, 20}
+    await service.collect_due_snapshots({1})
+    assert api.get_alliance_full.await_count == 1  # skipped for FULL_ROSTER_SKIP_SECONDS
 
 
 @pytest.mark.asyncio
@@ -217,8 +269,8 @@ async def test_capture_falls_back_to_member_profiles_when_full_roster_fails(powe
     api.full_failure = True
     assert await service.track_alliance(1, 830, 10) is True
     report = await service.get_report(1)
-    assert api.get_alliance_full.await_count == 1 and api.get_alliance.await_count == 1
-    assert api.get_player.await_count == 12 and api.peak == 5
+    assert api.get_alliance_full.await_count == 1 and api.get_alliance.await_count == 2
+    assert api.get_player.await_count == 12 and api.peak == AlliancePowerService.MEMBER_FETCH_CONCURRENCY
     assert report["latest"].members["1011"]["stove_lv"] == 31
     assert await service.track_alliance(1, 830, 10) is False  # Same UTC day: no new snapshot.
 
@@ -229,7 +281,7 @@ async def test_failed_full_members_are_refetched_individually(power_setup):
     api.full_errors = {"1003", "1007"}
     await service.track_alliance(1, 830, 10)
     assert sorted(call.args[0] for call in api.get_player.await_args_list) == ["1003", "1007"]
-    assert api.get_alliance.await_count == 0
+    assert api.get_alliance.await_count == 1  # selection validation only
     members = (await service.get_report(1))["latest"].members
     assert len(members) == 12 and members["1003"]["vip"] == 3 and members["1003"]["rank"] == 4
 

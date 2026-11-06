@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -123,10 +124,22 @@ def _rank(value) -> int | None:
     return rank if rank is not None and rank <= 5 else None
 
 
+class TransientMemberError(ValueError):
+    """A member profile came back empty or failed in a way a retry can fix."""
+
+
 class AlliancePowerService:
     FULL_ROSTER_TIMEOUT_SECONDS = 90
-    MEMBER_FETCH_TIMEOUT_SECONDS = 120
-    MEMBER_FETCH_CONCURRENCY = 5
+    # The Data API's game gateway intermittently answers profile requests with
+    # null-filled profiles (uid only). Those are retried in rounds at a gentle pace;
+    # in a live check 17 such members all resolved within three rounds.
+    MEMBER_FETCH_TIMEOUT_SECONDS = 300
+    MEMBER_FETCH_CONCURRENCY = 3
+    MEMBER_FETCH_ROUNDS = 6
+    MEMBER_RETRY_DELAYS_SECONDS = (2, 4, 8, 8, 8)
+    # /full has returned null power for every member; when it gives nothing usable,
+    # skip it for a while instead of paying its slow, gateway-heavy call each hour.
+    FULL_ROSTER_SKIP_SECONDS = 6 * 3600
     TAG_RESOLUTION_TIMEOUT_SECONDS = 20
     TAG_RESOLUTION_LIMIT = 15
 
@@ -135,13 +148,27 @@ class AlliancePowerService:
         self._api = kingshot_data_service
         self._now = now_provider or (lambda: datetime.now(timezone.utc))
         self._locks = {}
+        self._full_roster_skip_until = 0.0
 
-    async def track_alliance(self, guild_id: int, kingdom_id: int, alliance_id: int) -> bool:
-        """Select a server's alliance. Returns True when a new snapshot was captured."""
+    async def track_alliance(self, guild_id: int, kingdom_id: int, alliance_id: int) -> bool | None:
+        """Select a server's alliance.
+
+        Returns True when a new snapshot was captured, False when today's snapshot
+        already existed, and None when tracking was saved but the first snapshot could
+        not be completed yet (the hourly collector keeps retrying).
+        """
         if any(KingshotDataService._positive_int(value) is None for value in (guild_id, kingdom_id, alliance_id)):
             raise ValueError("Enter a positive kingdom ID and select an alliance from the suggestions.")
-        # Validate and capture before replacing an existing server selection.
-        captured = await self._ensure_snapshot(kingdom_id, alliance_id)
+        # Validate the alliance (identity and roster) before replacing an existing
+        # server selection; a flaky member-profile API must not block setup.
+        try:
+            self._roster(self._payload(await self._api.get_alliance(alliance_id, kingdom_id)), alliance_id)
+        except Exception as error:
+            logger.warning("Alliance %s in kingdom %s could not be validated", alliance_id, kingdom_id, exc_info=True)
+            raise ValueError(
+                "That alliance could not be loaded from the KingShot Data API. Check the kingdom and alliance, "
+                "or try again in a few minutes."
+            ) from error
         async with self._db.session() as session:
             await session.execute(insert(AlliancePowerTracking).values(
                 guild_id=guild_id, kingdom_id=kingdom_id, alliance_id=alliance_id,
@@ -149,7 +176,11 @@ class AlliancePowerService:
                 index_elements=["guild_id"],
                 set_={"kingdom_id": kingdom_id, "alliance_id": alliance_id},
             ))
-        return captured
+        try:
+            return await self._ensure_snapshot(kingdom_id, alliance_id)
+        except ValueError:
+            # Already logged; tracking is saved and the hourly collector retries.
+            return None
 
     async def stop_tracking(self, guild_id: int, kingdom_id: int, alliance_id: int) -> bool:
         async with self._db.session() as session:
@@ -294,14 +325,34 @@ class AlliancePowerService:
     async def _load_roster(self, kingdom_id: int, alliance_id: int):
         """Prefer /full (one paced call); fall back to the lean roster."""
         get_full = getattr(self._api, "get_alliance_full", None)
-        if get_full is not None:
+        if get_full is not None and time.monotonic() >= self._full_roster_skip_until:
             try:
                 async with asyncio.timeout(self.FULL_ROSTER_TIMEOUT_SECONDS):
-                    return self._roster(self._payload(await get_full(alliance_id, kingdom_id)), alliance_id)
+                    roster = self._roster(self._payload(await get_full(alliance_id, kingdom_id)), alliance_id)
+                if any(self._usable_power(self._embedded_profile(row)) for row in roster[1] if isinstance(row, dict)):
+                    return roster
+                self._full_roster_skip_until = time.monotonic() + self.FULL_ROSTER_SKIP_SECONDS
+                logger.warning(
+                    "Full roster for kingdom %s alliance %s had no member power; skipping /full for %s h",
+                    kingdom_id, alliance_id, self.FULL_ROSTER_SKIP_SECONDS // 3600,
+                )
             except Exception:
                 logger.info("Full roster unavailable for kingdom %s alliance %s; using member profiles",
                             kingdom_id, alliance_id, exc_info=True)
         return self._roster(self._payload(await self._api.get_alliance(alliance_id, kingdom_id)), alliance_id)
+
+    @staticmethod
+    def _usable_power(profile) -> bool:
+        return isinstance(profile, dict) and isinstance(profile.get("power"), (int, str)) and (
+            KingshotDataService._nonnegative_int(profile.get("power")) is not None
+        )
+
+    @staticmethod
+    def _is_empty_profile(profile) -> bool:
+        """The gateway's null-filled answer: only the uid, no identity or power."""
+        return isinstance(profile, dict) and all(
+            profile.get(key) in (None, "") for key in ("name", "fid", "power", "kid")
+        )
 
     @staticmethod
     def _embedded_profile(row: dict) -> dict | None:
@@ -336,6 +387,51 @@ class AlliancePowerService:
             "rank": rank,
         }
 
+    async def _fetch_member(self, uid: int, rank, kingdom_id: int, alliance_id: int, semaphore) -> tuple[dict, dict]:
+        async with semaphore:
+            try:
+                result = await self._api.get_player(str(uid))
+            except Exception as error:
+                raise TransientMemberError(f"Profile request failed: {error}") from error
+        try:
+            profile = self._payload(result)
+        except ValueError as error:
+            raise TransientMemberError(str(error)) from error
+        if self._is_empty_profile(profile) or not self._usable_power(profile):
+            raise TransientMemberError("Profile came back without power")
+        # Identity, kingdom or alliance mismatches are real roster changes: not retried.
+        return self._member_entry(uid, profile, rank, kingdom_id, alliance_id), profile
+
+    async def _fetch_pending_members(self, pending, entries, profiles, kingdom_id: int, alliance_id: int) -> None:
+        """Fetch member profiles in retry rounds; all-or-nothing after the last round."""
+        semaphore = asyncio.Semaphore(self.MEMBER_FETCH_CONCURRENCY)
+        remaining = list(pending)
+        async with asyncio.timeout(self.MEMBER_FETCH_TIMEOUT_SECONDS):
+            for round_index in range(self.MEMBER_FETCH_ROUNDS):
+                if round_index:
+                    delays = self.MEMBER_RETRY_DELAYS_SECONDS
+                    await asyncio.sleep(delays[min(round_index - 1, len(delays) - 1)])
+                results = await asyncio.gather(
+                    *(self._fetch_member(uid, rank, kingdom_id, alliance_id, semaphore) for uid, rank in remaining),
+                    return_exceptions=True,
+                )
+                still_missing = []
+                for (uid, rank), result in zip(remaining, results):
+                    if isinstance(result, TransientMemberError):
+                        still_missing.append((uid, rank))
+                    elif isinstance(result, BaseException):
+                        raise result
+                    else:
+                        entries[uid], profiles[uid] = result
+                if not still_missing:
+                    return
+                logger.info(
+                    "Alliance %s capture round %s/%s: %s of %s member profiles still incomplete",
+                    alliance_id, round_index + 1, self.MEMBER_FETCH_ROUNDS, len(still_missing), len(pending),
+                )
+                remaining = still_missing
+        raise ValueError(f"{len(remaining)} member profile(s) stayed incomplete after {self.MEMBER_FETCH_ROUNDS} rounds")
+
     async def _fetch_snapshot(self, kingdom_id: int, alliance_id: int) -> dict:
         roster, rows, uids = await self._load_roster(kingdom_id, alliance_id)
         name, tag = roster.get("name"), roster.get("abbr")
@@ -353,20 +449,7 @@ class AlliancePowerService:
             pending.append((uid, rank))
 
         if pending:
-            semaphore = asyncio.Semaphore(self.MEMBER_FETCH_CONCURRENCY)
-
-            async def fetch(uid):
-                async with semaphore:
-                    return await self._api.get_player(str(uid))
-
-            async with asyncio.timeout(self.MEMBER_FETCH_TIMEOUT_SECONDS):
-                async with asyncio.TaskGroup() as group:
-                    tasks = [group.create_task(fetch(uid)) for uid, _ in pending]
-            for (uid, rank), task in zip(pending, tasks):
-                profile = self._payload(task.result())
-                # All-or-nothing: one unusable member rejects the whole capture.
-                entries[uid] = self._member_entry(uid, profile, rank, kingdom_id, alliance_id)
-                profiles[uid] = profile
+            await self._fetch_pending_members(pending, entries, profiles, kingdom_id, alliance_id)
 
         for uid in uids:
             alliance = profiles[uid].get("alliance")

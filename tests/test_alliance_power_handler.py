@@ -407,3 +407,18 @@ def test_new_capture_from_setup_posts_daily_reports_in_background():
         await asyncio.gather(*handler._background_tasks)
         handler.post_daily_reports.assert_awaited_once_with([(830, 83900004)])
     asyncio.run(check())
+
+
+def test_setup_with_pending_first_snapshot_explains_the_hourly_retry():
+    async def check():
+        report = _report()
+        report["latest"] = None
+        handler = _handler(report)
+        handler.service.track_alliance.return_value = None  # tracking saved, capture incomplete
+        interaction = _interaction()
+        await handler._handle_alliance(interaction, 830, "83900004")
+        notes = [call for call in interaction.followup.send.call_args_list if call.kwargs.get("ephemeral")]
+        assert notes and "retries automatically every hour" in notes[-1].args[0]
+        public = [call for call in interaction.followup.send.call_args_list if "view" in call.kwargs]
+        assert public and "Waiting for the first complete snapshot" in public[0].kwargs["embed"].description
+    asyncio.run(check())

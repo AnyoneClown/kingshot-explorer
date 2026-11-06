@@ -310,7 +310,9 @@ Additional commands are provided by translation, event, player info, KVK, and da
 Power tracking saves the first complete snapshot each UTC day and checks hourly for
 missing snapshots, including after restarts. Captures use the Data API's `/full`
 alliance roster (falling back to one profile call per member) and also store each
-member's Town Center level, VIP, life tree level and alliance rank. It sums the current roster's member power;
+member's Town Center level, VIP, life tree level and alliance rank. Empty member profiles from the
+API are retried in several rounds; if the first snapshot after selecting an alliance is still
+incomplete, tracking is saved and the hourly check keeps retrying. It sums the current roster's member power;
 roster changes therefore affect the total. Daily and weekly changes compare exact UTC
 dates (one and seven days earlier), not rolling 24-hour periods. Missing baselines show
 as new history, and failed or incomplete captures preserve the last complete snapshot.
