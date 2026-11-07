@@ -1,5 +1,11 @@
 name: ds-translator
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # One-off: applies database migrations, then exits. The bot waits for it.
   migrate:
@@ -13,6 +19,7 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+    logging: *default-logging
 
   translator-bot-local:
     build:
@@ -39,24 +46,4 @@ services:
           cpus: "0.50"
         reservations:
           memory: 128M
-
-  grafana-alloy:
-    image: grafana/alloy:latest
-    container_name: ds-translator-grafana-alloy
-    env_file:
-      - .env.grafana
-    command:
-      - run
-      - --server.http.listen-addr=0.0.0.0:12345
-      - --storage.path=/var/lib/alloy/data
-      - /etc/alloy/config.alloy
-    ports:
-      - "127.0.0.1:12345:12345"
-    volumes:
-      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - alloy-data:/var/lib/alloy/data
-    restart: unless-stopped
-
-volumes:
-  alloy-data:
+    logging: *default-logging

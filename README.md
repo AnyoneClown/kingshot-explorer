@@ -149,23 +149,23 @@ uv run python main.py
 
 ## Docker
 
-Docker uses one Compose file with three services:
+Docker uses one Compose file with two services:
 
 - `migrate` is a one-off service that runs `alembic upgrade head` with `.env.local`; the
   bot starts only after it succeeds.
 - `translator-bot-local` uses `.env.local` and runs the complete bot. It shuts down
   gracefully on `docker stop` (SIGTERM, 30 s grace period): background jobs stop,
   gift-code progress is saved and connections close.
-- `grafana-alloy` uses `.env.grafana` to forward the bot container logs to Grafana Cloud Logs.
 
-Create the real env files from the committed examples:
+Container logs are rotated by Docker (`json-file`, 10 MB × 3 files per container).
+
+Create the real env file from the committed example:
 
 ```bash
 cp .env.local.example .env.local
-cp .env.grafana.example .env.grafana
 ```
 
-Start the bot and Grafana Alloy:
+Start the bot:
 
 ```bash
 docker compose -f compose.yaml up --build
@@ -190,56 +190,6 @@ docker compose -f compose.yaml logs -f translator-bot-local
 docker compose -f compose.yaml restart translator-bot-local
 docker compose -f compose.yaml stop translator-bot-local
 ```
-
-## Grafana Cloud Logs
-
-Grafana Cloud Free includes Loki logs with limited usage and 14-day retention. This project uses Grafana Alloy to read the bot's Docker logs and send them to Grafana Cloud Logs.
-
-Create the Grafana env file:
-
-```bash
-cp .env.grafana.example .env.grafana
-```
-
-Fill these values in `.env.grafana` from Grafana Cloud:
-
-- `GRAFANA_CLOUD_LOKI_URL`: Loki push URL, usually ending with `/loki/api/v1/push`.
-- `GRAFANA_CLOUD_LOKI_USERNAME`: Loki username or instance ID.
-- `GRAFANA_CLOUD_API_KEY`: access policy token with `logs:write`.
-
-Start the bot with Grafana log forwarding:
-
-```bash
-docker compose -f compose.yaml up -d --build
-```
-
-Start only the log collector after bots are already running:
-
-```bash
-docker compose -f compose.yaml up -d grafana-alloy
-```
-
-Check Alloy locally:
-
-```bash
-docker compose -f compose.yaml logs -f grafana-alloy
-open http://localhost:12345
-```
-
-Useful Grafana Explore LogQL queries:
-
-```logql
-{app="ds-translator"}
-{app="ds-translator", bot_instance="local", level="E"}
-{app="ds-translator"} |= "Failed"
-```
-
-The dashboard includes:
-
-- Errors and warnings for the selected time range.
-- Log volume by bot instance and level.
-- Top error/warning logger names.
-- Filterable live logs with bot-instance and level variables.
 
 ## Commands Overview
 
