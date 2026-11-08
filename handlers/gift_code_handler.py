@@ -594,6 +594,9 @@ class GiftCodeHandler:
         self._tracked_bot_user_id: int | None = None
         self._auto_retry_after: dict[str, float] = {}
         self._auto_transient_passes: dict[str, int] = {}
+        # Summaries already posted for a code that is still retrying, by channel ID, so
+        # later passes edit them instead of posting a second summary.
+        self._auto_announcements: dict[str, dict[int, Any]] = {}
         self._mightpulse_service = mightpulse_service
         self._alliance_directory_service = alliance_directory_service
         self._polling_loop = None
@@ -931,7 +934,7 @@ class GiftCodeHandler:
                     len(transient),
                     self.AUTO_RETRY_AFTER_TRANSIENT_SECONDS,
                 )
-                await self._announce_auto_redemption(code, results)
+                await self._announce_auto_redemption(code, results, final=False)
                 return False
             await self._gift_code_service.mark_gift_code_completed(code_row.id)
             self._auto_retry_after.pop(job.key, None)
@@ -942,7 +945,7 @@ class GiftCodeHandler:
                 code,
                 ", ".join(f"{status}={counts[status]}" for status in STATUS_ORDER),
             )
-            await self._announce_auto_redemption(code, results)
+            await self._announce_auto_redemption(code, results, final=True)
             return True
         finally:
             if not attached:
@@ -969,9 +972,18 @@ class GiftCodeHandler:
         results: list[dict[str, Any]],
         *,
         scope: str = "every registered player",
+        final: bool = True,
     ) -> discord.Embed:
         global_code_error = next((result for result in results if is_global_code_rejection(result)), None)
-        if global_code_error is not None:
+        retrying = 0 if final else sum(1 for result in results if is_retryable_result(result))
+        if global_code_error is None and retrying:
+            title = "🎁 New Gift Code Redeemed!"
+            description = (
+                f"Auto-redemption reached {scope}. {retrying} player(s) hit temporary gift-code server "
+                "errors and are retried automatically; this message is updated when it finishes."
+            )
+            color = EmbedColors.SUCCESS
+        elif global_code_error is not None:
             title = "⚠️ Gift Code Partly Redeemed"
             description = (
                 f"Auto-redemption reached {scope} until the code stopped working: "
@@ -992,23 +1004,47 @@ class GiftCodeHandler:
         embed.set_footer(text="Check in-game mail for successfully redeemed codes!")
         return embed
 
-    async def _announce_auto_redemption(self, gift_code: str, results: list[dict[str, Any]]) -> None:
+    async def _announce_auto_redemption(
+        self, gift_code: str, results: list[dict[str, Any]], *, final: bool = True
+    ) -> None:
         """Global summary for legacy channels, per-server summaries for configured servers.
 
-        Nothing is announced anywhere a summary would contain no new success.
+        Nothing is announced anywhere a summary would contain no new success. A pass that
+        leaves the code pending (``final=False``) posts the summary right away; later passes
+        of the same code edit that message instead of posting another one.
         """
         try:
             await self._send_auto_redemption_announcement(
                 gift_code=gift_code,
                 total_players=len(results),
                 results=results,
+                final=final,
             )
         except Exception:
             logger.exception("Could not post the global gift-code announcement for '%s'", gift_code)
         try:
-            await self._announce_to_guild_channels(gift_code, results)
+            await self._announce_to_guild_channels(gift_code, results, final=final)
         except Exception:
             logger.exception("Could not post per-server gift-code announcements for '%s'", gift_code)
+        finally:
+            if final:
+                self._auto_announcements.pop(CodeJobGuard.key(gift_code), None)
+
+    async def _post_or_update_announcement(
+        self, gift_code: str, channel_id: int, channel: Any, embed: discord.Embed
+    ) -> str:
+        """Edit this code's earlier summary in the channel, or post one; returns what happened."""
+        posted = self._auto_announcements.setdefault(CodeJobGuard.key(gift_code), {})
+        previous = posted.get(channel_id)
+        if previous is not None:
+            try:
+                await previous.edit(embed=embed)
+                return "updated"
+            except discord.NotFound:
+                # Someone deleted the first summary: post the update as a new message.
+                posted.pop(channel_id, None)
+        posted[channel_id] = await channel.send(embed=embed)
+        return "posted"
 
     async def _send_auto_redemption_announcement(
         self,
@@ -1016,25 +1052,28 @@ class GiftCodeHandler:
         gift_code: str,
         total_players: int,
         results: list[dict[str, Any]],
+        final: bool = True,
     ) -> None:
         """Post the global summary to the legacy ``AUTO_REDEEM_CHANNELS`` (≥1 success only)."""
         channel_ids = getattr(self._config, "auto_redeem_channels", None) or set()
         if not channel_ids or not has_success(results):
             return
 
-        embed = self._build_auto_redemption_embed(gift_code, total_players, results)
+        embed = self._build_auto_redemption_embed(gift_code, total_players, results, final=final)
         for channel_id in channel_ids:
             channel = self._bot.get_channel(channel_id)
             if channel and isinstance(channel, discord.TextChannel):
                 try:
-                    await channel.send(embed=embed)
-                    logger.info("Announced gift code %s in channel %s", gift_code, channel_id)
+                    action = await self._post_or_update_announcement(gift_code, channel_id, channel, embed)
+                    logger.info("Announced gift code %s in channel %s (%s)", gift_code, channel_id, action)
                 except Exception as e:
                     logger.error("Failed to send gift code announcement to channel %s: %s", channel_id, e)
             else:
                 logger.warning("Configured auto-redeem channel %s not found or is not a text channel", channel_id)
 
-    async def _announce_to_guild_channels(self, gift_code: str, results: list[dict[str, Any]]) -> None:
+    async def _announce_to_guild_channels(
+        self, gift_code: str, results: list[dict[str, Any]], *, final: bool = True
+    ) -> None:
         """Post each configured server a summary of its own roster's results."""
         if self._guild_configuration_service is None or not has_success(results):
             return
@@ -1063,11 +1102,13 @@ class GiftCodeHandler:
                 )
                 continue
             embed = self._build_auto_redemption_embed(
-                gift_code, len(subset), subset, scope="this server's roster"
+                gift_code, len(subset), subset, scope="this server's roster", final=final
             )
             try:
-                await channel.send(embed=embed)
-                logger.info("Announced gift code %s to guild %s", gift_code, settings.guild_id)
+                action = await self._post_or_update_announcement(
+                    gift_code, settings.gift_code_channel_id, channel, embed
+                )
+                logger.info("Announced gift code %s to guild %s (%s)", gift_code, settings.guild_id, action)
             except Exception as e:
                 logger.error("Failed to announce gift code %s to guild %s: %s", gift_code, settings.guild_id, e)
 

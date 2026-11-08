@@ -638,3 +638,48 @@ async def test_temporary_failures_keep_the_auto_code_pending_and_retry_only_thos
     assert await handler._run_auto_redemption(code_row) is True
     assert [str(player_id) for player_id, _ in handler._gift_code_service.calls] == ["932"]
     assert pending_codes(db) == []
+
+
+@pytest.mark.asyncio
+async def test_retry_pass_edits_the_first_announcement_instead_of_posting_again(db):
+    outage = {"success": False, "error_code": "API_ERROR", "message": "Service unavailable"}
+    responses = {942: outage}
+    channel = Channel(channel_id=789, guild_id=GUILD)
+    handler = make_handler(
+        db,
+        responses=responses,
+        guild_settings=[SimpleNamespace(guild_id=GUILD, gift_code_channel_id=789)],
+        channels={789: channel},
+    )
+    handler._redemption.REDEEM_RETRY_DELAY_SECONDS = 0
+    handler._redemption.REDEEM_RETRY_MAX_DELAY_SECONDS = 0
+    await register(handler, GUILD, MEMBER, "941", "942")
+    add_code(db, 8, "WOBBLY")
+    posted = SimpleNamespace(edit=AsyncMock())
+
+    async def send(**kwargs):
+        channel.sent.append(kwargs)
+        return posted
+
+    channel.send = send
+
+    code_row = (await handler._gift_code_service.list_pending_gift_codes())[0]
+    assert await handler._run_auto_redemption(code_row) is False
+
+    # The first pass posts at once and says the summary is still being updated.
+    assert len(channel.sent) == 1
+    first = channel.sent[0]["embed"]
+    assert "retried automatically" in first.description
+    assert "**✅ Success:** 1" in field(first, "Results").value
+
+    responses.pop(942)
+    code_row = (await handler._gift_code_service.list_pending_gift_codes())[0]
+    assert await handler._run_auto_redemption(code_row) is True
+
+    # The final pass edits that message rather than posting a second summary.
+    assert len(channel.sent) == 1
+    posted.edit.assert_awaited_once()
+    final = posted.edit.await_args.kwargs["embed"]
+    assert final.description == "Auto-redemption finished for this server's roster."
+    assert "**✅ Success:** 2" in field(final, "Results").value
+    assert handler._auto_announcements == {}
