@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from db.models import (
     Base,
+    CommandUsageDaily,
+    GiftCodeAnnouncement,
     GiftCode,
     GiftCodeRedemption,
     GuildPlayerRegistration,
@@ -54,6 +56,8 @@ class SqliteDb:
                 GuildPlayerRegistration.__table__,
                 GiftCode.__table__,
                 GiftCodeRedemption.__table__,
+                GiftCodeAnnouncement.__table__,
+                CommandUsageDaily.__table__,
             ],
         )
 

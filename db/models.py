@@ -245,6 +245,31 @@ class GiftCode(Base):
         return f"<GiftCode(id={self.id}, code={self.code})>"
 
 
+class GiftCodeAnnouncement(Base):
+    """A gift-code announcement message, so later passes (and restarts) edit it."""
+
+    __tablename__ = "gift_code_announcements"
+    __table_args__ = (PrimaryKeyConstraint("gift_code", "channel_id"),)
+
+    gift_code: Mapped[str] = mapped_column(String(255), nullable=False)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CommandUsageDaily(Base):
+    """How often a command ran in a server on one UTC day (no user data)."""
+
+    __tablename__ = "command_usage_daily"
+    __table_args__ = (PrimaryKeyConstraint("usage_date", "guild_id", "command_name"),)
+
+    usage_date: Mapped[date] = mapped_column(Date, nullable=False)
+    # 0 stands for direct messages.
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    command_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    uses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class ScheduledReminder(Base):
     """Persisted Discord reminder schedule."""
 

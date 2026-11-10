@@ -2,11 +2,13 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 import time
 from io import BytesIO
 from typing import Dict, List
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from handlers.ui import EmbedColors, build_status_embed
@@ -27,8 +29,28 @@ from services.voice_message_service import VoiceMessageService
 
 logger = logging.getLogger(__name__)
 
+# Messages that are commands for some bot ("!rank", "/roll"), not text to translate.
+_COMMAND_LIKE = re.compile(r"[!$/?.][A-Za-z]")
+
 # Model output (translations, chat replies) must never ping anyone.
 NO_MENTIONS = discord.AllowedMentions.none()
+
+# Discord client languages -> the language the "Translate" message command targets.
+LOCALE_LANGUAGES = {
+    "en-US": "English", "en-GB": "English", "uk": "Ukrainian", "ru": "Russian", "de": "German",
+    "fr": "French", "es-ES": "Spanish", "es-419": "Spanish", "pt-BR": "Portuguese", "it": "Italian",
+    "pl": "Polish", "tr": "Turkish", "nl": "Dutch", "cs": "Czech", "ro": "Romanian", "hu": "Hungarian",
+    "el": "Greek", "bg": "Bulgarian", "hr": "Croatian", "lt": "Lithuanian", "sv-SE": "Swedish",
+    "da": "Danish", "fi": "Finnish", "no": "Norwegian", "ja": "Japanese", "ko": "Korean",
+    "zh-CN": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)", "vi": "Vietnamese",
+    "th": "Thai", "id": "Indonesian", "hi": "Hindi",
+}
+TRANSLATE_MENU_COOLDOWN_SECONDS = 5.0
+
+
+def language_for_locale(locale) -> str:
+    """Language name for a Discord locale (English when it is unknown)."""
+    return LOCALE_LANGUAGES.get(str(getattr(locale, "value", locale) or ""), "English")
 
 
 class TranslationHandler:
@@ -90,12 +112,27 @@ class TranslationHandler:
             """Handles errors for the !en command."""
             await self._handle_command_error(ctx, error)
 
+        tree = getattr(self._bot, "tree", None)
+        if tree is not None and hasattr(tree, "context_menu"):
+
+            @tree.context_menu(name="Translate")
+            @app_commands.checks.cooldown(1, TRANSLATE_MENU_COOLDOWN_SECONDS)
+            async def translate_message(interaction: discord.Interaction, message: discord.Message):
+                """Right-click a message → Apps → Translate: a private translation."""
+                await self._handle_translate_message_menu(interaction, message)
+
     def register_events(self):
         """Register message events for automatic translation."""
 
         @self._bot.event
         async def on_message(message):
             if message.author == self._bot.user or message.author.bot:
+                return
+
+            # "X pinned a message", thread-created notices and joins are not chat: their
+            # content is a name or empty, and they cannot be replied to.
+            is_system = getattr(message, "is_system", None)
+            if callable(is_system) and is_system() is True:
                 return
 
             # Banned users are ignored entirely: no prefix commands, translation or chat.
@@ -179,6 +216,64 @@ class TranslationHandler:
 
     # ------------------------------------------------------------------ commands
 
+    async def _handle_translate_message_menu(self, interaction: discord.Interaction, message: discord.Message):
+        """Translate one message into the caller's Discord language, visible only to them."""
+        language = language_for_locale(getattr(interaction, "locale", None))
+        text = getattr(message, "content", None) or ""
+        if not text.strip() or not has_translatable_text(text):
+            await interaction.response.send_message(embed=self._nothing_to_translate_embed(), ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self._translation_service.translate_to_language(text, language)
+        except TranslationUnavailableError:
+            await interaction.followup.send(embed=self._unavailable_embed(), ephemeral=True)
+            return
+        except Exception as e:
+            logger.error(f"Error in the Translate message command: {e}", exc_info=True)
+            await interaction.followup.send(embed=self._unavailable_embed(), ephemeral=True)
+            return
+
+        translated_text = (result or {}).get("text")
+        if not translated_text:
+            await interaction.followup.send(embed=self._nothing_to_translate_embed(), ephemeral=True)
+            return
+        if self._same_text(translated_text, text):
+            await interaction.followup.send(
+                embed=build_status_embed(
+                    title=f"Already {language}",
+                    description=f"This message already appears to be in {language}.",
+                    color=EmbedColors.SUCCESS,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        author_name = getattr(getattr(message, "author", None), "display_name", None)
+        embed = build_status_embed(
+            title=f"Translated to {language}",
+            description=self._quote_for_embed(translated_text),
+            color=EmbedColors.INFO,
+            footer=(f"Message by {author_name} · " if author_name else "") + "Only you can see this",
+        )
+        extras = {}
+        jump_url = getattr(message, "jump_url", None)
+        if jump_url:
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Original message", url=jump_url))
+            extras["view"] = view
+        await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=NO_MENTIONS, **extras)
+        await self._track_translation(
+            interaction.user,
+            original_text=text,
+            translated_text=translated_text,
+            target_language=language,
+            source_language=(result or {}).get("language"),
+            translation_type="context_menu",
+            guild=getattr(interaction, "guild", None),
+            channel=getattr(interaction, "channel", None) or getattr(message, "channel", None),
+        )
+
     async def _handle_translate_to_language(self, ctx, target_language: str):
         """Handle translation to a specific language command."""
         if self._is_banned(ctx.author.id):
@@ -229,7 +324,6 @@ class TranslationHandler:
                 title=f"Translated to {truncate_cleanly(target_language, 60)}",
                 description=self._quote_for_embed(translated_text),
                 color=EmbedColors.INFO,
-                footer="DS Translator",
             )
             await self._reply_with_optional_voice(
                 ctx.reply,
@@ -302,7 +396,6 @@ class TranslationHandler:
                 title=f"Translated from {truncate_cleanly(str(source_language or 'unknown'), 60)}",
                 description=self._quote_for_embed(translated_text),
                 color=EmbedColors.INFO,
-                footer="DS Translator",
             )
             await self._reply_with_optional_voice(
                 ctx.reply,
@@ -360,8 +453,9 @@ class TranslationHandler:
     async def _handle_auto_translation(self, message: discord.Message):
         """Automatically translate messages from users with Translator role."""
         content = message.content or ""
-        # Skip empty or command-like messages
-        if not content.strip() or content.startswith(("!", "$", "/", "?")):
+        # Skip empty or command-like messages ("!rank", "?help"); "?? 왜" and "$100 es
+        # mucho" are ordinary chat.
+        if not content.strip() or _COMMAND_LIKE.match(content):
             return
 
         if self._is_banned(message.author.id):
@@ -396,14 +490,10 @@ class TranslationHandler:
             return
 
         try:
-            chunks = split_for_discord(
-                translated_text,
-                self.MESSAGE_CHUNK_LIMIT,
-                max_chunks=self.MAX_TRANSLATION_MESSAGES,
-            )
+            chunks = self._quoted_chunks(translated_text)
             await self._reply_with_optional_voice(
                 message.reply,
-                content=self._quote_for_message(chunks[0]),
+                content=chunks[0],
                 mention_author=False,
                 guild_id=message.guild.id if message.guild else None,
                 voice_text=translated_text,
@@ -411,7 +501,7 @@ class TranslationHandler:
                 filename_stem="translation",
             )
             for chunk in chunks[1:]:
-                await message.channel.send(content=self._quote_for_message(chunk), allowed_mentions=NO_MENTIONS)
+                await message.channel.send(content=chunk, allowed_mentions=NO_MENTIONS)
         except Exception as e:
             logger.error(f"Auto-translation reply failed: {e}", exc_info=True)
             return
@@ -444,11 +534,13 @@ class TranslationHandler:
                 user_id=author.id,
                 original_text=original_text,
                 translated_text=translated_text,
-                target_language=target_language,
-                source_language=source_language,
+                # The columns are VARCHAR(50); a chatty model-reported language name
+                # must not lose the whole row.
+                target_language=str(target_language)[:50],
+                source_language=str(source_language)[:50] if source_language else None,
                 translation_type=translation_type,
                 guild_id=guild.id if guild else None,
-                channel_id=channel.id,
+                channel_id=getattr(channel, "id", None),
                 username=author.name,
                 discriminator=author.discriminator,
                 display_name=author.display_name,
@@ -476,9 +568,16 @@ class TranslationHandler:
         if not await self._should_attempt_reply(message, direct_trigger=direct_trigger):
             return
 
-        if not self._claim_user_reply_slot(message.author.id):
-            logger.debug("Chat reply skipped for user %s: per-user cooldown", message.author.id)
-            return
+        if direct_trigger:
+            # Random candidates are limited by the channel cooldown; they must not use up
+            # the user's slot, or a real question right afterwards would be ignored.
+            if not self._claim_user_reply_slot(message.author.id):
+                logger.debug("Chat reply skipped for user %s: per-user cooldown", message.author.id)
+                return
+        else:
+            # Claim the channel before generating: a second candidate arriving while the
+            # model is still writing must not produce a second random reply.
+            self._last_chat_reply_at[message.channel.id] = time.monotonic()
 
         try:
             history = await self._collect_conversation_context(message)
@@ -645,7 +744,8 @@ class TranslationHandler:
                     exc,
                     exc_info=True,
                 )
-                return default_enabled
+                # Voice is opt-in per server: a database hiccup must not switch it on.
+                return False
 
         return default_enabled
 
@@ -701,7 +801,9 @@ class TranslationHandler:
                     exc,
                     exc_info=True,
                 )
-                return default_enabled
+                # AI replies are opt-in per server: a database hiccup must not switch
+                # them on where nobody enabled them.
+                return False
 
         return default_enabled
 
@@ -855,6 +957,21 @@ class TranslationHandler:
     def _quote_for_message(cls, text: str, limit: int = 2000) -> str:
         quoted = cls._as_quote_block(text)
         return quoted if len(quoted) <= limit else truncate_cleanly(quoted, limit)
+
+    def _quoted_chunks(self, text: str) -> list[str]:
+        """Split a long translation into quoted messages that each fit Discord's limit.
+
+        Quoting adds two characters per line, so a chunk of many short lines can pass
+        2000 characters after it was split; the split is redone with a smaller limit
+        instead of cutting lines out of the middle of the translation.
+        """
+        limit = self.MESSAGE_CHUNK_LIMIT
+        while True:
+            chunks = split_for_discord(text, limit, max_chunks=self.MAX_TRANSLATION_MESSAGES)
+            quoted = [self._as_quote_block(chunk) for chunk in chunks]
+            if all(len(chunk) <= 2000 for chunk in quoted) or limit <= 400:
+                return [chunk if len(chunk) <= 2000 else truncate_cleanly(chunk, 2000) for chunk in quoted]
+            limit -= 200
 
     @staticmethod
     def _as_quote_block(text: str) -> str:

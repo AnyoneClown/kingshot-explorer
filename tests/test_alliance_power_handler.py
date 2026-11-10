@@ -87,16 +87,22 @@ def test_power_report_deltas_and_pagination():
         assert fields["Weekly change"] == "+100 (+25.0%)"
         assert "Roster changes" in summary.description
         assert "UTC" in summary.footer.text
+        assert view.sort_button.disabled  # sorting applies to the members list only
         await view.members_button.callback(interaction)
-        assert len(view.build_embed().fields) == 10
-        assert "Weekly: New history" in view.build_embed().fields[0].value
+        members = view.build_embed()
+        assert members.fields == [] and members.description.count("\nDay ") == 10  # compact entries
+        assert "**1. Member 20** · 2,000\nDay +0 (+0.0%) · Week new" in members.description
+        assert "Sorted by power" in members.footer.text and not view.sort_button.disabled
         await view.next_button.callback(interaction)
         await view.next_button.callback(interaction)
         assert view.page == 2 and view.next_button.disabled and not view.previous_button.disabled
-        assert len(view.build_embed().fields) == 1
-        assert "baseline 0" in view.build_embed().fields[0].value
+        last = view.build_embed().description
+        assert last.count("\nDay ") == 1 and "**21. Member 0** · 0\nDay +0 · Week new" in last
         await view.previous_button.callback(interaction)
         assert view.page == 1
+        await view.sort_button.callback(interaction)
+        assert view.sort == "daily" and view.page == 0 and view.sort_button.label == "Sort: Daily growth"
+        assert "Sorted by daily growth" in view.build_embed().footer.text
         handler.service.get_report.assert_not_awaited()
         handler.service.track_alliance.assert_not_awaited()
         public_view = AlliancePowerView(handler, 10, report, 2, can_manage=False)
@@ -114,9 +120,9 @@ def test_power_report_deltas_and_pagination():
         missing = AlliancePowerView(handler, 10, report, 1)
         await missing.members_button.callback(interaction)
         embed = missing.build_embed()
-        assert "R4 · TC 30 · VIP 9" in embed.fields[0].value
-        assert "Unavailable" in embed.fields[1].value
-        assert len(embed) <= 6000 and len(embed.fields[1].name) <= 256
+        assert "**1. Rich** · 5\nDay new · Week new · R4 · TC 30 · VIP 9" in embed.description
+        assert "power unavailable\nDay n/a · Week n/a" in embed.description
+        assert len(embed) <= 6000 and len(embed.description) <= 4096
     asyncio.run(check())
 
 
@@ -246,7 +252,7 @@ def test_alliance_command_accepts_exact_tags():
         unknown = _interaction()
         await handler._handle_alliance(unknown, 830, "NOP")
         handler.service.track_alliance.assert_not_awaited()
-        assert "No alliance tagged `NOP`" in unknown.followup.send.call_args.args[0]
+        assert "could not find an alliance tagged `NOP`" in unknown.followup.send.call_args.args[0]
         assert unknown.followup.send.call_args.kwargs["ephemeral"]
     asyncio.run(check())
 
@@ -421,4 +427,58 @@ def test_setup_with_pending_first_snapshot_explains_the_hourly_retry():
         assert notes and "retries automatically every hour" in notes[-1].args[0]
         public = [call for call in interaction.followup.send.call_args_list if "view" in call.kwargs]
         assert public and "Waiting for the first complete snapshot" in public[0].kwargs["embed"].description
+    asyncio.run(check())
+
+
+def test_growth_leaders_trend_and_sorting_by_growth():
+    from handlers.alliance_power_handler import _compact, _short_change, sparkline, top_growth
+
+    assert [_compact(v) for v in (999, 1_500, 45_600_000, 1_230_000_000, -2_000_000)] == [
+        "999", "1.5K", "45.6M", "1.23B", "-2M",
+    ]
+    assert _short_change(1_500_000, 1_000_000) == "+500K (+50.0%)"
+    assert _short_change(900, 1_000) == "-100 (-10.0%)"
+    assert sparkline([1]) == "" and sparkline([5, 5, 5]) == "▄▄▄" and sparkline([0, 50, 100]) == "▁▅█"
+
+    now = datetime.now(timezone.utc)
+
+    def snapshot(days, members):
+        return SimpleNamespace(
+            snapshot_date=(now - timedelta(days=days)).date(), captured_at=now - timedelta(days=days),
+            alliance_name="Test Alliance", alliance_tag="TST",
+            total_power=sum(m["power"] or 0 for m in members.values()), members=members,
+        )
+
+    latest = snapshot(0, {
+        "a": {"name": "Big", "power": 1_000}, "b": {"name": "Riser", "power": 600},
+        "c": {"name": "Faller", "power": 100}, "d": {"name": "Joiner", "power": 50},
+    })
+    daily = snapshot(1, {
+        "a": {"name": "Big", "power": 990}, "b": {"name": "Riser", "power": 300}, "c": {"name": "Faller", "power": 200},
+    })
+    older = snapshot(2, {"a": {"name": "Big", "power": 900}})
+    assert [(uid, gain) for uid, _, gain, _ in top_growth(latest, daily)] == [("b", 300), ("a", 10)]
+    assert top_growth(latest, None) == []
+
+    report = {
+        "kingdom_id": 830, "alliance_id": 1, "latest": latest, "daily": daily, "weekly": None,
+        "history": [older, daily, latest], "changes": None, "inactive": {},
+    }
+    fields = {field.name: field.value for field in build_daily_report_embed(report).fields}
+    assert fields["Top growth today"] == "1. Riser · +300 (+100.0%)\n2. Big · +10 (+1.0%)"
+    assert "Top growth this week" not in fields
+    assert fields["Trend (3 days)"].startswith("`▁") and "900 → 1.8K (+94.4%)" in fields["Trend (3 days)"]
+
+    async def check():
+        view = AlliancePowerView(_handler(report), 10, report, 1)
+        assert "Top growth today" in {field.name for field in view.build_embed().fields}
+        interaction = _interaction()
+        await view.members_button.callback(interaction)
+        await view.sort_button.callback(interaction)
+        # Daily growth: Riser (+300), Big (+10), Faller (-100); Joiner has no baseline and goes last.
+        assert [member["name"] for _, member in view.members] == ["Riser", "Big", "Faller", "Joiner"]
+        await view.sort_button.callback(interaction)
+        await view.sort_button.callback(interaction)
+        assert view.sort == "power" and view.members[0][1]["name"] == "Big"
+
     asyncio.run(check())

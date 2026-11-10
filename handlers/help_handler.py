@@ -1,8 +1,10 @@
 """A private starting point for the bot's available commands."""
 
+import inspect
 from functools import partial
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from handlers.permissions import AccessPolicy, interaction_guild_id
@@ -33,15 +35,19 @@ GROUPS = {
         (("alliance", "Power trends", "/alliance"),),
     ),
     "Gifts": (
-        "Find active codes and add your Governor ID with /addplayer to receive new codes "
-        "automatically. Server managers can import alliances and run /redeem for this "
-        "server's roster.",
+        "Add your Governor ID with /addplayer to receive new codes automatically, check your "
+        "accounts with /myaccounts, and send in a code the bot has not found yet with /submitcode. "
+        "Server managers can post a sign-up panel with buttons, import alliances and run /redeem "
+        "for this server's roster.",
         (
             ("giftcodes", "Available codes", "/giftcodes"),
             ("addplayer", "Add players", "/addplayer player_ids:123456,654321"),
+            ("myaccounts", "My accounts", "/myaccounts"),
+            ("submitcode", "Submit a code", "/submitcode code:EXAMPLE"),
             ("removeplayer", "Remove player", "/removeplayer player_id:123456"),
             ("addalliance", "Import alliance", "/addalliance kid:830"),
             ("redeem", "Redeem code", "/redeem gift_code:EXAMPLE"),
+            ("giftpanel", "Post sign-up panel", "/giftpanel"),
         ),
     ),
     "Events": (
@@ -65,13 +71,17 @@ GROUPS = {
     ),
 }
 # Actions only offered to server managers (Manage Server, the manager role, or bot operators).
-ADMIN_COMMANDS = {"redeem", "schedule", "cancel", "configure", "addalliance"}
+ADMIN_COMMANDS = {"redeem", "schedule", "cancel", "configure", "addalliance", "giftpanel"}
+# Discord allows five buttons per row; action buttons fill these rows in order.
+ACTION_ROWS = (1, 2)
+BUTTONS_PER_ROW = 5
 # Friendlier form labels for slash-command parameters.
 FIELD_LABELS = {
     "player_ids": "Player IDs",
     "player_id": "Player ID",
     "kid": "Kingdom ID",
     "gift_code": "Gift code",
+    "code": "Gift code",
     "event_id": "Event ID",
     "kingdom_number": "Kingdom number",
     "kingdom_a": "First kingdom",
@@ -140,12 +150,15 @@ class HelpView(OwnedView):
 
     def _update_actions(self) -> None:
         for item in list(self.children):
-            if item.row == 1:
+            if item.row in ACTION_ROWS:
                 self.remove_item(item)
         for option in self.category_select.options:
             option.default = option.label == self.category
-        for name, label, _ in self.groups[self.category][1]:
-            button = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=1)
+        actions = self.groups[self.category][1][: len(ACTION_ROWS) * BUTTONS_PER_ROW]
+        for index, (name, label, _) in enumerate(actions):
+            button = discord.ui.Button(
+                label=label, style=discord.ButtonStyle.primary, row=ACTION_ROWS[index // BUTTONS_PER_ROW]
+            )
             button.callback = partial(self.handler.open_command, name=name, label=label)
             self.add_item(button)
 
@@ -167,7 +180,7 @@ class HelpView(OwnedView):
         self._update_actions()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Bot status", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Bot status", style=discord.ButtonStyle.secondary, row=3)
     async def status_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handler.run_command(interaction, "status", {})
 
@@ -226,8 +239,10 @@ class HelpHandler:
         if self._bot.get_command("t") is not None:
             prefix = self._bot.command_prefix
             groups["Translation"] = (
-                f"Reply to the message you want translated, then send `{prefix}en` for English "
-                f"or `{prefix}t Spanish` for another language.\n\n"
+                "Right-click a message (long-press on mobile) → **Apps → Translate** to read it in your "
+                "Discord language; only you see the result.\n\n"
+                f"To translate for everyone, reply to a message with `{prefix}en` for English or "
+                f"`{prefix}t Spanish` for another language.\n\n"
                 "Members with the configured Translator role have their messages translated to English automatically.",
                 (),
             )
@@ -271,5 +286,21 @@ class HelpHandler:
         if command is None or not self._allowed(interaction, name):
             await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
             return
-        # The registered callbacks retain the same validation and authorization as slash commands.
+        # Calling the callback directly skips the command's checks (cooldowns), so run
+        # them here; the callbacks themselves keep their validation and authorization.
+        try:
+            for check in getattr(command, "checks", None) or ():
+                allowed = check(interaction)
+                if inspect.isawaitable(allowed):
+                    allowed = await allowed
+                if not allowed:
+                    raise app_commands.CheckFailure()
+        except app_commands.CommandOnCooldown as error:
+            await interaction.response.send_message(
+                f"Slow down — try again in {error.retry_after:.0f}s.", ephemeral=True
+            )
+            return
+        except app_commands.CheckFailure:
+            await interaction.response.send_message("You can't use this command here.", ephemeral=True)
+            return
         await command.callback(interaction, **values)

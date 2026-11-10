@@ -563,7 +563,9 @@ class KingshotDataService:
             try:
                 client = await self.ensure_client()
                 response = await client.request(method=method, url=path, params=params, **request_kwargs)
-            except (httpx.NetworkError, httpx.TimeoutException) as exc:
+            # TransportError also covers RemoteProtocolError ("server disconnected" on a
+            # reused keep-alive connection), which is as retryable as a network error.
+            except httpx.TransportError as exc:
                 if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
                     logger.error("Timed out calling %s (not retried): %s", path, exc)
                     return {

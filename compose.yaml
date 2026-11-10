@@ -47,3 +47,10 @@ services:
         reservations:
           memory: 128M
     logging: *default-logging
+    volumes:
+      # The file log survives rebuilds and redeploys (rotated, about 60 MB at most); `docker logs`
+      # starts empty whenever the container is recreated.
+      - bot-logs:/app/logs
+
+volumes:
+  bot-logs:

@@ -11,6 +11,7 @@ from discord.ext import tasks
 
 from handlers.confirm_view import ConfirmView
 from handlers.permissions import AccessPolicy
+from handlers.setup_prompts import offer_channel_setup
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, edit_panel_message, send_ui_error
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,86 @@ def _change(current: int | None, baseline: int | None) -> str:
     difference = current - baseline
     percentage = f"{difference / baseline:+.1%}" if baseline else "percentage unavailable: baseline 0"
     return f"{difference:+,} ({percentage})"
+
+
+SORT_MODES = ("power", "daily", "weekly")
+SORT_LABELS = {"power": "Power", "daily": "Daily growth", "weekly": "Weekly growth"}
+TOP_GROWTH_LIMIT = 5
+_SPARKS = "▁▂▃▄▅▆▇█"
+
+
+def _compact(value: int) -> str:
+    """A short number for narrow lists: 1.23B, 45.6M, 789K."""
+    sign = "-" if value < 0 else ""
+    number = abs(value)
+    for size, suffix, digits in ((1_000_000_000, "B", 2), (1_000_000, "M", 1), (1_000, "K", 1)):
+        if number >= size:
+            text = f"{number / size:.{digits}f}"
+            return f"{sign}{text.rstrip('0').rstrip('.')}{suffix}"
+    return f"{sign}{number:,}"
+
+
+def _short_change(current: int | None, baseline: int | None) -> str:
+    """Compact form of ``_change`` for member lists."""
+    if current is None:
+        return "n/a"
+    if baseline is None:
+        return "new"
+    difference = current - baseline
+    percentage = f" ({difference / baseline:+.1%})" if baseline else ""
+    return f"{'+' if difference >= 0 else '-'}{_compact(abs(difference))}{percentage}"
+
+
+def sparkline(values: list[int]) -> str:
+    """Values as a one-line bar chart; empty when there is nothing to compare."""
+    if len(values) < 2:
+        return ""
+    low, high = min(values), max(values)
+    if high == low:
+        return _SPARKS[3] * len(values)
+    return "".join(_SPARKS[round((value - low) / (high - low) * (len(_SPARKS) - 1))] for value in values)
+
+
+def _trend_line(history) -> str | None:
+    """Sparkline of the daily totals with the change over the period."""
+    totals = [row.total_power for row in history if getattr(row, "total_power", None) is not None]
+    if len(totals) < 3:
+        return None
+    change = f" ({(totals[-1] - totals[0]) / totals[0]:+.1%})" if totals[0] else ""
+    return f"`{sparkline(totals)}` {_compact(totals[0])} → {_compact(totals[-1])}{change}"
+
+
+def top_growth(latest, baseline, limit: int = TOP_GROWTH_LIMIT) -> list[tuple[str, dict, int, int]]:
+    """Members who gained the most power since ``baseline``: (uid, member, gain, old power)."""
+    if latest is None or baseline is None:
+        return []
+    rows = []
+    for uid, member in (latest.members or {}).items():
+        power = member.get("power")
+        old_power = ((baseline.members or {}).get(uid) or {}).get("power")
+        if power is None or old_power is None or power <= old_power:
+            continue
+        rows.append((uid, member, power - old_power, old_power))
+    rows.sort(key=lambda row: (-row[2], row[0]))
+    return rows[:limit]
+
+
+def _growth_lines(rows) -> list[str]:
+    lines = []
+    for position, (uid, member, gain, old_power) in enumerate(rows, 1):
+        name = _escape(member.get("name") or f"Player {uid}", 60)
+        percentage = f" ({gain / old_power:+.1%})" if old_power else ""
+        lines.append(f"{position}. {name} · +{_compact(gain)}{percentage}")
+    return lines
+
+
+def _add_growth_fields(embed: discord.Embed, report: dict) -> None:
+    """Top gainers of the day and of the week (skipped while there is no baseline)."""
+    latest = report.get("latest")
+    for label, baseline in (("Top growth today", report.get("daily")), ("Top growth this week", report.get("weekly"))):
+        rows = top_growth(latest, baseline)
+        if rows:
+            embed.add_field(name=label, value=_bounded_lines(_growth_lines(rows)), inline=False)
 
 
 def _escape(value, limit: int) -> str:
@@ -120,6 +201,10 @@ def build_daily_report_embed(report: dict) -> discord.Embed:
     embed.add_field(name="Total member power", value=f"{latest.total_power:,}")
     embed.add_field(name="Daily change", value=_change(latest.total_power, daily.total_power if daily else None))
     embed.add_field(name="Members", value=str(len(latest.members or {})))
+    trend = _trend_line(report.get("history") or [])
+    if trend:
+        embed.add_field(name=f"Trend ({len(report['history'])} days)", value=trend, inline=False)
+    _add_growth_fields(embed, report)
     changes = report.get("changes")
     if changes is None:
         embed.add_field(
@@ -197,11 +282,8 @@ class AlliancePowerView(OwnedView):
         self.report = report
         self.page = 0
         self.mode = "summary"
-        latest = report["latest"]
-        self.members = sorted(
-            (latest.members if latest else {}).items(),
-            key=lambda pair: (pair[1].get("power") is None, -(pair[1].get("power") or 0), pair[0]),
-        )
+        self.sort = "power"
+        self.members = self._sorted_members()
         if can_manage is None:
             can_manage = handler._access.is_super_admin(author_id)
         self.can_manage = can_manage
@@ -214,12 +296,37 @@ class AlliancePowerView(OwnedView):
     def showing_members(self) -> bool:
         return self.mode == "members"
 
+    def _growth(self, uid: str, member: dict, baseline) -> int | None:
+        power = member.get("power")
+        old_power = ((baseline.members or {}).get(uid) or {}).get("power") if baseline else None
+        return None if power is None or old_power is None else power - old_power
+
+    def _sorted_members(self) -> list[tuple[str, dict]]:
+        """Members by power, or by daily/weekly gain (members without a baseline last)."""
+        latest = self.report["latest"]
+        members = list((latest.members if latest else {}).items())
+
+        def by_power(pair):
+            return (pair[1].get("power") is None, -(pair[1].get("power") or 0), pair[0])
+
+        if self.sort == "power":
+            return sorted(members, key=by_power)
+        baseline = self.report.get(self.sort)
+
+        def by_growth(pair):
+            growth = self._growth(pair[0], pair[1], baseline)
+            return (growth is None, -(growth or 0), *by_power(pair))
+
+        return sorted(members, key=by_growth)
+
     def _update_controls(self):
         self.summary_button.disabled = self.mode == "summary"
         self.members_button.disabled = self.mode == "members" or not self.members
         self.changes_button.disabled = self.mode == "changes" or self.report["latest"] is None
         self.previous_button.disabled = self.mode != "members" or self.page == 0
         self.next_button.disabled = self.mode != "members" or (self.page + 1) * MEMBERS_PER_PAGE >= len(self.members)
+        self.sort_button.disabled = self.mode != "members"
+        self.sort_button.label = f"Sort: {SORT_LABELS[self.sort]}"
 
     def build_embed(self) -> discord.Embed:
         latest = self.report["latest"]
@@ -243,22 +350,25 @@ class AlliancePowerView(OwnedView):
         return embed
 
     def _add_member_fields(self, embed: discord.Embed) -> str:
+        """One compact two-line entry per member, in the chosen order."""
         daily, weekly = self.report["daily"], self.report["weekly"]
         start = self.page * MEMBERS_PER_PAGE
-        for uid, member in self.members[start:start + MEMBERS_PER_PAGE]:
+        entries = []
+        for position, (uid, member) in enumerate(self.members[start:start + MEMBERS_PER_PAGE], start + 1):
             power = member.get("power")
-            name = _escape(member.get("name") or "Unknown player", 90)
-            changes = []
-            for label, baseline in (("Daily", daily), ("Weekly", weekly)):
-                old_power = (baseline.members.get(uid) or {}).get("power") if baseline else None
-                changes.append(f"{label}: {_change(power, old_power)}")
-            lines = [f"Power: {power:,}" if power is not None else "Power: Unavailable"]
+            name = _escape(member.get("name") or "Unknown player", 60)
+            parts = [
+                f"{label} {_short_change(power, (baseline.members.get(uid) or {}).get('power') if baseline else None)}"
+                for label, baseline in (("Day", daily), ("Week", weekly))
+            ]
             details = _member_details(member)
             if details:
-                lines.append(details)
-            embed.add_field(name=name, value="\n".join(lines + changes), inline=False)
+                parts.append(details)
+            power_text = f"{power:,}" if power is not None else "power unavailable"
+            entries.append(f"**{position}. {name}** · {power_text}\n{' · '.join(parts)}")
+        embed.description += "\n\n" + "\n".join(entries)
         pages = max(1, (len(self.members) + MEMBERS_PER_PAGE - 1) // MEMBERS_PER_PAGE)
-        return f"Members {self.page + 1}/{pages} · "
+        return f"Members {self.page + 1}/{pages} · Sorted by {SORT_LABELS[self.sort].lower()} · "
 
     def _add_changes(self, embed: discord.Embed) -> str:
         changes = self.report.get("changes")
@@ -296,11 +406,14 @@ class AlliancePowerView(OwnedView):
             embed.add_field(name="Roster", value=f"{summary} {_changes_period(changes)}", inline=False)
         history = self.report["history"][-7:]
         if history:
+            trend = _trend_line(history)
+            lines = [f"{row.snapshot_date.isoformat()} · {row.total_power:,}" for row in history]
             embed.add_field(
                 name="Recent daily totals (UTC)",
-                value="\n".join(f"{row.snapshot_date.isoformat()} · {row.total_power:,}" for row in history),
+                value="\n".join(([trend] if trend else []) + lines),
                 inline=False,
             )
+        _add_growth_fields(embed, self.report)
         if len(self.report["history"]) == 1:
             embed.description += "\nFirst snapshot saved. Daily and weekly changes need earlier snapshots."
         embed.description += "\nRoster changes affect total member power."
@@ -333,6 +446,13 @@ class AlliancePowerView(OwnedView):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=0)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(max(0, (len(self.members) - 1) // MEMBERS_PER_PAGE), self.page + 1)
+        await self._edit(interaction)
+
+    @discord.ui.button(label="Sort: Power", style=discord.ButtonStyle.secondary, row=1)
+    async def sort_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.sort = SORT_MODES[(SORT_MODES.index(self.sort) + 1) % len(SORT_MODES)]
+        self.members = self._sorted_members()
+        self.page = 0
         await self._edit(interaction)
 
     async def _require_manager(self, interaction: discord.Interaction, action: str) -> bool:
@@ -437,6 +557,8 @@ class AlliancePowerHandler:
         self._alliance_choices = alliance_choices
         self._kid_choices = kid_choices
         self._background_tasks: set[asyncio.Task] = set()
+        # Servers whose managers were already offered a report channel since the start.
+        self._report_setup_offered: set[int] = set()
 
     def register_commands(self):
         @self._bot.tree.command(name="alliance", description="View daily and weekly alliance power trends")
@@ -462,12 +584,14 @@ class AlliancePowerHandler:
         selection = (alliance or "").strip()
         if kid is None or not selection or not 0 < kid < 2**63 or not selection.isascii():
             return None
+        # Tags are exactly three characters and may be digits ("777"); alliance IDs are
+        # much longer, so three characters always mean a tag.
+        if len(selection) == 3 and selection.isalnum():
+            return None, selection
         if selection.isdigit():
             if len(selection) > 19 or not 0 < int(selection) < 2**63:
                 return None
             return int(selection), None
-        if len(selection) == 3 and selection.isalnum():
-            return None, selection
         return None
 
     async def _resolve_tag(self, kid: int, tag: str) -> int | None:
@@ -524,8 +648,9 @@ class AlliancePowerHandler:
                     alliance_id = await self._resolve_tag(kid, tag)
                     if alliance_id is None:
                         await interaction.followup.send(
-                            f"No alliance tagged `{discord.utils.escape_markdown(tag)}` was found among the "
-                            f"top alliances of kingdom {kid}. Choose one from the suggestions.",
+                            f"I could not find an alliance tagged `{discord.utils.escape_markdown(tag)}` among "
+                            f"the top alliances of kingdom {kid}. The alliance list sometimes loads incompletely: "
+                            "try again in a minute, or choose the alliance from the suggestions.",
                             ephemeral=True,
                         )
                         return
@@ -551,6 +676,24 @@ class AlliancePowerHandler:
                     "first snapshot isn't complete yet. The bot retries automatically every hour; this report "
                     "fills in once a complete snapshot is captured.",
                     ephemeral=True,
+                )
+            if can_manage and (configuring or interaction.guild_id not in self._report_setup_offered):
+                # Without a report channel the daily report is posted nowhere; offer it
+                # once per server (and whenever tracking is set up).
+                self._report_setup_offered.add(interaction.guild_id)
+                guild_id = interaction.guild_id
+
+                async def post_latest(_channel_id: int) -> None:
+                    current = await self.service.get_report(guild_id)
+                    if current is not None and current.get("latest") is not None:
+                        await self._post_report(guild_id, build_daily_report_embed(current))
+
+                await offer_channel_setup(
+                    interaction,
+                    setting="alliance_report_channel_id",
+                    guild_config_service=self._guild_configuration_service,
+                    access_policy=self._access,
+                    on_saved=post_latest,
                 )
         except ValueError as error:
             await interaction.followup.send(str(error), ephemeral=True)

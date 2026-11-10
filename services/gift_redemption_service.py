@@ -89,6 +89,9 @@ _RETRYABLE_ERROR_CODES = frozenset(
         "UNKNOWN_ERROR",
         "TIMEOUT_RETRY",
         "RATE_LIMITED",
+        # The player lookup service was unreachable: says nothing about the account.
+        "PLAYER_LOOKUP_UNAVAILABLE",
+        "KINGDOM_REFRESH_UNAVAILABLE",
         "40019",
         "429",
         "500",
@@ -110,6 +113,9 @@ _RETRYABLE_PHRASES = (
     "http error 5",
     "max retries",
 )
+
+# KingShot Data API failures that mean the service itself is unreachable.
+_LOOKUP_OUTAGE_ERROR_CODES = frozenset({"NETWORK_ERROR", "GATEWAY_ERROR", "MAX_RETRIES_EXCEEDED"})
 
 JOB_AUTO = "auto"
 JOB_MANUAL = "manual"
@@ -195,7 +201,9 @@ def is_retryable_result(result: dict) -> bool:
         return True
     try:
         numeric_code = int(code)
-        if numeric_code == 429 or numeric_code >= 500:
+        # Only HTTP-style statuses: the API's own business codes (40021, ...) are five
+        # digits and say something about the player or the code, not about an outage.
+        if numeric_code == 429 or 500 <= numeric_code < 600:
             return True
     except ValueError:
         pass
@@ -403,6 +411,46 @@ def summarize_roster_health(
     return RosterHealthReport(enabled_players=len(enabled_ids), codes=code_reach, failing_players=failing)
 
 
+def find_broken_players(
+    codes: Sequence[str],
+    players: Sequence[Any],
+    rows: Iterable[Any],
+    *,
+    current_code: str | None = None,
+    min_failures: int = 3,
+) -> list[FailingPlayer]:
+    """Players whose account keeps failing as invalid across recent codes.
+
+    A player is returned when ``current_code`` (default: the first of ``codes``)
+    failed as an invalid account (wrong Governor ID, kingdom mismatch), at least
+    ``min_failures`` of the codes failed that way, and none of them reached the
+    player. One bad code or a temporary outage therefore never disables anyone.
+    """
+    if not codes:
+        return []
+    current = current_code or codes[0]
+    names = {str(player.player_id): getattr(player, "player_name", None) for player in players}
+    code_names = set(codes)
+    reached: set[str] = set()
+    broken: dict[tuple[str, str], str] = {}
+    for row in rows:
+        code, player_id = str(row.gift_code), str(row.player_id)
+        if code not in code_names or player_id not in names:
+            continue
+        if row.success or row.error_code in ALREADY_REDEEMED_ERROR_CODES:
+            reached.add(player_id)
+        elif row.error_code in BROKEN_ACCOUNT_ERROR_CODES:
+            broken[(code, player_id)] = str(row.error_code)
+    failing: list[FailingPlayer] = []
+    for player_id in sorted(names):
+        if player_id in reached or (current, player_id) not in broken:
+            continue
+        errors = [broken[(code, player_id)] for code in codes if (code, player_id) in broken]
+        if len(errors) >= min_failures:
+            failing.append(FailingPlayer(player_id, names[player_id], len(errors), errors[0]))
+    return failing
+
+
 # ------------------------------------------------------------------- service
 
 
@@ -416,6 +464,8 @@ class GiftRedemptionService:
     REDEEM_RATE_LIMIT_DELAY_SECONDS = 60.0
     REDEEM_RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
     REDEEM_CONCURRENCY = 3
+    # Automatic passes end after this many temporary failures in a row.
+    TRANSIENT_ABORT_AFTER = 6
 
     def __init__(self, gift_code_service: Any, tracking_service: Any, kingshot_data_service: Any = None):
         self._gift_code_service = gift_code_service
@@ -450,14 +500,20 @@ class GiftRedemptionService:
         }
 
     @staticmethod
-    def player_lookup_failure_result(player: Any, message: str) -> dict[str, Any]:
+    def player_lookup_failure_result(player: Any, message: str, *, unavailable: bool = False) -> dict[str, Any]:
+        """A failed profile lookup.
+
+        ``unavailable`` means the lookup service itself failed (timeout, outage): that
+        is temporary and retried, unlike a player the service does not know.
+        """
         return {
             "player_id": str(player.player_id),
             "player_name": getattr(player, "player_name", None),
             "success": False,
             "message": message,
-            "error_code": "PLAYER_LOOKUP_FAILED",
-            "status_category": STATUS_INVALID_ID,
+            "error_code": "PLAYER_LOOKUP_UNAVAILABLE" if unavailable else "PLAYER_LOOKUP_FAILED",
+            "status_category": STATUS_API_REJECTED if unavailable else STATUS_INVALID_ID,
+            "lookup_unavailable": unavailable,
             "should_log": False,
         }
 
@@ -524,6 +580,7 @@ class GiftRedemptionService:
         if self._kingshot_data_service is None:
             return None, self.player_lookup_failure_result(player, "Jeab player lookup is unavailable.")
 
+        unavailable = False
         try:
             response = await self._kingshot_data_service.get_player_by_fid(player_id)
             data = response.get("data") if isinstance(response, dict) else None
@@ -543,16 +600,31 @@ class GiftRedemptionService:
                     }, None
                 lookup_error = "Jeab returned no kingdom for this player."
             else:
+                # Only a failing service is temporary. "Not found", a bad request or a
+                # missing API key will not get better by retrying, and treating them as
+                # temporary would let one bad account hold up the code for everyone.
+                unavailable = self._lookup_service_failed(response)
                 lookup_error = str(
                     (response.get("error_message") if isinstance(response, dict) else None)
                     or (response.get("message") if isinstance(response, dict) else None)
                     or "Jeab player lookup failed."
                 )
         except Exception as exc:
+            unavailable = True
             lookup_error = f"Jeab player lookup failed: {exc}"
             logger.warning("Jeab player lookup crashed for player %s: %s", player_id, exc, exc_info=True)
 
-        return None, self.player_lookup_failure_result(player, lookup_error)
+        return None, self.player_lookup_failure_result(player, lookup_error, unavailable=unavailable)
+
+    @staticmethod
+    def _lookup_service_failed(response: Any) -> bool:
+        """Whether a failed Data API answer means an outage (network, gateway, 429, 5xx)."""
+        if not isinstance(response, dict):
+            return True
+        if str(response.get("error_code") or "").upper() in _LOOKUP_OUTAGE_ERROR_CODES:
+            return True
+        status = response.get("status_code")
+        return isinstance(status, int) and (status == 429 or 500 <= status < 600)
 
     async def resolve_redemption_player(
         self, player: Any
@@ -583,7 +655,8 @@ class GiftRedemptionService:
                 "player_name": resolved_name,
                 "kingdom": resolved_kingdom,
                 "castle_level": resolved_level,
-                "added_by_user_id": added_by_user_id,
+                # No owner: redemption only refreshes existing profiles. A profile
+                # removed while the run was going must not be recreated.
             }
         ]
         if resolved_player_id != str(player_id):
@@ -805,6 +878,14 @@ class GiftRedemptionService:
                     player.player_id,
                     refresh_failure.get("message") if refresh_failure else "unknown error",
                 )
+                if refresh_failure and refresh_failure.get("lookup_unavailable"):
+                    # The new kingdom could not be looked up, so this is not final:
+                    # a later pass refreshes the kingdom and tries again.
+                    result = {
+                        **result,
+                        "error_code": "KINGDOM_REFRESH_UNAVAILABLE",
+                        "message": "The kingdom did not match and could not be refreshed right now.",
+                    }
 
         return {
             "player_id": str(player.player_id),
@@ -955,6 +1036,7 @@ class GiftRedemptionService:
             )
 
         if global_error is None and not transient_probe:
+            consecutive_transient = 0
             while next_pending_index < len(pending) and not stopped():
                 batch = pending[next_pending_index : next_pending_index + self.REDEEM_CONCURRENCY]
                 batch_results = await asyncio.gather(*(redeem_and_report(item) for item in batch))
@@ -964,6 +1046,22 @@ class GiftRedemptionService:
                     None,
                 )
                 if global_error is not None:
+                    break
+                if all(is_retryable_result(result) for _, result in batch_results):
+                    consecutive_transient += len(batch_results)
+                else:
+                    consecutive_transient = 0
+                if stop_on_transient_probe and consecutive_transient >= self.TRANSIENT_ABORT_AFTER:
+                    # An outage or rate-limit storm began mid-run. Each further player
+                    # would wait through every retry (about a minute each), so end the
+                    # pass; the caller retries the unreached players later.
+                    logger.warning(
+                        "Ending the pass for code '%s' after %s temporary failures in a row; %s players stay "
+                        "unattempted",
+                        gift_code,
+                        consecutive_transient,
+                        len(pending) - next_pending_index,
+                    )
                     break
 
         if global_error is not None and next_pending_index < len(pending):
@@ -986,6 +1084,58 @@ class GiftRedemptionService:
 
         await report("Finishing")
         return [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+
+    async def probe_code(
+        self,
+        *,
+        gift_code: str,
+        player: Any,
+        actor_user_id: int,
+        guild_id: int | None,
+        channel_id: int | None,
+    ) -> dict[str, Any]:
+        """Redeem ``gift_code`` for one player and save the result (code validation)."""
+        try:
+            player_id_int = int(str(player.player_id))
+        except ValueError:
+            return self.invalid_player_id_result(player)
+
+        async def no_wait(_player_id: str, _delay: float) -> None:
+            return None
+
+        result = await self._redeem_player(
+            player, player_id_int, gift_code, rate_limit_wait=no_wait, stop_event=None
+        )
+        try:
+            await self.persist_results(
+                gift_code=gift_code,
+                results=[result],
+                actor_user_id=actor_user_id,
+                guild_id=guild_id,
+                channel_id=channel_id,
+            )
+        except Exception:
+            logger.exception("Could not save the probe result of player %s for '%s'", player.player_id, gift_code)
+        return result
+
+    async def find_broken_players(
+        self,
+        players: Sequence[Any],
+        *,
+        current_code: str | None = None,
+        code_limit: int = 5,
+        min_failures: int = 3,
+    ) -> list[FailingPlayer]:
+        """Accounts among ``players`` that failed as invalid on the latest codes."""
+        if not players:
+            return []
+        codes = [str(code.code) for code in await self._gift_code_service.get_recent_gift_codes(code_limit)]
+        if current_code is not None and current_code not in codes:
+            codes.insert(0, current_code)
+        rows = await self._gift_code_service.get_redemption_rows(
+            codes, [str(player.player_id) for player in players]
+        )
+        return find_broken_players(codes, players, rows, current_code=current_code, min_failures=min_failures)
 
     # ----------------------------------------------------------- roster health
 

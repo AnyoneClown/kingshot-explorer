@@ -2,7 +2,6 @@
 
 import logging
 import os
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -33,7 +32,7 @@ def setup_logging(log_level: str = "INFO") -> None:
     log_dir = Path("logs")
     try:
         log_dir.mkdir(exist_ok=True)
-    except PermissionError as e:
+    except OSError as e:  # no permission, read-only filesystem, or "logs" is a file
         print(f"Warning: Cannot create logs directory: {e}")
         print("Logging to console only")
         log_dir = None
@@ -64,14 +63,17 @@ def setup_logging(log_level: str = "INFO") -> None:
     # File handler with rotation (10MB max, keep 5 backup files) - only if we can create the directory
     if log_dir:
         try:
-            log_file = log_dir / f"{context_filter.bot_instance}_{datetime.now().strftime('%Y%m%d')}.log"
+            # One fixed name, so rotation caps the directory at ~60 MB. A date in the
+            # name started a new, never-pruned file family after every restart.
+            log_file = log_dir / f"{context_filter.bot_instance}.log"
             file_handler = RotatingFileHandler(
                 log_file,
                 maxBytes=10 * 1024 * 1024,  # 10 MB
                 backupCount=5,
                 encoding="utf-8",
             )
-            file_handler.setLevel(logging.DEBUG)  # Log everything to file
+            # The root logger's level (LOG_LEVEL) decides what reaches the file.
+            file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(detailed_formatter)
             file_handler.addFilter(context_filter)
             root_logger.addHandler(file_handler)

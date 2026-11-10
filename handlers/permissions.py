@@ -18,6 +18,7 @@ The runtime check below always runs, so hiding is a convenience, not the guard.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Iterable
 
@@ -27,6 +28,8 @@ from discord import app_commands
 from handlers.ui import EmbedColors
 
 logger = logging.getLogger(__name__)
+
+MANAGER_ROLE_LOOKUP_TIMEOUT_SECONDS = 2.0
 
 # Hide manager commands from members by default (runtime checks still apply).
 manager_only_command = app_commands.default_permissions(manage_guild=True)
@@ -93,7 +96,10 @@ class AccessPolicy:
         try:
             service = self._guild_configuration_service
             loader = getattr(service, "get_settings", None) or service.get_or_create_for_guild
-            settings = await loader(guild_id)
+            # Bounded: this runs before many interactions are acknowledged (3-second
+            # deadline). A slow database must cost the manager role for a moment, not
+            # make every command fail with "The application did not respond".
+            settings = await asyncio.wait_for(loader(guild_id), timeout=MANAGER_ROLE_LOOKUP_TIMEOUT_SECONDS)
         except Exception:
             logger.warning("Could not load manager role for guild %s", guild_id, exc_info=True)
             return None

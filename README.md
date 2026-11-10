@@ -5,10 +5,15 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 ## Features
 
 - Slash commands with interactive Discord panels and a private `/help` guide.
+- A permanent gift-code panel (`/giftpanel`) with buttons: members add their Governor
+  ID, check their accounts, copy active codes and send in codes the bot has not found
+  yet, without knowing any command.
 - Multi-server ready: per-server settings in `/configure` (gift-code and alliance report
   channels, bot manager role) and per-server gift-code rosters.
 - Auto-translation and manual translation features that keep mentions, emoji, links and
   line breaks intact, skip text that needs no translation, and cache repeated messages.
+  Right-click a message → **Apps → Translate** shows a private translation in the
+  reader's own Discord language.
 - NVIDIA NIM powered translation plus contextual chat replies. Mentioning the bot can
   answer questions from this server's data (alliance power, reminders, active gift codes,
   a Governor ID lookup, the Kingshot knowledge base) through read-only tools.
@@ -18,8 +23,9 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 - Gift code polling and auto-redemption for registered players.
 - Searchable player lists with enabled/disabled filters and direct profile lookup.
 - Single-message scout reports and paginated KVK history with comparison actions.
-- Daily alliance and member power snapshots with daily and weekly trend reports, roster
-  changes (joined / left / renamed), a "possibly inactive" view and an optional daily report post.
+- Daily alliance and member power snapshots with daily and weekly trend reports, top
+  gainers of the day and week, a trend line, roster changes (joined / left / renamed),
+  a "possibly inactive" view and an optional daily report post.
 - Live manual-redemption progress with compact results and browsable failure details.
 - Timezone-aware event forms, save previews, and edit/cancel controls.
 - Unified player profile storage in a single players table.
@@ -43,6 +49,15 @@ Gift code support includes:
   players recent codes reached, and players whose redemptions keep failing permanently,
   with a one-click **Disable these**.
 - Polling the upstream gift code source every minute (with back-off on network errors).
+  Discovery runs independently of redemption, so a new code is recorded even while
+  another code is being redeemed. Members can also send in a code with `/submitcode`
+  (or **Submit a code** on the panel): it is checked with one account (the member's own
+  when they have one) and, if it works, queued for everyone; one submission per member
+  per minute.
+- Members' own accounts go first: a run redeems self-registered accounts (owners with
+  at most `MAX_SELF_REGISTERED_PLAYERS` entries in a server), then the rest of the
+  server rosters, then unassigned legacy profiles. The gift-code server allows about 30
+  requests a minute, so 1,000 accounts take roughly 40 minutes.
 - Auto-redeeming new codes for every enabled profile that is enabled in at least one
   server roster. Profiles created before per-server rosters ("unassigned legacy") keep
   being redeemed until a bot operator assigns them to a server (**Assign unassigned
@@ -52,15 +67,29 @@ Gift code support includes:
   already handled. A restart or deploy mid-run therefore continues where it stopped.
   Auto runs skip players with final failures for the code (invalid ID, kingdom mismatch,
   level or spend requirement); manual runs skip only players who already have it.
-  Temporary failures (outage, rate limit, 5xx) are not final: an auto pass whose probe
-  fails temporarily stops at once, and a pass that ends with temporary failures keeps
-  the code pending and retries just those players after 15 minutes (up to 6 passes, or
-  until the code expires). `/redeem` is refused while the bot is shutting down.
+  Temporary failures (outage, rate limit, HTTP 5xx, an unreachable player lookup) are
+  not final: an auto pass whose probe fails temporarily stops at once, a pass that meets
+  six temporary failures in a row ends early, and a pass that ends with temporary
+  failures keeps the code pending and retries just those players after 15 minutes (up
+  to 6 passes, or until the code expires). A pass that could not reach everyone does not
+  count toward those 6: the code stays pending until it expires, or for 72 hours when
+  it has no expiry date. `/redeem` is refused while the bot is shutting down.
+- Accounts that keep failing are paused. After a completed run, an account whose
+  Governor ID or kingdom was rejected on at least 3 of the last 5 codes (including the
+  current one) and that none of them reached is disabled: its roster entry in every
+  server, or the profile itself when it is unassigned. The server's gift-code channel
+  and the bot operators (by DM) get the list; a manager or the owner re-enables an
+  entry in `/listplayers` after fixing the ID.
 - One job per code: automatic and manual runs share a guard, so a code is never
   redeemed twice concurrently; each server can run one manual job at a time.
 - Posting summary embeds when at least one auto-redemption succeeds: each server's
   summary (its own players only) goes to the gift-code channel set in `/configure`, and
-  the legacy `AUTO_REDEEM_CHANNELS` receive the global summary.
+  the legacy `AUTO_REDEEM_CHANNELS` receive the global summary (a legacy channel that a
+  server also chose in `/configure` gets only that server's summary). While at least a
+  minute of a run is left, the same message is posted early as "New Gift Code —
+  Redeeming…" with the code, its expiry, progress and how to claim it by hand; it is
+  refreshed about once a minute and becomes the summary. Message IDs are stored, so a
+  restart edits the message instead of posting a second one.
 
 The redemption summary separates outcomes by category (Success, Already redeemed, API
 rejected, Invalid ID) using one label map everywhere.
@@ -157,7 +186,10 @@ Docker uses one Compose file with two services:
   gracefully on `docker stop` (SIGTERM, 30 s grace period): background jobs stop,
   gift-code progress is saved and connections close.
 
-Container logs are rotated by Docker (`json-file`, 10 MB × 3 files per container).
+Container logs are rotated by Docker (`json-file`, 10 MB × 3 files per container) and
+start empty whenever the container is recreated. The bot also writes a rotating file
+log (`/app/logs/<instance>.log`, 10 MB × 6 files) to the `bot-logs` volume, which
+survives rebuilds: `docker compose exec translator-bot-local tail -n 200 /app/logs/local.log`.
 
 Create the real env file from the committed example:
 
@@ -207,6 +239,12 @@ Gift code related commands include:
 - `/removeplayer player_id:<id>` removes an entry from this server's roster after confirmation.
 - `/listplayers` (alias `/playerlist`) browses this server's roster.
 - `/giftcodes` lists active codes as copyable lines.
+- `/myaccounts` privately shows the caller's own accounts in this server, whether each
+  is receiving codes, and the result of the three latest codes.
+- `/submitcode code:<code>` sends in a code the bot has not found yet (see Gift Code Flow).
+- `/giftpanel` (managers) posts the permanent panel with **Add my ID**, **My accounts**,
+  **Active codes** and **Submit a code** buttons; the buttons keep working after
+  restarts. If the server has no gift-code channel yet, the panel's channel becomes it.
 
 Gift-code redemption normally uses each Governor ID's kingdom cached in the database.
 If Century Games rejects that player/kingdom pair after a transfer, the bot refreshes the
@@ -223,15 +261,21 @@ channel message shows a progress bar, processed players, outcome counts, an ETA 
 **Cancel** button (requester or managers), then becomes the final summary, independent
 of Discord's interaction webhook lifetime; a separate short message pings the requester
 when the job finishes. Failed and
-skipped players can be inspected with the Details button. An already-claimed code
+skipped players can be inspected with the Details button for six hours (by the requester
+and server managers). `/redeem` is refused in a channel where the bot cannot post the
+progress card. An already-claimed code
 is reported as already claimed, not as a failed redemption.
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
 - `/configure` is the server managers' settings panel: gift-code announcement channel,
   alliance report channel, bot manager role (only members with Manage Server can change
-  it), voice replies and AI replies. It warns when the bot cannot post in a chosen channel.
-  When the bot joins a server it posts a short hint to run `/configure`.
+  it), voice replies and AI replies. The menus show the saved values, and the panel
+  says which channels are still missing. It warns when the bot cannot post in a chosen
+  channel. Managers are also offered a one-click **use this channel** prompt where it
+  matters: after `/addplayer` and `/addalliance` (gift-code channel) and when opening
+  `/alliance` (report channel; the latest report is posted at once).
+  When the bot joins a server it posts a short hint to run `/giftpanel` and `/configure`.
 - `/stats` shows a player's profile with a hero card (portraits, stars, levels) and a
   governor gear strip (equipment with its charms; "Equipment hidden" when the player
   hides it). Lookups use the KingShot Data API; when it is unavailable the bot says so
@@ -244,12 +288,17 @@ Additional commands are provided by translation, event, player info, KVK, and da
   top players by power and kills, and KvK records. Sections that fail show as
   unavailable; results are cached for 10 minutes.
 - `/status` returns a private health summary for Discord, the database, KingShot Data
-  API, and background workers, including reminder delivery stats. Deployment details
-  (model names, server count) are shown to bot operators only.
+  API, and background workers, including reminder delivery stats and the most used
+  commands of the last 30 days (this server; all servers for bot operators). Deployment
+  details (model names, server count) and scheduler error text are shown to bot
+  operators only. Usage is stored as one counter per command, server and UTC day
+  (`command_usage_daily`, kept 180 days), without user data.
 - `/alliance` shows this server's tracked alliance power trends. A server manager
   starts tracking with `/alliance kid:830 alliance:<selection>` using native autocomplete
   or an exact 3-character tag. Each server tracks one alliance; selecting another replaces
-  that server's selection. **Members** opens paginated individual power changes,
+  that server's selection. **Members** opens a compact paginated list (power, day and week change per member);
+  **Sort** switches between power, daily growth and weekly growth. The summary and the
+  daily report show the top five gainers of the day and of the week and a trend line.
   **Changes** lists who joined, left or was renamed between the two latest complete
   snapshots, and **Inactive** (managers) lists members whose power has not changed for
   7 or 14 days — only a hint, since maxed players also stop growing. **Stop tracking**
@@ -293,6 +342,8 @@ docker compose up -d translator-bot-local
   **Enable/Disable**, and (managers) **Roster health**.
   `/giftcodes` lists active codes as copyable lines with a note on redeeming them on the
   website; server managers also get **Redeem selected code**.
+- `/schedule` refuses a channel where the bot cannot post, and the preview warns when
+  the bot lacks **Mention @everyone** there (the reminder would be posted without a ping).
 - `/schedule` without arguments opens a form. Enter the event date/time, an IANA
   timezone such as `Europe/Kyiv`, the message, reminder lead time, and optional repeat
   interval. Slash-command arguments remain available, with `time_zone` defaulting to

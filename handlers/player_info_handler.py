@@ -44,8 +44,14 @@ class ScoutReportView(OwnedView):
         return True
 
     def _update_controls(self):
-        self.previous_button.disabled = self.current_player == 0
-        self.next_button.disabled = self.current_player == len(self.entries) - 1
+        if self.showing_summary:
+            # From the summary, Next opens the current player (the top one on a fresh
+            # report) instead of skipping it.
+            self.previous_button.disabled = True
+            self.next_button.disabled = not self.entries
+        else:
+            self.previous_button.disabled = self.current_player == 0
+            self.next_button.disabled = self.current_player == len(self.entries) - 1
         self.summary_button.disabled = self.showing_summary
         self.player_select.options = []
         for index, entry in enumerate(self.entries):
@@ -111,12 +117,14 @@ class ScoutReportView(OwnedView):
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_player = max(0, self.current_player - 1)
+        if not self.showing_summary:
+            self.current_player = max(0, self.current_player - 1)
         await self._show_player(interaction)
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_player = min(len(self.entries) - 1, self.current_player + 1)
+        if not self.showing_summary:
+            self.current_player = min(len(self.entries) - 1, self.current_player + 1)
         await self._show_player(interaction)
 
     @discord.ui.button(label="Summary", style=discord.ButtonStyle.secondary, row=1)
@@ -128,6 +136,10 @@ class ScoutReportView(OwnedView):
 
 class PlayerInfoHandler:
     """Handles player info Discord commands."""
+
+    # The Data API gateway intermittently returns a null-filled profile.
+    EMPTY_PROFILE_ATTEMPTS = 3
+    EMPTY_PROFILE_RETRY_SECONDS = 0.5
 
     # Static artwork used by the player card; tests point this at temporary folders.
     ASSET_DIRS = card_renderer.AssetDirs()
@@ -446,7 +458,9 @@ class PlayerInfoHandler:
         uid = self._extract_player_uid(entry, None)
         fid = self._extract_entry_fid(entry)
         profile = await self._get_kingshot_data_player(str(fid) if fid is not None else None, uid=uid)
-        entry["player"] = profile
+        if profile is not None:
+            # A failed lookup is not remembered, so opening the player again retries it.
+            entry["player"] = profile
         return profile
 
     @staticmethod
@@ -459,20 +473,27 @@ class PlayerInfoHandler:
         if player_data is not None or self._kingshot_data_service is None:
             return player_data
 
-        result = await self._kingshot_data_service.get_player(player_id)
-        if not result.get("success"):
-            raise PlayerInfoUnavailableError(
-                result.get("error_message") or "KingShot Data API UID lookup failed"
-            )
+        profile: Any = None
+        for attempt in range(self.EMPTY_PROFILE_ATTEMPTS):
+            result = await self._kingshot_data_service.get_player(player_id)
+            if not result.get("success"):
+                raise PlayerInfoUnavailableError(
+                    result.get("error_message") or "KingShot Data API UID lookup failed"
+                )
 
-        profile = result.get("data")
-        if not isinstance(profile, dict):
-            raise PlayerInfoUnavailableError("KingShot Data API returned an invalid player profile")
-        if profile.get("error") == "uid not found":
-            return None
-        if profile.get("error"):
-            raise PlayerInfoUnavailableError(str(profile["error"]))
-        # Unknown UIDs return an empty profile with no Governor ID.
+            profile = result.get("data")
+            if not isinstance(profile, dict):
+                raise PlayerInfoUnavailableError("KingShot Data API returned an invalid player profile")
+            if profile.get("error") == "uid not found":
+                return None
+            if profile.get("error"):
+                raise PlayerInfoUnavailableError(str(profile["error"]))
+            if profile.get("fid"):
+                break
+            # The gateway sometimes answers a valid UID with a null-filled profile, which
+            # looks the same as an unknown UID: ask again before saying "not found".
+            if attempt + 1 < self.EMPTY_PROFILE_ATTEMPTS:
+                await asyncio.sleep(self.EMPTY_PROFILE_RETRY_SECONDS)
         if not profile.get("fid"):
             return None
         if not profile.get("uid"):
@@ -493,26 +514,39 @@ class PlayerInfoHandler:
         if self._kingshot_data_service is None or not (uid or player_id):
             return None
 
-        try:
-            result = (
-                await self._kingshot_data_service.get_player(uid)
-                if uid else await self._kingshot_data_service.get_player_by_fid(player_id)
-            )
-        except Exception:
-            logger.warning("KingShot Data enrichment failed for player %s", uid or player_id, exc_info=True)
-            return None
-        if not result.get("success"):
-            logger.warning(
-                "KingShot Data enrichment failed for player %s: %s",
-                uid or player_id,
-                result.get("error_message") or result.get("error_code"),
-            )
-            return None
+        for attempt in range(self.EMPTY_PROFILE_ATTEMPTS):
+            try:
+                result = (
+                    await self._kingshot_data_service.get_player(uid)
+                    if uid else await self._kingshot_data_service.get_player_by_fid(player_id)
+                )
+            except Exception:
+                logger.warning("KingShot Data enrichment failed for player %s", uid or player_id, exc_info=True)
+                return None
+            if not result.get("success"):
+                logger.warning(
+                    "KingShot Data enrichment failed for player %s: %s",
+                    uid or player_id,
+                    result.get("error_message") or result.get("error_code"),
+                )
+                return None
 
-        data = result.get("data")
-        if isinstance(data, dict) and not data.get("error"):
-            return data
+            data = result.get("data")
+            if not isinstance(data, dict) or data.get("error"):
+                return None
+            if not self._is_null_profile(data):
+                return data
+            # The gateway's intermittent null-filled answer (only the uid is set). Showing
+            # it would print "Unavailable" everywhere, so retry and otherwise report no
+            # profile; callers then fall back to what they already know.
+            if attempt + 1 < self.EMPTY_PROFILE_ATTEMPTS:
+                await asyncio.sleep(self.EMPTY_PROFILE_RETRY_SECONDS)
+        logger.warning("KingShot Data returned an empty profile for player %s", uid or player_id)
         return None
+
+    @staticmethod
+    def _is_null_profile(profile: dict[str, Any]) -> bool:
+        return all(profile.get(key) in (None, "") for key in ("name", "fid", "power", "kid"))
 
     async def _get_mystic_trial(
         self,

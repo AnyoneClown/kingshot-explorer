@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Iterable, Iterator, Optional, Sequence, Set
 
 from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
+    CommandUsageDaily,
     GiftCode,
+    GiftCodeAnnouncement,
     GiftCodeRedemption,
     GuildConfiguration,
     GuildPlayerRegistration,
@@ -721,6 +723,41 @@ class GuildPlayerRegistrationRepository:
         )
         return list(result.scalars().all())
 
+    async def list_enabled_owners(self) -> list[tuple[str, int, int]]:
+        """``(player_id, guild_id, added_by_user_id)`` of every enabled roster entry."""
+        result = await self._session.execute(
+            select(
+                GuildPlayerRegistration.player_id,
+                GuildPlayerRegistration.guild_id,
+                GuildPlayerRegistration.added_by_user_id,
+            ).where(GuildPlayerRegistration.enabled.is_(True))
+        )
+        return [(str(player_id), int(guild_id), int(owner_id)) for player_id, guild_id, owner_id in result.all()]
+
+    async def list_owned(self, guild_id: int, added_by_user_id: int) -> list[tuple[GuildPlayerRegistration, RegisteredPlayer]]:
+        """One member's entries in a server roster."""
+        result = await self._session.execute(
+            select(GuildPlayerRegistration, RegisteredPlayer)
+            .join(RegisteredPlayer, RegisteredPlayer.player_id == GuildPlayerRegistration.player_id)
+            .where(GuildPlayerRegistration.guild_id == guild_id)
+            .where(GuildPlayerRegistration.added_by_user_id == added_by_user_id)
+            .order_by(RegisteredPlayer.player_id)
+        )
+        return [(registration, player) for registration, player in result.all()]
+
+    async def disable_everywhere(self, player_ids: Sequence[str]) -> int:
+        """Disable these players' entries in every server roster; returns rows changed."""
+        changed = 0
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                update(GuildPlayerRegistration)
+                .where(GuildPlayerRegistration.player_id.in_(chunk))
+                .where(GuildPlayerRegistration.enabled.is_(True))
+                .values(enabled=False)
+            )
+            changed += int(result.rowcount or 0)
+        return changed
+
     async def enabled_guilds_by_player(self, player_ids: Sequence[str]) -> dict[str, set[int]]:
         guilds: dict[str, set[int]] = {}
         for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
@@ -756,16 +793,19 @@ class GiftCodeRepository:
         expires_at: Optional[datetime] = None,
     ) -> tuple[bool, GiftCode]:
         """Track a code from the upstream list; new codes start ``pending`` auto-redemption."""
-        existing_code = await self.get(code_id)
-        if existing_code is None:
-            # The upstream list occasionally re-issues a known code under a new ID; the
-            # code string is unique, so treat it as the same code instead of failing.
-            existing_code = await self.get_by_code(code)
+        # The code text identifies a code. The upstream list occasionally re-issues a
+        # known code under a new ID, and may reuse an ID for a different code.
+        existing_code = await self.get_by_code(code)
         if existing_code:
             existing_code.expires_at = expires_at
             await self._session.flush()
             logger.debug("Updated existing gift code %s (ID: %s)", code, code_id)
             return False, existing_code
+        if await self.get(code_id) is not None:
+            # The ID belongs to another code already: store this one under a local ID
+            # (negative, like member-submitted codes) instead of dropping it.
+            logger.warning("Upstream gift code ID %s was reused for a new code %s", code_id, code)
+            code_id = -int(datetime.now(timezone.utc).timestamp() * 1000)
 
         new_code = GiftCode(
             id=code_id,
@@ -779,6 +819,28 @@ class GiftCodeRepository:
         self._session.add(new_code)
         logger.info("Added new tracked gift code: %s (ID: %s)", code, code_id)
         await self._session.flush()
+        return True, new_code
+
+    async def add_submitted(self, code: str, submitted_at: datetime | None = None) -> tuple[bool, GiftCode]:
+        """Track a code a member submitted before the upstream list published it.
+
+        Submitted codes get a negative ID (the upstream list uses positive ones); when
+        the list later publishes the same code, ``add_or_update`` finds it by its text.
+        """
+        existing_code = await self.get_by_code(code)
+        if existing_code is not None:
+            return False, existing_code
+        submitted_at = submitted_at or datetime.now(timezone.utc)
+        new_code = GiftCode(
+            id=-int(submitted_at.timestamp() * 1000),
+            code=code,
+            expires_at=None,
+            created_at_api=submitted_at,
+            auto_redeem_status=AUTO_REDEEM_PENDING,
+        )
+        self._session.add(new_code)
+        await self._session.flush()
+        logger.info("Added member-submitted gift code: %s", code)
         return True, new_code
 
     async def list_all(self):
@@ -924,3 +986,78 @@ class GiftCodeRedemptionRepository:
             )
         )
         return set(result.scalars().all())
+
+
+class GiftCodeAnnouncementRepository:
+    """Announcement messages already posted for a gift code, by channel."""
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def for_code(self, gift_code: str) -> dict[int, int]:
+        result = await self._session.execute(
+            select(GiftCodeAnnouncement.channel_id, GiftCodeAnnouncement.message_id).where(
+                GiftCodeAnnouncement.gift_code == gift_code
+            )
+        )
+        return {int(channel_id): int(message_id) for channel_id, message_id in result.all()}
+
+    async def save(self, gift_code: str, channel_id: int, message_id: int) -> None:
+        result = await self._session.execute(
+            select(GiftCodeAnnouncement)
+            .where(GiftCodeAnnouncement.gift_code == gift_code)
+            .where(GiftCodeAnnouncement.channel_id == channel_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            self._session.add(GiftCodeAnnouncement(gift_code=gift_code, channel_id=channel_id, message_id=message_id))
+        else:
+            row.message_id = message_id
+        await self._session.flush()
+
+    async def delete_older_than(self, cutoff: datetime) -> int:
+        result = await self._session.execute(
+            delete(GiftCodeAnnouncement).where(GiftCodeAnnouncement.created_at < cutoff)
+        )
+        return int(result.rowcount or 0)
+
+
+class CommandUsageRepository:
+    """Per-day command counters."""
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def add(self, usage_date: date, guild_id: int, command_name: str, uses: int) -> None:
+        result = await self._session.execute(
+            select(CommandUsageDaily)
+            .where(CommandUsageDaily.usage_date == usage_date)
+            .where(CommandUsageDaily.guild_id == guild_id)
+            .where(CommandUsageDaily.command_name == command_name)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            self._session.add(
+                CommandUsageDaily(usage_date=usage_date, guild_id=guild_id, command_name=command_name, uses=uses)
+            )
+        else:
+            row.uses = int(row.uses or 0) + uses
+        await self._session.flush()
+
+    async def totals_since(self, since: date, *, guild_id: int | None = None) -> list[tuple[str, int]]:
+        """``(command_name, uses)`` since ``since`` (inclusive), most used first."""
+        total = func.sum(CommandUsageDaily.uses)
+        query = (
+            select(CommandUsageDaily.command_name, total)
+            .where(CommandUsageDaily.usage_date >= since)
+            .group_by(CommandUsageDaily.command_name)
+            .order_by(total.desc(), CommandUsageDaily.command_name)
+        )
+        if guild_id is not None:
+            query = query.where(CommandUsageDaily.guild_id == guild_id)
+        result = await self._session.execute(query)
+        return [(str(name), int(uses or 0)) for name, uses in result.all()]
+
+    async def delete_older_than(self, cutoff: date) -> int:
+        result = await self._session.execute(delete(CommandUsageDaily).where(CommandUsageDaily.usage_date < cutoff))
+        return int(result.rowcount or 0)

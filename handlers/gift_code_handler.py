@@ -18,10 +18,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from config.bot_config import BotConfig
+from handlers.gift_panel import GiftPanelView, build_panel_embed
 from handlers.permissions import AccessPolicy, interaction_guild_id, manager_only_command, send_denied
+from handlers.setup_prompts import bot_can_post, is_announcement_target, offer_channel_setup
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 from services.gift_code_service import IGiftCodeService
 from services.gift_redemption_service import (
+    ALREADY_REDEEMED_ERROR_CODES,
     JOB_AUTO,
     JOB_MANUAL,
     STATUS_ALREADY_REDEEMED,
@@ -62,6 +65,17 @@ EMBED_LIST_LIMIT = 500
 ALLIANCE_LOADING_VALUE = "__loading__"
 MAX_IDS_PER_ADDPLAYER = 50
 GIFT_CODE_PATTERN = re.compile(r"^[^\s`@<>]{1,64}$")
+# A probe that fails with one of these still proves the code itself exists.
+CODE_VALID_ERROR_CODES = frozenset({"CASTLE_LEVEL_TOO_LOW", "SPEND_REQUIREMENT_NOT_MET", "VIP_REQUIREMENT_NOT_MET"})
+JOB_PROBE = "probe"
+ACCOUNT_ERROR_HINTS = {
+    "KINGDOM_MISMATCH": "kingdom does not match",
+    "INVALID_PLAYER_ID": "Governor ID not found",
+    "INVALID_USER_ID": "Governor ID not found",
+    "CASTLE_LEVEL_TOO_LOW": "Town Center level too low",
+    "SPEND_REQUIREMENT_NOT_MET": "spending requirement not met",
+    "VIP_REQUIREMENT_NOT_MET": "VIP requirement not met",
+}
 REDEEM_HOW_TO = (
     f"To claim a code yourself, enter your Governor ID and the code at <{GIFT_CODE_SITE}>; "
     "rewards arrive in your in-game mail."
@@ -486,13 +500,41 @@ class RedemptionProgressView(discord.ui.View):
 class RedemptionResultsView(OwnedView):
     PAGE_SIZE = 4
 
-    def __init__(self, summary: discord.Embed, issues: list[dict], author_id: int):
-        super().__init__(author_id)
+    def __init__(
+        self,
+        summary: discord.Embed,
+        issues: list[dict],
+        author_id: int,
+        *,
+        access_policy: AccessPolicy | None = None,
+        timeout: float = 180.0,
+        all_servers: bool = False,
+    ):
+        super().__init__(author_id, timeout=timeout)
+        self._access = access_policy
+        self._all_servers = all_servers
         self.summary = summary
         self.issues = issues
         self.current_page = 0
         self.expanded = False
         self.refresh()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """The requester and server managers may browse the failures of a job."""
+        if interaction.user.id == self.author_id:
+            return True
+        if self._access is not None:
+            # An all-servers run lists players of every server: operators only.
+            if self._all_servers:
+                allowed = self._access.is_super_admin(interaction.user.id)
+            else:
+                allowed = await self._access.can_manage(interaction)
+            if allowed:
+                return True
+        await interaction.response.send_message(
+            "Only the person who started this job or a server manager can open its details.", ephemeral=True
+        )
+        return False
 
     def refresh(self):
         self.details_button.label = "Back to summary" if self.expanded else f"Details ({len(self.issues)})"
@@ -554,7 +596,26 @@ class GiftCodeHandler:
     # and retry the unsettled players later, up to this many passes per code.
     AUTO_RETRY_AFTER_TRANSIENT_SECONDS = 15 * 60
     MAX_AUTO_TRANSIENT_PASSES = 6
+    # A code without an expiry date is abandoned after this long if the gift-code
+    # server never lets a pass through.
+    MAX_AUTO_PENDING_HOURS = 72
+    # How long the Details button of a finished manual run keeps working.
+    RESULT_DETAILS_TIMEOUT_SECONDS = 6 * 3600.0
     ROSTER_HEALTH_CODES = 5
+    # A running automatic redemption keeps one announcement per channel up to date.
+    # It is posted only while enough of the run is left for the news to matter.
+    LIVE_ANNOUNCE_INTERVAL_SECONDS = 60.0
+    LIVE_ANNOUNCE_MIN_REMAINING_SECONDS = 60.0
+    # Accounts that failed as invalid on this many of the latest codes are paused.
+    AUTO_DISABLE_CODES = 5
+    AUTO_DISABLE_MIN_FAILURES = 3
+    # Member code submissions: each one costs a request to the gift-code server.
+    SUBMIT_USER_COOLDOWN_SECONDS = 60.0
+    SUBMIT_USER_MAX_PER_HOUR = 5
+    SUBMIT_GUILD_MAX_PER_HOUR = 10
+    SUBMIT_MAX_PER_HOUR = 40
+    MY_ACCOUNTS_CODES = 3
+    MY_ACCOUNTS_LISTED = 10
 
     def __init__(
         self,
@@ -597,6 +658,13 @@ class GiftCodeHandler:
         # Summaries already posted for a code that is still retrying, by channel ID, so
         # later passes edit them instead of posting a second summary.
         self._auto_announcements: dict[str, dict[int, Any]] = {}
+        # Codes whose stored announcement messages were already loaded from the database.
+        self._announcements_loaded: set[str] = set()
+        # Runs pending codes, so the one-minute discovery loop never waits for a run.
+        self._pending_worker: asyncio.Task | None = None
+        self._submit_cooldowns: dict[int, float] = {}
+        self._submit_times: list[tuple[float, int, int | None]] = []
+        self._persistent_views_registered = False
         self._mightpulse_service = mightpulse_service
         self._alliance_directory_service = alliance_directory_service
         self._polling_loop = None
@@ -645,6 +713,10 @@ class GiftCodeHandler:
         await self._jobs.shutdown(grace_seconds=self.SHUTDOWN_GRACE_SECONDS)
         if self._polling_loop is not None and self._polling_loop.is_running():
             self._polling_loop.cancel()
+        worker = self._pending_worker
+        if worker is not None and not worker.done():
+            worker.cancel()
+            await asyncio.wait({worker}, timeout=2.0)
         for _, task in list(self._alliance_prewarm_tasks.values()):
             task.cancel()
 
@@ -741,6 +813,34 @@ class GiftCodeHandler:
             """List available gift codes from the API."""
             await self._handle_list_gift_codes_slash(interaction)
 
+        @self._bot.tree.command(name="myaccounts", description="Your accounts on this server's gift-code list")
+        @app_commands.guild_only()
+        async def my_accounts(interaction: discord.Interaction):
+            """Show the caller's own roster entries and their latest results."""
+            await self._handle_my_accounts(interaction)
+
+        @self._bot.tree.command(name="submitcode", description="Send in a gift code the bot has not found yet")
+        @app_commands.guild_only()
+        @app_commands.describe(code="The gift code, exactly as published")
+        async def submit_code(interaction: discord.Interaction, code: str):
+            """Validate a member-submitted code and queue it for everyone."""
+            await self._handle_submit_code(interaction, code)
+
+        @self._bot.tree.command(name="giftpanel", description="Post the gift-code panel with buttons in this channel")
+        @app_commands.guild_only()
+        @manager_only_command
+        async def gift_panel(interaction: discord.Interaction):
+            """Post the permanent gift-code panel."""
+            await self._handle_gift_panel(interaction)
+
+    def register_persistent_views(self) -> None:
+        """Make the buttons of gift-code panels posted earlier work again (call once, on ready)."""
+        add_view = getattr(self._bot, "add_view", None)
+        if self._persistent_views_registered or not callable(add_view):
+            return
+        add_view(GiftPanelView(self))
+        self._persistent_views_registered = True
+
     # -------------------------------------------------------------- polling
 
     def start_polling_task(self):
@@ -751,8 +851,13 @@ class GiftCodeHandler:
 
         @tasks.loop(minutes=1)
         async def poll_gift_codes():
-            """Discover new codes and run (or resume) their automatic redemption."""
-            await self._poll_gift_codes_once()
+            """Discover new codes every minute; redemption runs in its own task.
+
+            A run takes two seconds per player, so awaiting it here would stop
+            discovery (and the start of the next code) for the whole run.
+            """
+            await self._discover_gift_codes()
+            self._ensure_pending_worker()
 
         # Wait until bot is fully ready before running the loop
         @poll_gift_codes.before_loop
@@ -768,6 +873,19 @@ class GiftCodeHandler:
         return bool(self._polling_loop and self._polling_loop.is_running())
 
     async def _poll_gift_codes_once(self) -> None:
+        """Discover codes, then run every pending one to completion (one full cycle)."""
+        if self._closing:
+            return
+        await self._discover_gift_codes()
+        # Pending codes are in the database, so they resume even when the
+        # upstream list is temporarily unavailable.
+        try:
+            await self._process_pending_codes()
+        except Exception:
+            logger.exception("Error while processing pending gift codes")
+
+    async def _discover_gift_codes(self) -> None:
+        """Record codes from the upstream list; never raises (it runs inside the loop)."""
         if self._closing:
             return
         if not self._can_poll():
@@ -781,14 +899,28 @@ class GiftCodeHandler:
                     logger.info("Found %s new gift codes: %s", len(new_codes), ", ".join(new_codes))
             else:
                 logger.warning("Failed to poll gift codes: %s", response.get("message"))
-            # Pending codes are in the database, so they resume even when the
-            # upstream list is temporarily unavailable.
-            await self._process_pending_codes()
         except socket.gaierror as e:
             self._mark_poll_backoff(e)
             logger.error("Error in poll_gift_codes background task: %s", e, exc_info=True)
         except Exception:
             logger.exception("Error in poll_gift_codes background task")
+
+    def _ensure_pending_worker(self) -> None:
+        """Start the task that redeems pending codes unless it is already running."""
+        if self._closing:
+            return
+        worker = self._pending_worker
+        if worker is not None and not worker.done():
+            return
+        self._pending_worker = asyncio.create_task(self._run_pending_worker(), name="gift-code-pending-worker")
+
+    async def _run_pending_worker(self) -> None:
+        try:
+            await self._process_pending_codes()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error while processing pending gift codes")
 
     async def _record_discovered_codes(self, rows: Iterable[Any]) -> list[str]:
         """Store codes from the upstream list; new ones start as pending auto-redemption."""
@@ -839,6 +971,7 @@ class GiftCodeHandler:
                 if expires_at <= datetime.now(timezone.utc):
                     logger.info("Gift code '%s' expired before auto-redemption finished; marking it completed", code)
                     await self._gift_code_service.mark_gift_code_completed(code_row.id)
+                    await self._finish_expired_code(code_row)
                     continue
             retry_after = self._auto_retry_after.get(CodeJobGuard.key(code))
             if retry_after is not None and time.monotonic() < retry_after:
@@ -847,6 +980,43 @@ class GiftCodeHandler:
                 logger.info("Gift code '%s' is being redeemed by another job; auto-redemption resumes later", code)
                 continue
             await self._run_auto_redemption(code_row)
+
+    def _auto_pending_too_old(self, code_row: Any) -> bool:
+        """Whether a still-pending code was discovered more than MAX_AUTO_PENDING_HOURS ago."""
+        discovered_at = getattr(code_row, "discovered_at", None)
+        if not isinstance(discovered_at, datetime):
+            return False
+        if discovered_at.tzinfo is None:
+            discovered_at = discovered_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - discovered_at > timedelta(hours=self.MAX_AUTO_PENDING_HOURS)
+
+    async def _finish_expired_code(self, code_row: Any) -> None:
+        """Turn the announcements of a code that expired mid-retry into a final summary.
+
+        Without this they would say "retried automatically" (or "redeeming") forever.
+        """
+        code = str(code_row.code)
+        key = CodeJobGuard.key(code)
+        try:
+            if await self._load_announcements(code):
+                targets = await self._player_registry_service.get_auto_redeem_targets()
+                recorded = await self._redemption.load_recorded_outcomes(code)
+                actor_user_id = await self._ensure_bot_user()
+                results = [
+                    self._redemption.recorded_outcome_result(player, recorded[str(player.player_id)], actor_user_id)
+                    for player in targets
+                    if str(player.player_id) in recorded
+                ]
+                await self._announce_auto_redemption(
+                    code, results, final=True, note="The code expired before the remaining players could be retried."
+                )
+        except Exception:
+            logger.exception("Could not finalize the announcements of expired code '%s'", code)
+        finally:
+            self._auto_announcements.pop(key, None)
+            self._announcements_loaded.discard(key)
+            self._auto_retry_after.pop(key, None)
+            self._auto_transient_passes.pop(key, None)
 
     async def _ensure_bot_user(self) -> int:
         """The bot logs automatic attempts as itself (``users`` foreign key)."""
@@ -872,8 +1042,11 @@ class GiftCodeHandler:
         attached = False
         try:
             actor_user_id = await self._ensure_bot_user()
-            targets = await self._player_registry_service.get_auto_redeem_targets()
+            targets = await self._player_registry_service.get_auto_redeem_targets(
+                self_registered_max=self._max_self_registered
+            )
             job.total = len(targets)
+            expires_at = getattr(code_row, "expires_at", None)
             if not targets:
                 logger.info("No enabled players to auto-redeem '%s' for; marking it completed", code)
                 await self._gift_code_service.mark_gift_code_completed(code_row.id)
@@ -889,7 +1062,7 @@ class GiftCodeHandler:
                     actor_user_id=actor_user_id,
                     guild_id=None,
                     channel_id=None,
-                    progress=self._auto_progress_logger(code, len(targets)),
+                    progress=self._auto_progress(code, targets, expires_at, job),
                     stop_event=job.stop_event,
                     use_recorded_outcomes=True,
                     stop_on_transient_probe=True,
@@ -919,51 +1092,205 @@ class GiftCodeHandler:
             results = task.result()
             transient = [result for result in results if is_retryable_result(result)]
             globally_rejected = any(is_global_code_rejection(result) for result in results)
-            passes = self._auto_transient_passes.get(job.key, 0) + 1
-            if transient and not globally_rejected and passes < self.MAX_AUTO_TRANSIENT_PASSES:
+            # A pass that ended early (the gift-code server was down or rate limiting)
+            # leaves players without any result. Such a pass says nothing about them, so
+            # it does not count toward the pass limit: the code stays pending until it
+            # expires (or, without an expiry, for MAX_AUTO_PENDING_HOURS).
+            unreached = max(0, len(targets) - len(results))
+            # The same goes for a pass in which nobody was settled at all (for example
+            # a single remaining player during an outage): it proves nothing.
+            settled_any = any(
+                result.get("redemption_attempted") and not is_retryable_result(result) for result in results
+            )
+            outage_pass = unreached > 0 or (bool(transient) and not settled_any)
+            passes = self._auto_transient_passes.get(job.key, 0) + (0 if outage_pass else 1)
+            if outage_pass:
+                # A code with an expiry date is ended by its expiry (see
+                # _process_pending_codes); only codes without one need a time limit.
+                keep_pending = expires_at is not None or not self._auto_pending_too_old(code_row)
+            else:
+                keep_pending = bool(transient) and passes < self.MAX_AUTO_TRANSIENT_PASSES
+            keep_pending = keep_pending and not globally_rejected
+            if keep_pending:
                 # Temporary failures are not "settled", so the next pass retries exactly
                 # those players (and anyone not reached); don't complete the code yet.
                 self._auto_transient_passes[job.key] = passes
                 self._auto_retry_after[job.key] = time.monotonic() + self.AUTO_RETRY_AFTER_TRANSIENT_SECONDS
                 logger.warning(
-                    "Auto-redemption of '%s' pass %s/%s ended with %s temporary failures; "
-                    "it stays pending and retries in %s s",
+                    "Auto-redemption of '%s' pass %s/%s ended with %s temporary failures and %s players "
+                    "not reached; it stays pending and retries in %s s",
                     code,
                     passes,
                     self.MAX_AUTO_TRANSIENT_PASSES,
                     len(transient),
+                    unreached,
                     self.AUTO_RETRY_AFTER_TRANSIENT_SECONDS,
                 )
-                await self._announce_auto_redemption(code, results, final=False)
+                await self._announce_auto_redemption(code, results, final=False, expires_at=expires_at)
                 return False
-            await self._gift_code_service.mark_gift_code_completed(code_row.id)
-            self._auto_retry_after.pop(job.key, None)
-            self._auto_transient_passes.pop(job.key, None)
+            if outage_pass and not globally_rejected:
+                logger.error(
+                    "Giving up on gift code '%s': %s players were never reached after %s hours of "
+                    "temporary failures",
+                    code,
+                    unreached,
+                    self.MAX_AUTO_PENDING_HOURS,
+                )
             counts = count_statuses(results)
             logger.info(
                 "Auto-redemption of '%s' completed: %s",
                 code,
                 ", ".join(f"{status}={counts[status]}" for status in STATUS_ORDER),
             )
-            await self._announce_auto_redemption(code, results, final=True)
+            # Announce before marking the code completed: if the bot stops in between,
+            # the code is still pending, so the next start (which skips every recorded
+            # player) writes the final summary instead of leaving "Redeeming…" forever.
+            await self._announce_auto_redemption(code, results, final=True, expires_at=expires_at)
+            await self._gift_code_service.mark_gift_code_completed(code_row.id)
+            self._auto_retry_after.pop(job.key, None)
+            self._auto_transient_passes.pop(job.key, None)
+            await self._disable_broken_accounts(code, targets)
             return True
         finally:
             if not attached:
                 self._jobs.release(job)
 
-    @staticmethod
-    def _auto_progress_logger(gift_code: str, total: int):
-        state = {"logged": 0}
+    def _auto_progress(self, gift_code: str, targets: Sequence[Any], expires_at: Any, job: RedemptionJob):
+        """Progress callback of an automatic run: logs, and keeps a live announcement current.
+
+        The announcement appears as soon as the code has worked for someone (so it is
+        a real code) and enough of the run is left; it is then edited about once a
+        minute and finally replaced by the summary.
+        """
+        total = len(targets)
+        state: dict[str, Any] = {"logged": 0, "announced_at": None, "guilds": None}
 
         async def progress(results: list[dict], phase: str) -> None:
             processed = len(results)
             if processed - state["logged"] >= 50 or (processed == total and state["logged"] != total):
                 state["logged"] = processed
                 logger.info("Auto-redemption '%s': %s/%s players processed (%s)", gift_code, processed, total, phase)
+            remaining_seconds = (total - processed) * MIN_REQUEST_INTERVAL_SECONDS
+            if remaining_seconds < self.LIVE_ANNOUNCE_MIN_REMAINING_SECONDS or not has_success(results):
+                return
+            now = time.monotonic()
+            announced_at = state["announced_at"]
+            if announced_at is not None and now - announced_at < self.LIVE_ANNOUNCE_INTERVAL_SECONDS:
+                return
+            state["announced_at"] = now
+            try:
+                if state["guilds"] is None:
+                    state["guilds"] = await self._player_registry_service.get_enabled_guilds_for_players(
+                        [str(player.player_id) for player in targets]
+                    )
+                await self._announce_auto_progress(
+                    gift_code, targets, list(results), state["guilds"], expires_at=expires_at, started_at=job.started_at
+                )
+            except Exception:
+                logger.exception("Could not update the live announcement for '%s'", gift_code)
 
         return progress
 
+    async def _disable_broken_accounts(self, gift_code: str, targets: Sequence[Any]) -> list[Any]:
+        """Pause accounts that failed as invalid on the latest codes and tell their servers."""
+        if not callable(getattr(self._gift_code_service, "get_recent_gift_codes", None)):
+            return []
+        try:
+            failing = await self._redemption.find_broken_players(
+                targets,
+                current_code=gift_code,
+                code_limit=self.AUTO_DISABLE_CODES,
+                min_failures=self.AUTO_DISABLE_MIN_FAILURES,
+            )
+            if not failing:
+                return []
+            player_ids = [player.player_id for player in failing]
+            guilds_by_player = await self._player_registry_service.get_enabled_guilds_for_players(player_ids)
+            entries, profiles = await self._player_registry_service.disable_broken_players(player_ids)
+            logger.warning(
+                "Paused %s account(s) after repeated invalid-account failures (%s roster entries, "
+                "%s unassigned profiles): %s",
+                len(failing),
+                entries,
+                profiles,
+                ", ".join(player_ids),
+            )
+        except Exception:
+            logger.exception("Could not check for repeatedly failing accounts after '%s'", gift_code)
+            return []
+        try:
+            await self._notify_disabled_accounts(failing, guilds_by_player)
+        except Exception:
+            logger.exception("Could not report the paused accounts after '%s'", gift_code)
+        return failing
+
+    def _build_disabled_accounts_embed(self, failing: Sequence[Any], *, scope: str) -> discord.Embed:
+        lines = [
+            f"{discord.utils.escape_markdown(str(player.player_name or 'Unnamed player'))[:60]} · "
+            f"`{player.player_id}` — {ACCOUNT_ERROR_HINTS.get(player.error_code, 'invalid account')} "
+            f"({player.failed_codes} codes)"
+            for player in failing
+        ]
+        embed = discord.Embed(
+            title=f"⏸️ Paused {len(failing)} Account(s) That Keep Failing",
+            description=(
+                f"These accounts {scope} failed as invalid on the latest gift codes and never received one, "
+                "so the bot stopped redeeming for them:\n\n" + bounded_join(lines, limit=3000)
+            ),
+            color=EmbedColors.WARNING,
+        )
+        embed.add_field(
+            name="How to fix",
+            value=(
+                "Check the Governor ID in game (a kingdom transfer or a typo are the usual causes). "
+                "Replace a wrong ID with `/removeplayer` and `/addplayer`, or switch the account back on "
+                "in `/listplayers` once it works."
+            ),
+            inline=False,
+        )
+        return embed
+
+    async def _notify_disabled_accounts(self, failing: Sequence[Any], guilds_by_player: dict[str, set[int]]) -> None:
+        """Tell each server's gift-code channel about its paused accounts, and DM the operators."""
+        if self._guild_configuration_service is not None:
+            for settings in await self._guild_configuration_service.list_all():
+                channel = self._guild_gift_channel(settings)
+                mine = [
+                    player for player in failing
+                    if settings.guild_id in guilds_by_player.get(str(player.player_id), ())
+                ]
+                if channel is None or not mine:
+                    continue
+                try:
+                    await channel.send(embed=self._build_disabled_accounts_embed(mine, scope="on this server's list"))
+                except discord.HTTPException:
+                    logger.warning("Could not report paused accounts to guild %s", settings.guild_id, exc_info=True)
+        embed = self._build_disabled_accounts_embed(failing, scope="(all servers and unassigned profiles)")
+        for admin_id in sorted(self._access.super_admin_ids):
+            try:
+                get_user = getattr(self._bot, "get_user", None)
+                user = get_user(admin_id) if callable(get_user) else None
+                if user is None:
+                    fetch_user = getattr(self._bot, "fetch_user", None)
+                    if not callable(fetch_user):
+                        continue
+                    user = await fetch_user(admin_id)
+                await user.send(embed=embed)
+            except discord.HTTPException:
+                logger.info("Could not DM operator %s about paused accounts", admin_id)
+
     # -------------------------------------------------------- announcements
+
+    @staticmethod
+    def _code_field(gift_code: str, expires_at: Any = None) -> str:
+        """The code as copyable text, with its expiry when one is known and in the future."""
+        value = f"`{gift_code}`"
+        if isinstance(expires_at, datetime):
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at > datetime.now(timezone.utc):
+                value += f" · expires <t:{int(expires_at.timestamp())}:R>"
+        return value
 
     def _build_auto_redemption_embed(
         self,
@@ -973,6 +1300,8 @@ class GiftCodeHandler:
         *,
         scope: str = "every registered player",
         final: bool = True,
+        expires_at: Any = None,
+        note: str | None = None,
     ) -> discord.Embed:
         global_code_error = next((result for result in results if is_global_code_rejection(result)), None)
         retrying = 0 if final else sum(1 for result in results if is_retryable_result(result))
@@ -990,12 +1319,27 @@ class GiftCodeHandler:
                 f"{global_code_error.get('message') or 'the gift code was rejected.'}"
             )
             color = EmbedColors.WARNING
+        elif not final:
+            # The pass ended early (temporary gift-code server errors); players without
+            # a result are still to come, so nothing here may say "finished".
+            title = "🎁 New Gift Code Redeemed!" if has_success(results) else "🎁 New Gift Code — Redeeming…"
+            description = (
+                f"Auto-redemption for {scope} was interrupted by temporary gift-code server errors. "
+                "It continues automatically; this message is updated when it finishes."
+            )
+            color = EmbedColors.SUCCESS if has_success(results) else EmbedColors.INFO
+        elif not has_success(results):
+            title = "ℹ️ Gift Code Finished Without New Rewards"
+            description = f"Auto-redemption finished for {scope}; nobody received a new reward."
+            color = EmbedColors.INFO
         else:
             title = "🎁 New Gift Code Redeemed!"
             description = f"Auto-redemption finished for {scope}."
             color = EmbedColors.SUCCESS
+        if note:
+            description = f"{description}\n{note}"
         embed = discord.Embed(title=title, description=description[:4096], color=color)
-        embed.add_field(name="Gift Code", value=f"`{gift_code}`", inline=False)
+        embed.add_field(name="Gift Code", value=self._code_field(gift_code, expires_at), inline=False)
         embed.add_field(
             name="Results",
             value=f"{format_status_counts(results)}\n**👥 Total players:** {total_players}",
@@ -1004,14 +1348,131 @@ class GiftCodeHandler:
         embed.set_footer(text="Check in-game mail for successfully redeemed codes!")
         return embed
 
+    def _build_auto_progress_embed(
+        self,
+        gift_code: str,
+        total_players: int,
+        results: list[dict[str, Any]],
+        *,
+        scope: str,
+        finish: int | None,
+        expires_at: Any = None,
+    ) -> discord.Embed:
+        """The announcement shown while an automatic run is still going."""
+        lines = [f"Redeeming for {scope}: **{len(results)}/{total_players}** players processed."]
+        if finish is not None:
+            lines.append(f"The whole run should finish <t:{finish}:R>.")
+        embed = discord.Embed(
+            title="🎁 New Gift Code — Redeeming…", description="\n".join(lines), color=EmbedColors.INFO
+        )
+        embed.add_field(name="Gift Code", value=self._code_field(gift_code, expires_at), inline=False)
+        embed.add_field(
+            name="Results so far",
+            value=format_status_counts(results, hide_zero=True) or "Waiting for this roster's turn.",
+            inline=False,
+        )
+        embed.add_field(name="Don't want to wait?", value=REDEEM_HOW_TO, inline=False)
+        embed.set_footer(text="This message is updated during the run and becomes the summary.")
+        return embed
+
+    def _guild_gift_channel(self, settings: Any) -> Any:
+        """The server's configured gift-code channel, or None when it is unusable."""
+        channel_id = getattr(settings, "gift_code_channel_id", None)
+        if not channel_id:
+            return None
+        channel = self._bot.get_channel(channel_id)
+        channel_guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if channel is None or channel_guild_id != settings.guild_id or not hasattr(channel, "send"):
+            logger.warning("Gift-code channel %s of guild %s is unavailable", channel_id, settings.guild_id)
+            return None
+        return channel
+
+    async def _guild_gift_settings(self) -> list[Any]:
+        if self._guild_configuration_service is None:
+            return []
+        return [
+            settings
+            for settings in await self._guild_configuration_service.list_all()
+            if getattr(settings, "gift_code_channel_id", None)
+        ]
+
+    def _legacy_announcement_channels(self, guild_settings: Sequence[Any]) -> list[tuple[int, Any]]:
+        """``AUTO_REDEEM_CHANNELS`` that are not also a server's own gift-code channel.
+
+        A channel that a server picked in ``/configure`` gets that server's summary;
+        posting the global one there too would make the two overwrite each other.
+        """
+        configured = {int(settings.gift_code_channel_id) for settings in guild_settings}
+        channels: list[tuple[int, Any]] = []
+        for channel_id in getattr(self._config, "auto_redeem_channels", None) or ():
+            if int(channel_id) in configured:
+                continue
+            channel = self._bot.get_channel(channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                channels.append((channel_id, channel))
+            else:
+                logger.warning("Configured auto-redeem channel %s not found or is not a text channel", channel_id)
+        return channels
+
+    async def _announce_auto_progress(
+        self,
+        gift_code: str,
+        targets: Sequence[Any],
+        results: list[dict[str, Any]],
+        guilds_by_player: dict[str, set[int]],
+        *,
+        expires_at: Any = None,
+        started_at: float | None = None,
+    ) -> None:
+        """Post or refresh the "redeeming now" announcement in every announcement channel."""
+        finish = self._estimate_finish(len(targets), results, started_at)
+        guild_settings = await self._guild_gift_settings()
+        for channel_id, channel in self._legacy_announcement_channels(guild_settings):
+            embed = self._build_auto_progress_embed(
+                gift_code, len(targets), results, scope="every registered player", finish=finish,
+                expires_at=expires_at,
+            )
+            try:
+                await self._post_or_update_announcement(gift_code, channel_id, channel, embed)
+            except Exception as e:
+                logger.error("Failed to post live gift code announcement to channel %s: %s", channel_id, e)
+        for settings in guild_settings:
+            guild_targets = sum(
+                1 for player in targets if settings.guild_id in guilds_by_player.get(str(player.player_id), ())
+            )
+            if not guild_targets:
+                continue
+            channel = self._guild_gift_channel(settings)
+            if channel is None:
+                continue
+            subset = [
+                result for result in results
+                if settings.guild_id in guilds_by_player.get(str(result.get("player_id")), ())
+            ]
+            embed = self._build_auto_progress_embed(
+                gift_code, guild_targets, subset, scope="this server's roster", finish=finish, expires_at=expires_at
+            )
+            try:
+                await self._post_or_update_announcement(gift_code, settings.gift_code_channel_id, channel, embed)
+            except Exception as e:
+                logger.error("Failed to post live gift code announcement to guild %s: %s", settings.guild_id, e)
+
     async def _announce_auto_redemption(
-        self, gift_code: str, results: list[dict[str, Any]], *, final: bool = True
+        self,
+        gift_code: str,
+        results: list[dict[str, Any]],
+        *,
+        final: bool = True,
+        expires_at: Any = None,
+        note: str | None = None,
     ) -> None:
         """Global summary for legacy channels, per-server summaries for configured servers.
 
-        Nothing is announced anywhere a summary would contain no new success. A pass that
-        leaves the code pending (``final=False``) posts the summary right away; later passes
-        of the same code edit that message instead of posting another one.
+        A summary is posted where it contains a new success, and wherever a live
+        announcement of this code already stands (it must not stay "redeeming"). A
+        pass that leaves the code pending (``final=False``) posts the summary right
+        away; later passes of the same code edit that message instead of posting
+        another one. Message IDs are stored, so this also holds across restarts.
         """
         try:
             await self._send_auto_redemption_announcement(
@@ -1019,31 +1480,70 @@ class GiftCodeHandler:
                 total_players=len(results),
                 results=results,
                 final=final,
+                expires_at=expires_at,
+                note=note,
             )
         except Exception:
             logger.exception("Could not post the global gift-code announcement for '%s'", gift_code)
         try:
-            await self._announce_to_guild_channels(gift_code, results, final=final)
+            await self._announce_to_guild_channels(
+                gift_code, results, final=final, expires_at=expires_at, note=note
+            )
         except Exception:
             logger.exception("Could not post per-server gift-code announcements for '%s'", gift_code)
         finally:
             if final:
-                self._auto_announcements.pop(CodeJobGuard.key(gift_code), None)
+                key = CodeJobGuard.key(gift_code)
+                self._auto_announcements.pop(key, None)
+                self._announcements_loaded.discard(key)
+
+    async def _load_announcements(self, gift_code: str) -> dict[int, Any]:
+        """Messages already posted for this code by channel ID (memory, then the database)."""
+        key = CodeJobGuard.key(gift_code)
+        posted = self._auto_announcements.setdefault(key, {})
+        if key in self._announcements_loaded:
+            return posted
+        self._announcements_loaded.add(key)
+        loader = getattr(self._gift_code_service, "get_announcements", None)
+        if not callable(loader):
+            return posted
+        try:
+            stored = await loader(gift_code)
+        except Exception:
+            logger.warning("Could not load stored announcements for '%s'", gift_code, exc_info=True)
+            return posted
+        for channel_id, message_id in stored.items():
+            if channel_id in posted:
+                continue
+            channel = self._bot.get_channel(channel_id)
+            get_partial_message = getattr(channel, "get_partial_message", None)
+            if callable(get_partial_message):
+                posted[channel_id] = get_partial_message(message_id)
+        return posted
 
     async def _post_or_update_announcement(
         self, gift_code: str, channel_id: int, channel: Any, embed: discord.Embed
     ) -> str:
         """Edit this code's earlier summary in the channel, or post one; returns what happened."""
-        posted = self._auto_announcements.setdefault(CodeJobGuard.key(gift_code), {})
+        posted = await self._load_announcements(gift_code)
         previous = posted.get(channel_id)
         if previous is not None:
             try:
                 await previous.edit(embed=embed)
                 return "updated"
-            except discord.NotFound:
-                # Someone deleted the first summary: post the update as a new message.
+            except discord.HTTPException:
+                # The first summary was deleted (or cannot be edited any more): post the
+                # update as a new message rather than losing it.
                 posted.pop(channel_id, None)
-        posted[channel_id] = await channel.send(embed=embed)
+        message = await channel.send(embed=embed)
+        posted[channel_id] = message
+        message_id = getattr(message, "id", None)
+        saver = getattr(self._gift_code_service, "save_announcement", None)
+        if isinstance(message_id, int) and callable(saver):
+            try:
+                await saver(gift_code, channel_id, message_id)
+            except Exception:
+                logger.warning("Could not store the announcement message of '%s'", gift_code, exc_info=True)
         return "posted"
 
     async def _send_auto_redemption_announcement(
@@ -1053,36 +1553,44 @@ class GiftCodeHandler:
         total_players: int,
         results: list[dict[str, Any]],
         final: bool = True,
+        expires_at: Any = None,
+        note: str | None = None,
     ) -> None:
-        """Post the global summary to the legacy ``AUTO_REDEEM_CHANNELS`` (≥1 success only)."""
+        """Post the global summary to the legacy ``AUTO_REDEEM_CHANNELS``."""
         channel_ids = getattr(self._config, "auto_redeem_channels", None) or set()
-        if not channel_ids or not has_success(results):
+        if not channel_ids:
+            return
+        existing = await self._load_announcements(gift_code)
+        if not has_success(results) and not existing:
             return
 
-        embed = self._build_auto_redemption_embed(gift_code, total_players, results, final=final)
-        for channel_id in channel_ids:
-            channel = self._bot.get_channel(channel_id)
-            if channel and isinstance(channel, discord.TextChannel):
-                try:
-                    action = await self._post_or_update_announcement(gift_code, channel_id, channel, embed)
-                    logger.info("Announced gift code %s in channel %s (%s)", gift_code, channel_id, action)
-                except Exception as e:
-                    logger.error("Failed to send gift code announcement to channel %s: %s", channel_id, e)
-            else:
-                logger.warning("Configured auto-redeem channel %s not found or is not a text channel", channel_id)
+        embed = self._build_auto_redemption_embed(
+            gift_code, total_players, results, final=final, expires_at=expires_at, note=note
+        )
+        for channel_id, channel in self._legacy_announcement_channels(await self._guild_gift_settings()):
+            if not has_success(results) and channel_id not in existing:
+                continue
+            try:
+                action = await self._post_or_update_announcement(gift_code, channel_id, channel, embed)
+                logger.info("Announced gift code %s in channel %s (%s)", gift_code, channel_id, action)
+            except Exception as e:
+                logger.error("Failed to send gift code announcement to channel %s: %s", channel_id, e)
 
     async def _announce_to_guild_channels(
-        self, gift_code: str, results: list[dict[str, Any]], *, final: bool = True
+        self,
+        gift_code: str,
+        results: list[dict[str, Any]],
+        *,
+        final: bool = True,
+        expires_at: Any = None,
+        note: str | None = None,
     ) -> None:
         """Post each configured server a summary of its own roster's results."""
-        if self._guild_configuration_service is None or not has_success(results):
-            return
-        settings_list = [
-            settings
-            for settings in await self._guild_configuration_service.list_all()
-            if getattr(settings, "gift_code_channel_id", None)
-        ]
+        settings_list = await self._guild_gift_settings()
         if not settings_list:
+            return
+        existing = await self._load_announcements(gift_code)
+        if not has_success(results) and not existing:
             return
         guilds_by_player = await self._player_registry_service.get_enabled_guilds_for_players(
             [str(result["player_id"]) for result in results if result.get("player_id") is not None]
@@ -1092,17 +1600,14 @@ class GiftCodeHandler:
                 result for result in results
                 if settings.guild_id in guilds_by_player.get(str(result.get("player_id")), ())
             ]
-            if not has_success(subset):
+            if not has_success(subset) and settings.gift_code_channel_id not in existing:
                 continue
-            channel = self._bot.get_channel(settings.gift_code_channel_id)
-            channel_guild_id = getattr(getattr(channel, "guild", None), "id", None)
-            if channel is None or channel_guild_id != settings.guild_id or not hasattr(channel, "send"):
-                logger.warning(
-                    "Gift-code channel %s of guild %s is unavailable", settings.gift_code_channel_id, settings.guild_id
-                )
+            channel = self._guild_gift_channel(settings)
+            if channel is None:
                 continue
             embed = self._build_auto_redemption_embed(
-                gift_code, len(subset), subset, scope="this server's roster", final=final
+                gift_code, len(subset), subset, scope="this server's roster", final=final, expires_at=expires_at,
+                note=note,
             )
             try:
                 action = await self._post_or_update_announcement(
@@ -1114,9 +1619,10 @@ class GiftCodeHandler:
 
     # ------------------------------------------------------------ /giftcodes
 
-    async def _handle_list_gift_codes_slash(self, interaction: discord.Interaction):
-        """Handle listing available gift codes."""
-        await interaction.response.defer(thinking=True)
+    async def _handle_list_gift_codes_slash(self, interaction: discord.Interaction, *, ephemeral: bool = False):
+        """Handle listing available gift codes (privately when opened from the panel)."""
+        private = {"ephemeral": True} if ephemeral else {}
+        await interaction.response.defer(thinking=True, **private)
 
         try:
             response = await self._gift_code_service.get_available_gift_codes()
@@ -1128,7 +1634,7 @@ class GiftCodeHandler:
                     color=EmbedColors.ERROR,
                 )
                 embed.add_field(name="Details", value=str(response.get("message", "Unknown error"))[:1024], inline=False)
-                await interaction.followup.send(embed=embed)
+                await interaction.followup.send(embed=embed, **private)
                 return
 
             codes = [code for code in response.get("data", []) if isinstance(code, dict) and code.get("code")]
@@ -1139,14 +1645,19 @@ class GiftCodeHandler:
                         title="📋 No Active Gift Codes",
                         description="No currently active gift codes were found.",
                         color=EmbedColors.INFO,
-                    )
+                    ),
+                    **private,
                 )
                 return
 
-            can_redeem = interaction_guild_id(interaction) is not None and await self._access.can_manage(interaction)
+            can_redeem = (
+                not ephemeral
+                and interaction_guild_id(interaction) is not None
+                and await self._access.can_manage(interaction)
+            )
             view = GiftCodesView(self, codes, interaction.user.id, can_redeem)
             view.message = await interaction.followup.send(
-                content=view.build_content(), embed=view.build_embed(), view=view, wait=True
+                content=view.build_content(), embed=view.build_embed(), view=view, wait=True, **private
             )
 
         except Exception as e:
@@ -1156,8 +1667,291 @@ class GiftCodeHandler:
                     title="❌ Unexpected Error",
                     description="Could not show the gift codes. Try again in a minute.",
                     color=EmbedColors.ERROR,
-                )
+                ),
+                **private,
             )
+
+    # ------------------------------------------------- panel, my accounts, submit
+
+    async def _reject_banned(self, interaction: discord.Interaction) -> bool:
+        """Buttons bypass the command tree's ban check, so panels repeat it; True when rejected."""
+        if not self._access.is_banned(interaction.user.id):
+            return False
+        await send_denied(interaction, "You can't use this bot.")
+        return True
+
+    async def _handle_gift_panel(self, interaction: discord.Interaction) -> None:
+        """Post the permanent panel; an unset gift-code channel becomes this channel."""
+        if not await self._access.require_manager(interaction, action="post the gift-code panel"):
+            return
+        guild_id = interaction_guild_id(interaction)
+        channel = getattr(interaction, "channel", None)
+        if guild_id is None or channel is None or not hasattr(channel, "send"):
+            await send_denied(interaction, "Use /giftpanel in a server text channel.")
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            await channel.send(embed=build_panel_embed(self._max_self_registered), view=GiftPanelView(self))
+        except discord.HTTPException:
+            logger.info("Could not post the gift-code panel in channel %s", getattr(channel, "id", None), exc_info=True)
+            await interaction.followup.send(
+                embed=self._build_status_embed(
+                    title="❌ Could Not Post the Panel",
+                    description="I need **View Channel**, **Send Messages** and **Embed Links** in this channel.",
+                    color=EmbedColors.ERROR,
+                ),
+                ephemeral=True,
+            )
+            return
+        note = "The panel is posted. Pin it so members can always find it."
+        service = self._guild_configuration_service
+        try:
+            if service is not None and hasattr(service, "update_for_guild"):
+                settings = await service.get_settings(guild_id)
+                # A thread archives and would silently lose announcements: text channels only.
+                if not getattr(settings, "gift_code_channel_id", None) and is_announcement_target(channel):
+                    await service.update_for_guild(guild_id, gift_code_channel_id=int(channel.id))
+                    note += (
+                        f"\nGift-code announcements will be posted in <#{channel.id}> as well "
+                        "(no channel was set). Change it in `/configure`."
+                    )
+        except Exception:
+            logger.warning("Could not set the gift-code channel of guild %s from /giftpanel", guild_id, exc_info=True)
+        await interaction.followup.send(
+            embed=self._build_status_embed(title="✅ Gift-Code Panel Posted", description=note, color=EmbedColors.SUCCESS),
+            ephemeral=True,
+        )
+
+    async def _handle_my_accounts(self, interaction: discord.Interaction) -> None:
+        """Show the caller's own accounts in this server and how the latest codes went."""
+        guild_id = interaction_guild_id(interaction)
+        if guild_id is None:
+            await send_denied(interaction, "Use this in a server: each server keeps its own gift-code list.")
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            entries = await self._player_registry_service.list_owned_entries(guild_id, interaction.user.id)
+            embed = await self._build_my_accounts_embed(entries)
+        except Exception:
+            logger.exception("Could not show the accounts of user %s in guild %s", interaction.user.id, guild_id)
+            embed = self._build_status_embed(
+                title="❌ Could Not Load Your Accounts",
+                description="Try again in a minute.",
+                color=EmbedColors.ERROR,
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _build_my_accounts_embed(self, entries: Sequence[Any]) -> discord.Embed:
+        if not entries:
+            return self._build_status_embed(
+                title="🎁 My Accounts",
+                description=(
+                    "You have not added an account in this server yet. Press **Add my ID** on the gift-code "
+                    "panel or run `/addplayer` with your Governor ID, and new codes will be redeemed for you "
+                    "automatically."
+                ),
+                color=EmbedColors.INFO,
+            )
+        shown = list(entries)[: self.MY_ACCOUNTS_LISTED]
+        codes = [
+            str(code.code) for code in await self._gift_code_service.get_recent_gift_codes(self.MY_ACCOUNTS_CODES)
+        ]
+        rows = await self._gift_code_service.get_redemption_rows(codes, [str(entry.player_id) for entry in shown])
+        outcomes: dict[tuple[str, str], tuple[int, str]] = {}
+        for row in rows:
+            if row.success:
+                outcome = (3, "✅ redeemed")
+            elif row.error_code in ALREADY_REDEEMED_ERROR_CODES:
+                outcome = (2, "☑️ already claimed")
+            else:
+                hint = ACCOUNT_ERROR_HINTS.get(str(row.error_code or ""), "not redeemed")
+                outcome = (1, f"❌ {hint}")
+            key = (str(row.gift_code), str(row.player_id))
+            if key not in outcomes or outcome[0] >= outcomes[key][0]:
+                outcomes[key] = outcome
+        embed = discord.Embed(
+            title="🎁 My Accounts",
+            description=f"You have {len(entries)} account(s) on this server's gift-code list.",
+            color=EmbedColors.INFO,
+        )
+        for entry in shown:
+            active = bool(entry.enabled and entry.profile_enabled)
+            details = [f"`{entry.player_id}`"]
+            if entry.kingdom:
+                details.append(f"Kingdom {discord.utils.escape_markdown(str(entry.kingdom))[:20]}")
+            details.append("✅ receiving codes" if active else "⏸️ paused")
+            lines = [" · ".join(details)]
+            lines.extend(
+                f"`{code[:40]}` {outcomes.get((code, str(entry.player_id)), (0, '— no result yet'))[1]}"
+                for code in codes
+            )
+            embed.add_field(
+                name=discord.utils.escape_markdown(str(entry.player_name or "Unnamed player"))[:256],
+                value="\n".join(lines)[:EMBED_FIELD_LIMIT],
+                inline=False,
+            )
+        footer = "Paused account? Check the Governor ID, then switch it back on in /listplayers."
+        if len(entries) > len(shown):
+            footer = f"Showing {len(shown)} of {len(entries)} accounts; /listplayers has the rest. " + footer
+        embed.set_footer(text=footer)
+        return embed
+
+    def _claim_submit_slot(self, user_id: int, guild_id: int | None = None) -> str | None:
+        """Rate-limit code submissions; returns a refusal text or None when allowed.
+
+        Besides the short cooldown there are hourly budgets per member, per server and
+        overall, so one person (or one server) cannot use up everybody's submissions.
+        """
+        now = time.monotonic()
+        wait = self.SUBMIT_USER_COOLDOWN_SECONDS - (now - self._submit_cooldowns.get(user_id, float("-inf")))
+        if wait > 0:
+            return f"You just submitted a code. Try again in {int(wait) + 1} seconds."
+        self._submit_times = [entry for entry in self._submit_times if now - entry[0] < 3600]
+        if sum(1 for _, user, _ in self._submit_times if user == user_id) >= self.SUBMIT_USER_MAX_PER_HOUR:
+            return "You have submitted several codes in the last hour. Try again later."
+        if (
+            guild_id is not None
+            and sum(1 for _, _, guild in self._submit_times if guild == guild_id) >= self.SUBMIT_GUILD_MAX_PER_HOUR
+        ):
+            return "This server submitted many codes in the last hour. Try again later."
+        if len(self._submit_times) >= self.SUBMIT_MAX_PER_HOUR:
+            return "Too many codes were submitted in the last hour. Try again later."
+        self._submit_cooldowns[user_id] = now
+        self._submit_times.append((now, user_id, guild_id))
+        if len(self._submit_cooldowns) > 1000:
+            self._submit_cooldowns = {
+                key: stamp for key, stamp in self._submit_cooldowns.items()
+                if now - stamp < self.SUBMIT_USER_COOLDOWN_SECONDS
+            }
+        return None
+
+    async def _handle_submit_code(self, interaction: discord.Interaction, raw_code: str) -> None:
+        """Check a member-submitted code with one account; a working code is queued for everyone."""
+        guild_id = interaction_guild_id(interaction)
+        if guild_id is None:
+            await send_denied(interaction, "Use this in a server.")
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        async def reply(title: str, description: str, color: discord.Color) -> None:
+            await interaction.followup.send(
+                embed=self._build_status_embed(title=title, description=description, color=color), ephemeral=True
+            )
+
+        gift_code = (raw_code or "").strip()
+        if not GIFT_CODE_PATTERN.fullmatch(gift_code):
+            await reply(
+                "❌ That Does Not Look Like a Gift Code",
+                "Enter the code exactly as published: up to 64 characters, no spaces.",
+                EmbedColors.ERROR,
+            )
+            return
+        if self._closing:
+            await reply("⏳ Restarting", "The bot is restarting. Try again in a minute.", EmbedColors.WARNING)
+            return
+        safe_code = gift_code.replace("`", "")
+        try:
+            known = await self._gift_code_service.get_gift_code(gift_code)
+            if known is not None:
+                pending = getattr(known, "auto_redeem_status", None) == "pending"
+                await reply(
+                    "ℹ️ The Bot Already Has This Code",
+                    f"`{safe_code}` is "
+                    + ("being redeemed for everyone on the list right now." if pending
+                       else "already redeemed for everyone on the list.")
+                    + " Press **My accounts** (or run `/myaccounts`) to see your result.",
+                    EmbedColors.INFO,
+                )
+                return
+            running = self._jobs.get(gift_code)
+            if running is not None:
+                await interaction.followup.send(embed=self._job_busy_embed(running, guild_id), ephemeral=True)
+                return
+            refusal = self._claim_submit_slot(interaction.user.id, guild_id)
+            if refusal is not None:
+                await reply("⏳ Slow Down", refusal, EmbedColors.WARNING)
+                return
+
+            await self._tracking_service.track_user(
+                session=None,
+                user_id=interaction.user.id,
+                username=interaction.user.name,
+                discriminator=interaction.user.discriminator,
+                display_name=interaction.user.display_name,
+            )
+            targets = await self._player_registry_service.get_auto_redeem_targets(
+                self_registered_max=self._max_self_registered
+            )
+            if not targets:
+                await reply(
+                    "ℹ️ Nobody to Redeem For",
+                    "No account is on a gift-code list yet. Add yours with `/addplayer` first.",
+                    EmbedColors.INFO,
+                )
+                return
+            target_ids = {str(player.player_id) for player in targets}
+            owned = await self._player_registry_service.list_owned_entries(guild_id, interaction.user.id)
+            own_id = next((str(entry.player_id) for entry in owned if str(entry.player_id) in target_ids), None)
+            probe_player = next(
+                (player for player in targets if str(player.player_id) == own_id), targets[0]
+            )
+
+            job = RedemptionJob(gift_code=gift_code, kind=JOB_PROBE, guild_id=guild_id, requester_id=interaction.user.id)
+            existing = self._jobs.claim(job)
+            if existing is not None:
+                await interaction.followup.send(embed=self._job_busy_embed(existing, guild_id), ephemeral=True)
+                return
+            try:
+                result = await self._redemption.probe_code(
+                    gift_code=gift_code,
+                    player=probe_player,
+                    actor_user_id=interaction.user.id,
+                    guild_id=guild_id,
+                    channel_id=getattr(getattr(interaction, "channel", None), "id", None),
+                )
+            finally:
+                self._jobs.release(job)
+
+            status = result.get("status_category")
+            error_code = str(result.get("error_code") or "").upper()
+            message = discord.utils.escape_markdown(str(result.get("message") or "The code was rejected."))[:300]
+            if is_global_code_rejection(result):
+                await reply("❌ The Code Does Not Work", f"`{safe_code}`: {message}", EmbedColors.ERROR)
+                return
+            if is_retryable_result(result):
+                await reply(
+                    "⚠️ Could Not Check the Code",
+                    "The gift-code server is not answering right now. Try again in a few minutes.",
+                    EmbedColors.WARNING,
+                )
+                return
+            if status not in (STATUS_SUCCESS, STATUS_ALREADY_REDEEMED) and error_code not in CODE_VALID_ERROR_CODES:
+                await reply(
+                    "⚠️ Could Not Check the Code",
+                    f"The test account could not use `{safe_code}` ({message}), so the code is not confirmed. "
+                    "A server manager can run `/redeem` with it.",
+                    EmbedColors.WARNING,
+                )
+                return
+
+            is_new, _ = await self._gift_code_service.add_submitted_gift_code(gift_code)
+            logger.info(
+                "User %s submitted gift code '%s' in guild %s (new=%s, probe=%s)",
+                interaction.user.id, gift_code, guild_id, is_new, error_code or status,
+            )
+            self._ensure_pending_worker()
+            own_note = ""
+            if own_id is not None and str(probe_player.player_id) == own_id and status == STATUS_SUCCESS:
+                own_note = " Your account already received it."
+            await reply(
+                "✅ Code Accepted — Thank You!",
+                f"`{safe_code}` works.{own_note} It is now being redeemed for {len(targets)} account(s); "
+                "the summary is posted in the gift-code channel.",
+                EmbedColors.SUCCESS,
+            )
+        except Exception:
+            logger.exception("Could not process the submitted gift code '%s'", gift_code)
+            await reply("❌ Could Not Check the Code", "Something went wrong. Try again in a minute.", EmbedColors.ERROR)
 
     # ---------------------------------------------------------------- /redeem
 
@@ -1231,11 +2025,14 @@ class GiftCodeHandler:
         )
 
         channel = interaction.channel
-        if channel is None or not hasattr(channel, "send"):
+        if channel is None or not hasattr(channel, "send") or not bot_can_post(channel):
             await interaction.followup.send(
                 embed=self._build_status_embed(
                     title="❌ Channel Unavailable",
-                    description="The bot cannot post the job's progress here. Run /redeem in a text channel the bot can write to.",
+                    description=(
+                        "The bot cannot post the job's progress here. Run /redeem in a text channel where it has "
+                        "**View Channel**, **Send Messages** and **Embed Links**."
+                    ),
                     color=EmbedColors.ERROR,
                 ),
                 ephemeral=True,
@@ -1631,7 +2428,14 @@ class GiftCodeHandler:
         if global_error is not None:
             embed.add_field(name="Code rejected", value=str(global_error.get("message") or "The code is unavailable.")[:1024], inline=False)
         embed.set_footer(text="Check in-game mail for successful claims." + (" Open Details to review failed or skipped players." if issues else ""))
-        view = RedemptionResultsView(embed, issues, requester_user_id) if issues else None
+        view = (
+            RedemptionResultsView(
+                embed, issues, requester_user_id,
+                access_policy=self._access, timeout=self.RESULT_DETAILS_TIMEOUT_SECONDS,
+                all_servers=bool(job is not None and job.all_servers),
+            )
+            if issues else None
+        )
         if message is not None:
             try:
                 await message.edit(embed=embed, view=view)
@@ -2425,6 +3229,13 @@ class GiftCodeHandler:
             logger.info(
                 "User %s added %s players to guild %s roster", interaction.user.id, len(outcome.added), guild_id
             )
+            if outcome.added and is_manager:
+                await offer_channel_setup(
+                    interaction,
+                    setting="gift_code_channel_id",
+                    guild_config_service=self._guild_configuration_service,
+                    access_policy=self._access,
+                )
         except Exception as e:
             logger.error("Error adding players %s: %s", player_ids, e, exc_info=True)
             await interaction.followup.send(
@@ -2908,6 +3719,13 @@ class GiftCodeHandler:
                 )
             )
             await interaction.followup.send(embed=embed)
+            if outcome.added:
+                await offer_channel_setup(
+                    interaction,
+                    setting="gift_code_channel_id",
+                    guild_config_service=self._guild_configuration_service,
+                    access_policy=self._access,
+                )
 
         except Exception as e:
             logger.error("Error adding alliance %s in kingdom %s: %s", aid, kid, e, exc_info=True)

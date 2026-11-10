@@ -6,6 +6,25 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 
+def _env_number(name: str, default, convert):
+    """Read a numeric setting; an empty value means "use the default"."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return convert(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+
+
+def _env_int(name: str, default: int) -> int:
+    return _env_number(name, default, int)
+
+
+def _env_float(name: str, default: float) -> float:
+    return _env_number(name, default, float)
+
+
 @dataclass
 class BotConfig:
     """Bot configuration settings."""
@@ -72,6 +91,9 @@ class BotConfig:
             raise ValueError("CHAT_HISTORY_LIMIT must be >= 1")
         if self.max_chat_response_chars < 50:
             raise ValueError("MAX_CHAT_RESPONSE_CHARS must be >= 50")
+        # Discord rejects messages over 2000 characters, so a larger value would make
+        # long replies fail to send.
+        self.max_chat_response_chars = min(self.max_chat_response_chars, 2000)
         if self.nvidia_tts_sample_rate_hz < 8000:
             raise ValueError("NVIDIA_TTS_SAMPLE_RATE_HZ must be >= 8000")
         if self.nvidia_tts_max_text_chars < 1:
@@ -150,7 +172,8 @@ class BotConfig:
             discord_token=discord_token,
             database_url=database_url,
             nvidia_api_key=nvidia_api_key,
-            command_prefix=os.getenv("COMMAND_PREFIX", "!"),
+            # An empty prefix would make every message look like a command.
+            command_prefix=(os.getenv("COMMAND_PREFIX") or "").strip() or "!",
             translator_role_name=os.getenv("TRANSLATOR_ROLE", "Translator"),
             nvidia_base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
             nvidia_model=os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
@@ -175,24 +198,24 @@ class BotConfig:
                 "Magpie-Multilingual.EN-US.Aria",
             ),
             nvidia_tts_audio_encoding=os.getenv("NVIDIA_TTS_AUDIO_ENCODING", "LINEAR_PCM"),
-            nvidia_tts_sample_rate_hz=int(os.getenv("NVIDIA_TTS_SAMPLE_RATE_HZ", "44100")),
-            nvidia_tts_max_text_chars=int(os.getenv("NVIDIA_TTS_MAX_TEXT_CHARS", "350")),
-            random_reply_chance=float(os.getenv("RANDOM_REPLY_CHANCE", "0")),
-            random_reply_cooldown_seconds=int(os.getenv("RANDOM_REPLY_COOLDOWN_SECONDS", "180")),
-            chat_history_limit=int(os.getenv("CHAT_HISTORY_LIMIT", "25")),
-            max_chat_response_chars=int(os.getenv("MAX_CHAT_RESPONSE_CHARS", "500")),
+            nvidia_tts_sample_rate_hz=_env_int("NVIDIA_TTS_SAMPLE_RATE_HZ", 44100),
+            nvidia_tts_max_text_chars=_env_int("NVIDIA_TTS_MAX_TEXT_CHARS", 350),
+            random_reply_chance=_env_float("RANDOM_REPLY_CHANCE", 0),
+            random_reply_cooldown_seconds=_env_int("RANDOM_REPLY_COOLDOWN_SECONDS", 180),
+            chat_history_limit=_env_int("CHAT_HISTORY_LIMIT", 25),
+            max_chat_response_chars=_env_int("MAX_CHAT_RESPONSE_CHARS", 500),
             ks_data_api_key=os.getenv("KS_DATA_API_KEY"),
             ks_data_base_url=os.getenv("KS_DATA_API_BASE_URL", "https://ks.jeab.dev"),
-            ks_data_timeout_seconds=int(os.getenv("KS_DATA_TIMEOUT_SECONDS", "30")),
+            ks_data_timeout_seconds=_env_int("KS_DATA_TIMEOUT_SECONDS", 30),
             mightpulse_api_key=os.getenv("MIGHTPULSE_API_KEY"),
             mightpulse_base_url=os.getenv("MIGHTPULSE_API_BASE_URL", "https://api.mightpulse.com"),
             admin_user_ids=admin_user_ids,
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,
-            max_players_per_guild=int(os.getenv("MAX_PLAYERS_PER_GUILD", "300")),
-            max_self_registered_players=int(os.getenv("MAX_SELF_REGISTERED_PLAYERS", "3")),
-            llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
-            translation_log_retention_days=int(os.getenv("TRANSLATION_LOG_RETENTION_DAYS", "30")),
-            chat_user_cooldown_seconds=float(os.getenv("CHAT_USER_COOLDOWN_SECONDS", "10")),
-            kingshot_rag_max_distance=float(os.getenv("KINGSHOT_RAG_MAX_DISTANCE", "0.7")),
+            max_players_per_guild=_env_int("MAX_PLAYERS_PER_GUILD", 300),
+            max_self_registered_players=_env_int("MAX_SELF_REGISTERED_PLAYERS", 3),
+            llm_timeout_seconds=_env_float("LLM_TIMEOUT_SECONDS", 30),
+            translation_log_retention_days=_env_int("TRANSLATION_LOG_RETENTION_DAYS", 30),
+            chat_user_cooldown_seconds=_env_float("CHAT_USER_COOLDOWN_SECONDS", 10),
+            kingshot_rag_max_distance=_env_float("KINGSHOT_RAG_MAX_DISTANCE", 0.7),
         )

@@ -34,6 +34,7 @@ class StatusHandler:
         scheduler_enabled: bool | None = None,
         gift_polling_enabled: bool | None = None,
         access_policy=None,
+        usage_stats_service=None,
     ):
         self._bot = bot
         self._config = config
@@ -43,6 +44,7 @@ class StatusHandler:
         self._kingshot_data_service = kingshot_data_service
         self._started_at = started_at
         self._access = access_policy
+        self._usage_stats_service = usage_stats_service
         self._database_health_service = database_health_service or DatabaseHealthService()
         self._scheduler_enabled = True if scheduler_enabled is None else scheduler_enabled
         self._gift_polling_enabled = True if gift_polling_enabled is None else gift_polling_enabled
@@ -121,7 +123,7 @@ class StatusHandler:
             data_api_value = status_value(data_api_health[0], "Reachable", data_api_health[1])
         embed.add_field(name="KingShot Data API", value=data_api_value, inline=True)
         scheduler_value = self._component_value(scheduler_state)
-        summary = self._scheduler_summary(scheduler_health)
+        summary = self._scheduler_summary(scheduler_health, include_errors=is_operator)
         if summary and scheduler_state == "running":
             scheduler_value = f"{scheduler_value}\n{summary}"[:1024]
         embed.add_field(name="Scheduler", value=scheduler_value, inline=True)
@@ -144,7 +146,31 @@ class StatusHandler:
                 inline=True,
             )
 
+        usage = await self._usage_summary(interaction, is_operator)
+        if usage:
+            embed.add_field(
+                name="Most used commands · 30 days" + (" · all servers" if is_operator else " · this server"),
+                value=usage,
+                inline=False,
+            )
+
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _usage_summary(self, interaction: discord.Interaction, is_operator: bool) -> str:
+        """Top commands: every server for operators, this server for everyone else."""
+        if self._usage_stats_service is None:
+            return ""
+        guild_id = getattr(interaction, "guild_id", None)
+        if not is_operator and guild_id is None:
+            return ""
+        try:
+            top = await self._usage_stats_service.top_commands(
+                30, guild_id=None if is_operator else guild_id, limit=8
+            )
+        except Exception:
+            logger.warning("Could not load command usage", exc_info=True)
+            return ""
+        return " · ".join(f"`/{name}` {uses}" for name, uses in top)[:1024]
 
     def _is_operator(self, interaction: discord.Interaction) -> bool:
         user = getattr(interaction, "user", None)
@@ -164,12 +190,18 @@ class StatusHandler:
             return None
 
     @staticmethod
-    def _scheduler_summary(health: Any) -> str:
+    def _scheduler_summary(health: Any, *, include_errors: bool = False) -> str:
         """Short delivery stats; warns when reminders failed or the loop looks stuck."""
         if health is None:
             return ""
         summary = getattr(health, "summary", None)
-        text = summary() if callable(summary) else ""
+        if not callable(summary):
+            text = ""
+        else:
+            try:
+                text = summary(include_errors=include_errors)
+            except TypeError:
+                text = summary() if include_errors else ""
         last_success = getattr(health, "last_success_at", None)
         if last_success is not None:
             if last_success.tzinfo is None:

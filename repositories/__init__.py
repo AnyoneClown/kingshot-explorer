@@ -1,6 +1,8 @@
 """Repository package for database persistence."""
 
 from .discord_repositories import (
+    CommandUsageRepository,
+    GiftCodeAnnouncementRepository,
     GiftCodeRedemptionRepository,
     GiftCodeRepository,
     GuildConfigurationRepository,
@@ -16,4 +18,6 @@ __all__ = [
     "RegisteredPlayerRepository",
     "GiftCodeRepository",
     "GiftCodeRedemptionRepository",
+    "GiftCodeAnnouncementRepository",
+    "CommandUsageRepository",
 ]

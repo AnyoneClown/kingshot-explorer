@@ -17,7 +17,19 @@ Direct mentions and replies to the bot normally allow two generation attempts:
 
 When server-scoped tools are available, a direct mention first tries the tool loop;
 if it is rejected by the API, fails, or produces no usable reply, the two plain
-attempts above follow.
+attempts above follow. The tool loop is limited to 40 seconds, so a direct mention
+is answered (or gets the fallback) within about 100 seconds at worst. Only a
+rejection that mentions tool calling switches tools off for ten minutes; a
+request-specific 400 or a temporary provider error does not.
+
+At most two model requests run at once. A direct mention waits up to 30 seconds for
+a free slot and then gets the fallback; the random-reply yes/no check is limited to
+15 seconds. Random candidates do not use up the author's per-user cooldown slot, and
+the channel's random-reply cooldown starts before generation, so two candidates
+arriving together produce at most one random reply.
+
+Per-server AI replies and voice replies are opt-in. If the server settings cannot be
+loaded, both are treated as off.
 
 The retry override applies to that invocation only. It preserves other configured
 chat-template options and does not mutate the shared client's defaults. Thinking

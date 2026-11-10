@@ -108,15 +108,19 @@ class SchedulerHealth:
     sent_count: int
     missed_count: int
 
-    def summary(self) -> str:
-        """Compact multi-line text for a status embed field (under 1024 characters)."""
+    def summary(self, *, include_errors: bool = True) -> str:
+        """Compact multi-line text for a status embed field (under 1024 characters).
+
+        Error text can contain database details and other servers' reminder IDs, so
+        ``/status`` passes ``include_errors`` only for bot operators.
+        """
         lines = []
         if self.last_run_at is None:
             lines.append("No run yet")
         else:
             lines.append(f"Last run <t:{int(self.last_run_at.timestamp())}:R>")
         lines.append(f"Sent {self.sent_count} · Failed {self.failed_count} · Missed {self.missed_count}")
-        if self.last_error:
+        if self.last_error and include_errors:
             when = f" (<t:{int(self.last_error_at.timestamp())}:R>)" if self.last_error_at else ""
             lines.append(f"Last error{when}: {self.last_error[:300]}")
         return "\n".join(lines)
@@ -554,6 +558,7 @@ class EventHandler:
         # Occurrences already posted whose bookkeeping could not be saved yet;
         # they are recorded again without being re-posted.
         self._delivered_pending: dict[tuple[int, datetime], DeliveryOutcome] = {}
+        self._iteration_active = False
         self._last_run_at: datetime | None = None
         self._last_success_at: datetime | None = None
         self._last_error: str | None = None
@@ -728,6 +733,10 @@ class EventHandler:
             await self._send_error(interaction, str(error))
             return
         role_names = event.role_names if event else ["everyone"]
+        blocked, permission_warning = self._channel_permission_problems(interaction, role_names)
+        if blocked:
+            await self._send_error(interaction, blocked)
+            return
         draft = ScheduledEvent(
             event.id if event else None,
             reminder_time,
@@ -756,6 +765,8 @@ class EventHandler:
             inline=False,
         )
         embed.add_field(name="Repeat", value=self._format_repeat(repeat_every_days), inline=False)
+        if permission_warning:
+            embed.add_field(name="⚠️ No ping", value=permission_warning, inline=False)
         for offset in range(0, len(message), 950):
             embed.add_field(
                 name="Message" if offset == 0 else "Message (continued)",
@@ -775,6 +786,42 @@ class EventHandler:
             allowed_mentions=discord.AllowedMentions.none(),
         )
         view.message = await interaction.original_response()
+
+    @staticmethod
+    def _channel_permission_problems(interaction, role_names) -> tuple[str | None, str | None]:
+        """(blocking problem, warning) about the bot's permissions where the reminder will post.
+
+        Slash commands work in channels the bot cannot write to, so without this check
+        a reminder could be saved that can never be delivered.
+        """
+        channel = getattr(interaction, "channel", None)
+        me = getattr(getattr(interaction, "guild", None), "me", None)
+        permissions_for = getattr(channel, "permissions_for", None)
+        if me is None or not callable(permissions_for):
+            return None, None
+        try:
+            permissions = permissions_for(me)
+        except Exception:
+            # For example a thread whose parent channel is not cached: do not block.
+            return None, None
+        # Posting in a thread needs "Send Messages in Threads" of the parent channel.
+        send_bit = "send_messages_in_threads" if isinstance(channel, discord.Thread) else "send_messages"
+        if getattr(permissions, "view_channel", True) is False or getattr(permissions, send_bit, True) is False:
+            return (
+                "I can't post in this channel. Give me **View Channel** and **Send Messages** here, "
+                "or schedule the reminder in a channel I can write to.",
+                None,
+            )
+        pings_everyone = any(
+            str(name).strip().casefold() in EVERYONE_NAMES or str(name).strip().casefold() in HERE_NAMES
+            for name in role_names or ("everyone",)
+        )
+        if pings_everyone and getattr(permissions, "mention_everyone", True) is False:
+            return None, (
+                "I don't have **Mention @everyone, @here and All Roles** in this channel, so the reminder "
+                "will be posted without notifying anyone. Grant the permission to get a real ping."
+            )
+        return None, None
 
     async def _handle_list_events(self, interaction: discord.Interaction):
         if interaction.channel_id is None:
@@ -906,6 +953,19 @@ class EventHandler:
         if self._scheduler_loop is not None:
             self._scheduler_loop.cancel()
 
+    async def shutdown_scheduler(self, timeout: float = 10.0) -> None:
+        """Stop the scheduler, letting a running pass finish first.
+
+        Cancelling between "the ping was posted" and "the delivery was recorded" would
+        make the restarted bot post the same @everyone ping again.
+        """
+        self._scheduler_stopped = True
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self._iteration_active and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        if self._scheduler_loop is not None:
+            self._scheduler_loop.cancel()
+
     def _restart_scheduler(self):
         if self._scheduler_stopped or self._scheduler_loop is None or self._scheduler_loop.is_running():
             return
@@ -937,6 +997,13 @@ class EventHandler:
 
     async def run_scheduler_iteration(self) -> None:
         """One scheduler pass. Never raises: every failure is logged and recorded."""
+        self._iteration_active = True
+        try:
+            await self._run_scheduler_iteration()
+        finally:
+            self._iteration_active = False
+
+    async def _run_scheduler_iteration(self) -> None:
         self._last_run_at = datetime.now(timezone.utc)
         try:
             batch = await self._scheduler_service.claim_due_events(self.GRACE_PERIOD)
@@ -955,6 +1022,9 @@ class EventHandler:
         due_keys = {(event.id, event.event_time) for event in batch.due}
         self._delivered_pending = {key: value for key, value in self._delivered_pending.items() if key in due_keys}
         for event in batch.due:
+            if self._scheduler_stopped and self._scheduler_loop is not None:
+                # Shutting down: leave the rest due; they are sent after the restart.
+                break
             try:
                 await self._deliver(event)
             except Exception as error:

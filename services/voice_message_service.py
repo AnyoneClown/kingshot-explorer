@@ -243,6 +243,8 @@ class VoiceMessageService:
             return None
 
         language_code = self._resolve_language_code(language_hint)
+        if language_code is None:
+            return None
         voice_name = self._resolve_voice_name(language_code)
         audio_bytes = await self._synthesize(
             text=cleaned,
@@ -309,16 +311,24 @@ class VoiceMessageService:
         if inspect.isawaitable(result):
             await result
 
-    def _resolve_language_code(self, language_hint: str | None) -> str:
+    def _resolve_language_code(self, language_hint: str | None) -> str | None:
+        """TTS language for a hint; None when the hint names a language no voice speaks.
+
+        Reading, say, Ukrainian text with the English voice produces noise, so an
+        unsupported language gets no audio at all.
+        """
         if not language_hint:
             return self._default_language_code
 
         normalized = language_hint.strip().lower()
-        if normalized in self._LANGUAGE_ALIASES:
-            return self._LANGUAGE_ALIASES[normalized]
+        candidates = [normalized, re.sub(r"\(.*?\)", " ", normalized).strip()]
+        candidates.append(candidates[-1].split()[0] if candidates[-1].split() else "")
+        for candidate in candidates:
+            if candidate in self._LANGUAGE_ALIASES:
+                return self._LANGUAGE_ALIASES[candidate]
 
-        logger.warning("Unsupported TTS language hint %r, falling back to %s", language_hint, self._default_language_code)
-        return self._default_language_code
+        logger.info("No TTS voice for language hint %r; skipping audio", language_hint)
+        return None
 
     def _resolve_voice_name(self, language_code: str) -> str:
         if language_code == self._default_language_code:

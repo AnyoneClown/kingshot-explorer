@@ -64,6 +64,9 @@ class GuildConfigurationService:
         self._db_manager = db_manager
         self._cache_ttl_seconds = cache_ttl_seconds
         self._cache: dict[int, tuple[float, GuildSettings]] = {}
+        # Bumped by every update: a read that started before an update finished must
+        # not put its (old) row back into the cache afterwards.
+        self._generations: dict[int, int] = {}
 
     async def _get_db_manager(self):
         return self._db_manager or get_db()
@@ -153,8 +156,12 @@ class GuildConfigurationService:
             )
             return GuildSettings.from_model(model)
 
+        generation = self._generations.get(guild_id, 0)
         # A concurrent first message in the same guild can race the insert.
-        return self._remember(await self._run(operation, retry_on_integrity_error=True))
+        settings = await self._run(operation, retry_on_integrity_error=True)
+        if self._generations.get(guild_id, 0) == generation:
+            self._remember(settings)
+        return settings
 
     async def get_settings(self, guild_id: int) -> GuildSettings:
         """Alias of ``get_or_create_for_guild`` for readability at call sites."""
@@ -178,8 +185,14 @@ class GuildConfigurationService:
             await session.flush()
             return GuildSettings.from_model(model)
 
+        self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
         self.invalidate(guild_id)
-        return self._remember(await self._run(operation, retry_on_integrity_error=True))
+        try:
+            settings = await self._run(operation, retry_on_integrity_error=True)
+        finally:
+            # Again after the write: reads that began during it carry the old row.
+            self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+        return self._remember(settings)
 
     async def set_use_voice_replies_for_guild(self, guild_id: int, use_voice_replies: bool) -> GuildSettings:
         return await self.update_for_guild(guild_id, use_voice_replies=use_voice_replies)
@@ -194,7 +207,9 @@ class GuildConfigurationService:
             result = await session.execute(select(GuildConfiguration))
             return [GuildSettings.from_model(model) for model in result.scalars().all()]
 
+        generations = dict(self._generations)
         settings = await self._run(operation)
         for item in settings:
-            self._remember(item)
+            if self._generations.get(item.guild_id, 0) == generations.get(item.guild_id, 0):
+                self._remember(item)
         return settings

@@ -46,6 +46,12 @@ class GuildConfigView(OwnedView):
         self._guild = guild
         self._warnings: list[str] = []
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """The panel can stay open for a long time: re-check manager rights on every click."""
+        if not await super().interaction_check(interaction):
+            return False
+        return await self._access.require_manager(interaction, "configure the bot")
+
     async def _settings(self):
         return await self._guild_config_service.get_or_create_for_guild(self._guild_id)
 
@@ -72,6 +78,18 @@ class GuildConfigView(OwnedView):
         gift_channel = getattr(guild_config, "gift_code_channel_id", None)
         report_channel = getattr(guild_config, "alliance_report_channel_id", None)
         manager_role = getattr(guild_config, "manager_role_id", None)
+        # Show what is saved inside the menus too, instead of empty placeholders.
+        # Only values the menu can hold: a deleted channel or role, or a channel of
+        # another type, as a default would make Discord reject the whole panel.
+        self.gift_channel_select.default_values = self._defaults(
+            self._selectable_channel(gift_channel), discord.SelectDefaultValueType.channel
+        )
+        self.report_channel_select.default_values = self._defaults(
+            self._selectable_channel(report_channel), discord.SelectDefaultValueType.channel
+        )
+        self.manager_role_select.default_values = self._defaults(
+            self._selectable_role(manager_role), discord.SelectDefaultValueType.role
+        )
 
         lines = [
             f"Server: **{self._guild_name}**",
@@ -81,6 +99,7 @@ class GuildConfigView(OwnedView):
             f"Alliance reports: {_mention_channel(report_channel)}",
             f"Bot manager role: {_mention_role(manager_role)}",
             "",
+            self._setup_progress(gift_channel, report_channel),
             "Use the menus below to pick channels and the manager role. "
             "Clear a menu's selection to unset it.",
         ]
@@ -105,6 +124,36 @@ class GuildConfigView(OwnedView):
                 "Server Settings → Integrations"
             ),
         )
+
+    def _selectable_channel(self, channel_id: int | None) -> int | None:
+        if not channel_id:
+            return None
+        if self._guild is None:
+            return channel_id
+        channel = self._guild.get_channel(channel_id)
+        return channel_id if getattr(channel, "type", None) in _TEXT_CHANNEL_TYPES else None
+
+    def _selectable_role(self, role_id: int | None) -> int | None:
+        if not role_id:
+            return None
+        if self._guild is None:
+            return role_id
+        return role_id if self._guild.get_role(role_id) is not None else None
+
+    @staticmethod
+    def _defaults(object_id: int | None, kind: discord.SelectDefaultValueType) -> list[discord.SelectDefaultValue]:
+        return [discord.SelectDefaultValue(id=int(object_id), type=kind)] if object_id else []
+
+    def _setup_progress(self, gift_channel: int | None, report_channel: int | None) -> str:
+        done = sum(bool(value) for value in (gift_channel, report_channel))
+        if done == 2:
+            return "✅ Channels are set up."
+        missing = []
+        if not gift_channel:
+            missing.append("gift-code announcements")
+        if not report_channel:
+            missing.append("alliance reports")
+        return f"Setup {done}/2 — no channel yet for: {', '.join(missing)}. Until then they are not posted."
 
     def _sync_voice_button(self, enabled: bool) -> None:
         self.toggle_voice_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary

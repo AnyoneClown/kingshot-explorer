@@ -83,6 +83,19 @@ _FOREIGN_MARKERS = frozenset(
 _WORD_PATTERN = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
 
+# English words that are also everyday words elsewhere (Portuguese, Spanish, Italian,
+# German, Tagalog) or game terms used untranslated in every language.
+_HOMOGRAPHS = frozenset("a as no me come do time so may war yo man son once sin mas dos pan con fin par".split())
+_AMBIGUOUS_WORDS = _HOMOGRAPHS | frozenset(
+    """
+    alliance rally rallies bear trap event events reward rewards hero heroes troops troop march marches
+    shield castle kingdom server kvk gift code codes power level upgrade speedup speedups gems gem
+    player players member members leader leaders online team chat min mins sec pm am utc reset
+    lol lmao lmfao omg gg gl hf np ok okay afk
+    """.split()
+)
+
+
 def _letters(text: str) -> List[str]:
     return [char for char in text if unicodedata.category(char).startswith("L")]
 
@@ -92,7 +105,9 @@ def has_translatable_text(text: Optional[str]) -> bool:
     if not text:
         return False
     stripped = _PROTECTED_PATTERN.sub(" ", text)
-    return len(_letters(stripped)) >= 2
+    letters = _letters(stripped)
+    # One Latin letter is noise ("k", "x"), but one CJK or Hangul character is a word.
+    return len(letters) >= 2 or any(ord(char) > 0x2E7F for char in letters)
 
 
 def looks_clearly_english(text: Optional[str]) -> bool:
@@ -113,7 +128,19 @@ def looks_clearly_english(text: Optional[str]) -> bool:
 
     known = sum(1 for word in words if word in _ENGLISH_WORDS)
     if len(words) <= 2:
-        return known == len(words)
+        # "Come no" / "war so" are two homographs, not English; a lone "no" or "ok"
+        # reads the same everywhere and needs no translation.
+        return known == len(words) and not (len(words) == 2 and all(word in _HOMOGRAPHS for word in words))
+    # Words spelled the same in other languages ("no", "me", "come", "time") and game
+    # loanwords used in every language ("server", "gift", "code") prove nothing; a
+    # phrase made only of them plus unknown words goes to the model.
+    if not any(word in _ENGLISH_WORDS and word not in _AMBIGUOUS_WORDS for word in words):
+        return False
+    distinctive = [word for word in words if word not in _AMBIGUOUS_WORDS]
+    if len(distinctive) < len(words) and (
+        not distinctive or sum(1 for word in distinctive if word in _ENGLISH_WORDS) / len(distinctive) < 0.5
+    ):
+        return False
     # Short phrases share many words with Romance languages ("no me gusta"), so they
     # need a higher share of known English words.
     return known / len(words) >= (0.75 if len(words) <= 6 else 0.65)

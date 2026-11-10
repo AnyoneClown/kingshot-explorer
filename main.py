@@ -35,6 +35,7 @@ from handlers import (
 from handlers.permissions import AccessPolicy, build_denied_embed
 from services.chat_tools import build_chat_tool_registry
 from services.kvk_dossier_service import KvKDossierService
+from services.usage_stats_service import UsageStatsService
 from services import (
     AlliancePowerService,
     EventSchedulerService,
@@ -65,6 +66,18 @@ class BotCommandTree(app_commands.CommandTree):
     """Command tree with a global ban check and a safety-net error handler."""
 
     access_policy: AccessPolicy | None = None
+    usage_stats = None
+
+    def _count_usage(self, interaction: discord.Interaction) -> None:
+        """Count slash and context-menu commands (not autocomplete or buttons)."""
+        stats = self.usage_stats
+        command = interaction.command
+        if stats is None or command is None or interaction.type is not discord.InteractionType.application_command:
+            return
+        try:
+            stats.record(command.qualified_name, interaction.guild_id)
+        except Exception:
+            logger.debug("Could not count command usage", exc_info=True)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         policy = self.access_policy
@@ -80,6 +93,7 @@ class BotCommandTree(app_commands.CommandTree):
                 except discord.HTTPException:
                     logger.debug("Could not notify banned user", exc_info=True)
             return False
+        self._count_usage(interaction)
         return True
 
     async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
@@ -210,6 +224,10 @@ class TranslatorBot:
         )
         self.bot.tree.access_policy = self.access_policy
         self.interaction_tracking_service = InteractionTrackingService(self.db_manager)
+        self.usage_stats_service = UsageStatsService(self.db_manager)
+        self.bot.tree.usage_stats = self.usage_stats_service
+        # Registered right after the pool, so the last counters are saved before it closes.
+        self.bot.add_cleanup("command usage counters", self.usage_stats_service.flush)
         self.database_health_service = DatabaseHealthService(self.db_manager)
         self.kvk_service = KVKService()
         self.bot.add_cleanup("KVK history client", self.kvk_service.close)
@@ -340,6 +358,7 @@ class TranslatorBot:
             kingshot_data_service=self.kingshot_data_service,
             started_at=self.started_at,
             access_policy=self.access_policy,
+            usage_stats_service=self.usage_stats_service,
         )
         self.help_handler = HelpHandler(
             self.bot,
@@ -354,6 +373,7 @@ class TranslatorBot:
         self.bot.add_cleanup("event scheduler", self._stop_event_scheduler)
         self.bot.add_cleanup("maintenance", self._stop_maintenance)
         self._maintenance_loop = tasks.loop(hours=24)(self._run_maintenance)
+        self._usage_flush_loop = tasks.loop(minutes=5)(self.usage_stats_service.flush)
         logger.info("All handlers initialized")
 
         # Setup bot
@@ -391,6 +411,9 @@ class TranslatorBot:
                 except Exception as e:
                     logger.error(f"Failed to sync slash commands: {e}")
 
+            # Buttons of gift-code panels posted before this start work again.
+            self.gift_code_handler.register_persistent_views()
+
             self.event_handler.start_scheduler_task()
             logger.info("Event scheduler task started")
 
@@ -399,6 +422,8 @@ class TranslatorBot:
             self.alliance_power_handler.start_polling_task()
             if not self._maintenance_loop.is_running():
                 self._maintenance_loop.start()
+            if not self._usage_flush_loop.is_running():
+                self._usage_flush_loop.start()
 
         @self.bot.event
         async def on_command_error(ctx, error):
@@ -433,7 +458,7 @@ class TranslatorBot:
             logger.info(f"Bot removed from guild: {guild.name} (ID: {guild.id})")
 
     async def _stop_event_scheduler(self) -> None:
-        self.event_handler.stop_scheduler_task()
+        await self.event_handler.shutdown_scheduler()
 
     async def _stop_alliance_power_polling(self) -> None:
         if self.alliance_power_handler.is_polling_running():
@@ -442,9 +467,25 @@ class TranslatorBot:
     async def _stop_maintenance(self) -> None:
         if self._maintenance_loop.is_running():
             self._maintenance_loop.cancel()
+        if self._usage_flush_loop.is_running():
+            self._usage_flush_loop.cancel()
 
     async def _run_maintenance(self) -> None:
-        """Daily housekeeping: drop stored translation text past its retention."""
+        """Daily housekeeping: drop stored data past its retention.
+
+        Each step is independent: one failing purge must not skip the others or stop
+        the daily loop.
+        """
+        for name, purge in (
+            ("old gift-code announcement records", self.gift_code_service.purge_announcements),
+            ("old command usage counters", self.usage_stats_service.purge_old),
+        ):
+            try:
+                deleted = await purge()
+                if deleted:
+                    logger.info("Purged %s %s", deleted, name)
+            except Exception:
+                logger.exception("Purge of %s failed", name)
         retention_days = self.config.translation_log_retention_days
         purge = getattr(self.interaction_tracking_service, "purge_old_translation_logs", None)
         if retention_days <= 0 or purge is None:
@@ -466,11 +507,12 @@ class TranslatorBot:
         if channel is None:
             return
         embed = discord.Embed(
-            title="Thanks for adding DS Translator",
+            title=f"Thanks for adding {getattr(self.bot.user, 'display_name', None) or 'the bot'}",
             description=(
-                "**Server managers:** run `/configure` to choose the gift-code channel, the alliance report "
-                "channel and an optional bot manager role.\n"
-                "**Everyone:** run `/help` for a tour of translation, player lookups, events and gift codes."
+                "**Server managers:** run `/giftpanel` in the channel where members should sign up for gift "
+                "codes, and `/configure` for the alliance report channel and an optional bot manager role.\n"
+                "**Everyone:** run `/help` for a tour of gift codes, player lookups, alliance trends, events "
+                "and translation (right-click a message → Apps → Translate)."
             ),
             color=discord.Color.blurple(),
         )

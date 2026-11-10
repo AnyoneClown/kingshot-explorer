@@ -68,7 +68,7 @@ def _truncate_for_log(value: str, limit: int = 200) -> str:
 
 
 _PERSONA = (
-    "You are AI Clown, also known as DS Translator, a helpful Discord bot for this server. "
+    "You are AI Clown, a helpful Discord bot for this server. "
     "People use this server for game coordination, translation help, events, gift codes, "
     "player lookups, and casual chat. Use the replied-to message and recent chat context to "
     "understand references, language, tone, and who is talking. If the latest message is vague, "
@@ -120,6 +120,11 @@ class ChatbotService(IChatbotService):
     MAX_TRANSIENT_ATTEMPTS = 4
     PROVIDER_ATTEMPT_TIMEOUT_SECONDS = 30.0
     TOTAL_REPLY_TIMEOUT_SECONDS = 60.0
+    # A direct mention waits at most this long for a free model slot, and the cheap
+    # random-reply check may take at most this long.
+    QUEUE_WAIT_SECONDS = 30.0
+    GATE_TIMEOUT_SECONDS = 15.0
+    _TOOL_ERROR_MARKERS = ("tool", "function call", "function_call")
     RETRY_BACKOFF_BASE_SECONDS = 2.0
     _TRANSIENT_MARKERS = ("degraded function", "temporarily overloaded")
     _TOOL_REJECTED_ERRORS = (BadRequestError, UnprocessableEntityError, NotFoundError)
@@ -142,7 +147,7 @@ class ChatbotService(IChatbotService):
         gate_model: Optional[str] = None,
         gate_max_tokens: int = 512,
         max_concurrent_requests: int = 2,
-        reply_timeout_seconds: float = 90.0,
+        reply_timeout_seconds: float = 40.0,
         tool_retry_after_seconds: float = 600.0,
         seed: Optional[int] = None,
     ):
@@ -558,14 +563,15 @@ class ChatbotService(IChatbotService):
             },
         ]
         try:
-            response = await self._client.chat.completions.create(
-                model=self._gate_model,
-                messages=messages,
-                temperature=0,
-                top_p=1,
-                max_tokens=self._gate_max_tokens,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
+            async with asyncio.timeout(self.GATE_TIMEOUT_SECONDS):
+                response = await self._client.chat.completions.create(
+                    model=self._gate_model,
+                    messages=messages,
+                    temperature=0,
+                    top_p=1,
+                    max_tokens=self._gate_max_tokens,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )
         except Exception as exc:
             logger.warning("Random reply gate failed, skipping reply: %s", exc)
             return False
@@ -613,7 +619,18 @@ class ChatbotService(IChatbotService):
         request_id = uuid.uuid4().hex[:12]
         used_tool_model = False
         failure: Optional[str] = None
-        async with self._semaphore:
+        try:
+            # Bounded: with both slots busy on slow replies, a third mention must not
+            # wait for minutes before the user hears anything.
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=self.QUEUE_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            if not force_reply:
+                return None
+            logger.warning("Sending chat fallback reply (request_id=%s, category=model busy)", request_id)
+            return ChatReply(
+                truncate_cleanly(self.UNAVAILABLE_REPLY, self._max_chat_response_chars), is_fallback=True
+            )
+        try:
             try:
                 if not force_reply and not await self._passes_random_gate(cleaned_message, history_lines):
                     return None
@@ -626,8 +643,19 @@ class ChatbotService(IChatbotService):
                         async with asyncio.timeout(self._reply_timeout_seconds):
                             tool_text = await self._run_tool_loop(tool_messages, tool_context)
                     except self._TOOL_REJECTED_ERRORS as exc:
-                        logger.warning("Tool-calling chat rejected by the API, using plain reply: %s", exc)
-                        self._tools_disabled_until = time.monotonic() + self._tool_retry_after_seconds
+                        # Only a rejection of tool calling itself switches tools off for a
+                        # while. A request-specific 400 or a provider hiccup must not leave
+                        # every data question unanswered for ten minutes.
+                        text = str(exc).lower()
+                        if not self._is_transient_provider_error(exc) and any(
+                            marker in text for marker in self._TOOL_ERROR_MARKERS
+                        ):
+                            logger.warning("Tool-calling chat rejected by the API, using plain reply: %s", exc)
+                            self._tools_disabled_until = time.monotonic() + self._tool_retry_after_seconds
+                        else:
+                            logger.warning(
+                                "Tool-calling chat failed (request_id=%s), using plain reply: %s", request_id, exc
+                            )
                         tool_text = ""
                     except Exception as exc:
                         logger.warning(
@@ -700,6 +728,8 @@ class ChatbotService(IChatbotService):
             except Exception as exc:
                 logger.error("Contextual reply generation failed (request_id=%s): %s", request_id, exc, exc_info=True)
                 failure = f"error: {type(exc).__name__}"
+        finally:
+            self._semaphore.release()
 
         if not force_reply:
             return None

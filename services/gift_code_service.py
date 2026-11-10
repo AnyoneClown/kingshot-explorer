@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
 import aiohttp
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import DatabaseManager, get_db
-from repositories.discord_repositories import GiftCodeRedemptionRepository, GiftCodeRepository
+from repositories.discord_repositories import (
+    GiftCodeAnnouncementRepository,
+    GiftCodeRedemptionRepository,
+    GiftCodeRepository,
+)
 from services.kingshot_api import KingshotAPIClient
 from services.transactions import run_db_operation
 
@@ -123,6 +128,43 @@ class GiftCodeService(IGiftCodeService):
         if session is not None:
             return await _inner(session)
         return await run_db_operation(await self._get_db_manager(), _inner, retry_on_integrity_error=True)
+
+    async def add_submitted_gift_code(self, code: str) -> tuple[bool, Any]:
+        """Track a member-submitted code as pending; returns (newly added, row)."""
+
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRepository(db_session).add_submitted(code)
+
+        return await run_db_operation(await self._get_db_manager(), _inner, retry_on_integrity_error=True)
+
+    async def get_gift_code(self, code: str) -> Any:
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRepository(db_session).get_by_code(code)
+
+        return await self._with_session(None, _inner)
+
+    async def get_announcements(self, gift_code: str) -> dict[int, int]:
+        """Announcement message IDs already posted for ``gift_code``, by channel ID."""
+
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeAnnouncementRepository(db_session).for_code(gift_code)
+
+        return await self._with_session(None, _inner)
+
+    async def save_announcement(self, gift_code: str, channel_id: int, message_id: int) -> None:
+        async def _inner(db_session: AsyncSession):
+            await GiftCodeAnnouncementRepository(db_session).save(gift_code, channel_id, message_id)
+
+        await run_db_operation(await self._get_db_manager(), _inner, retry_on_integrity_error=True)
+
+    async def purge_announcements(self, older_than_days: int = 14) -> int:
+        """Forget announcement messages of codes that are long finished."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeAnnouncementRepository(db_session).delete_older_than(cutoff)
+
+        return await run_db_operation(await self._get_db_manager(), _inner)
 
     async def list_pending_gift_codes(self) -> list[Any]:
         """Codes whose automatic redemption has not finished (oldest first)."""
