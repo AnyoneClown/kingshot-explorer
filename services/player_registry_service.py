@@ -116,11 +116,23 @@ class PlayerRegistryService:
         async with db.session() as session:
             yield session
 
-    async def _run(self, operation, *, session=None, retry_on_integrity_error: bool = False):
+    async def _run(
+        self,
+        operation,
+        *,
+        session=None,
+        retry_on_integrity_error: bool = False,
+        isolation_level: str | None = None,
+    ):
         if session is not None:
             return await operation(session)
         db = await self._get_db_manager()
-        return await run_db_operation(db, operation, retry_on_integrity_error=retry_on_integrity_error)
+        return await run_db_operation(
+            db,
+            operation,
+            retry_on_integrity_error=retry_on_integrity_error,
+            isolation_level=isolation_level,
+        )
 
     # ------------------------------------------------------------------ profiles
 
@@ -240,8 +252,11 @@ class PlayerRegistryService:
         ``profiles`` rows carry ``player_id`` plus optional ``player_uid``,
         ``player_name``, ``kingdom`` and ``castle_level``. Shared profiles are
         created or refreshed; players already in this roster are left as they are
-        (``enable_existing`` re-enables disabled ones). The caps are re-checked in the
-        same serializable transaction, so concurrent commands cannot overshoot them.
+        (``enable_existing`` re-enables disabled ones). The caps are counted and the
+        rows inserted in one SERIALIZABLE transaction: two concurrent imports that read
+        the same count conflict, and the retried one sees the other's rows, so they
+        cannot overshoot the caps together. A caller-supplied ``session`` keeps its
+        own isolation level.
         """
         unique_profiles: dict[str, dict[str, Any]] = {}
         for profile in profiles:
@@ -302,7 +317,12 @@ class PlayerRegistryService:
             outcome.roster_size = total + len(outcome.added)
             return outcome
 
-        outcome = await self._run(operation, session=session, retry_on_integrity_error=True)
+        outcome = await self._run(
+            operation,
+            session=session,
+            retry_on_integrity_error=True,
+            isolation_level="SERIALIZABLE",
+        )
         logger.info(
             "Guild %s roster: %s added, %s already registered, %s over the %s limit (by user %s)",
             guild_id,

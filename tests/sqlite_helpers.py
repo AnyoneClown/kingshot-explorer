@@ -44,6 +44,7 @@ class SqliteDb:
     def __init__(self, engine=None):
         self.engine = engine or create_engine("sqlite://")
         self.transactions = []
+        self.isolation_levels = []
         Base.metadata.create_all(
             self.engine,
             tables=[
@@ -62,7 +63,8 @@ class SqliteDb:
         with Session(self.engine, expire_on_commit=False, autoflush=False) as sync_session, sync_session.begin():
             yield AsyncSessionAdapter(sync_session)
 
-    async def run_in_transaction(self, operation, *, attempts=4, retry_on_integrity_error=False):
+    async def run_in_transaction(self, operation, *, attempts=4, retry_on_integrity_error=False, isolation_level=None):
         self.transactions.append(retry_on_integrity_error)
+        self.isolation_levels.append(isolation_level)
         async with self.session() as session:
             return await operation(session)

@@ -109,8 +109,10 @@ async def test_registration_respects_personal_and_server_caps(db):
     assert outcome.over_limit == ["103"]
     assert outcome.limit_kind == "personal"
     assert outcome.roster_size == 3
-    # Writes go through the retried transaction helper (read-then-insert upsert).
+    # Writes go through the retried transaction helper (read-then-insert upsert),
+    # serializable so concurrent imports cannot both pass the cap check.
     assert db.transactions[-1] is True
+    assert db.isolation_levels[-1] == "SERIALIZABLE"
 
     # Another user hits the server cap (4) instead of a personal one.
     outcome = await registry.register_players_for_guild(

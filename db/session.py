@@ -6,6 +6,7 @@ import random
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Awaitable, Callable, TypeVar
 
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -18,6 +19,7 @@ T = TypeVar("T")
 # CockroachDB reports transaction contention as SQLSTATE 40001 and expects the
 # client to retry the whole transaction.
 _RETRYABLE_SQLSTATES = {"40001"}
+_TRANSACTION_ISOLATION_LEVELS = {"SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED"}
 
 
 def is_retryable_db_error(error: BaseException) -> bool:
@@ -107,6 +109,7 @@ class DatabaseManager:
         *,
         attempts: int = 4,
         retry_on_integrity_error: bool = False,
+        isolation_level: str | None = None,
     ) -> T:
         """Run ``operation`` in its own transaction, retrying CockroachDB contention.
 
@@ -114,11 +117,29 @@ class DatabaseManager:
         state between attempts. Set ``retry_on_integrity_error`` for read-then-insert
         upserts, where a concurrent insert of the same key surfaces as a unique
         violation and the retry then finds the existing row.
+
+        SQLAlchemy's asyncpg driver opens every transaction as READ COMMITTED, and
+        CockroachDB honours that once ``sql.txn.read_committed_isolation.enabled`` is
+        on. Pass ``isolation_level="SERIALIZABLE"`` when the operation checks a count
+        or other invariant before writing, so concurrent callers get a 40001 retry
+        instead of both acting on the same stale read.
+
+        The level is set with ``SET TRANSACTION`` as the first statement rather than
+        through ``execution_options``: the cockroachdb dialect rejects SQLAlchemy's
+        reset to READ COMMITTED when the connection goes back to the pool.
         """
+        isolation_statement = None
+        if isolation_level is not None:
+            level = isolation_level.replace("_", " ").upper()
+            if level not in _TRANSACTION_ISOLATION_LEVELS:
+                raise ValueError(f"Unsupported isolation level: {isolation_level!r}")
+            isolation_statement = text(f"SET TRANSACTION ISOLATION LEVEL {level}")
         last_error: BaseException | None = None
         for attempt in range(1, attempts + 1):
             try:
                 async with self.session() as session:
+                    if isolation_statement is not None:
+                        await session.execute(isolation_statement)
                     return await operation(session)
             except IntegrityError as error:
                 if not retry_on_integrity_error or attempt == attempts:
