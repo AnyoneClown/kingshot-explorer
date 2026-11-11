@@ -727,7 +727,6 @@ def build_entity(page: Page) -> Optional[dict[str, Any]]:
     overview_parts = [t for t in page.intro if not is_boilerplate(t)]
     for section in page.sections:
         title = section.title.lower()
-        texts = [item.text for item in section.items if item.kind == "p"]
         if title in SKIP_SECTIONS:
             recruit, in_recruit = [], False
             for item in section.items:

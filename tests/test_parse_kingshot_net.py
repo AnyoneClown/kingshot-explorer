@@ -19,7 +19,8 @@ def page_html(main: str, *, faq=None, payload=None) -> str:
         }
         scripts += f'<script type="application/ld+json">{json.dumps(data)}</script>'
     if payload is not None:
-        scripts += f"<script>self.__next_f.push([1,{json.dumps(json.dumps(payload, separators=(",", ":")))}])</script>"
+        compact = json.dumps(payload, separators=(",", ":"))  # the real payload has no spaces
+        scripts += f"<script>self.__next_f.push([1,{json.dumps(compact)}])</script>"
     return f"<html><body><nav>Home</nav><main>{main}</main>{scripts}</body></html>"
 
 
