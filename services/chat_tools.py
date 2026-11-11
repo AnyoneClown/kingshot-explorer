@@ -443,6 +443,10 @@ def make_governor_lookup_tool(kingshot_data_service: Any) -> ChatTool:
 # ---------------------------------------------------------------------------
 
 
+# A filtered search whose best chunk is farther than this also searches without the filter.
+FILTER_FALLBACK_DISTANCE = 0.55
+
+
 def make_knowledge_search_tool(rag_service: Any, *, max_distance: Optional[float] = None, limit: int = 4) -> ChatTool:
     cutoff = max_distance if max_distance is not None else getattr(rag_service, "max_distance", 0.7)
 
@@ -453,6 +457,16 @@ def make_knowledge_search_tool(rag_service: Any, *, max_distance: Optional[float
         entity_type = " ".join(str(arguments.get("entity_type") or "").split()) or None
         chunks = await rag_service.search(query, limit=limit, entity_type=entity_type)
         matches = [chunk for chunk in chunks or [] if float(_field(chunk, "distance", 99)) <= cutoff]
+        best = min((float(_field(chunk, "distance", 99)) for chunk in matches), default=99.0)
+        if entity_type and best > FILTER_FALLBACK_DISTANCE:
+            # The model guesses filters ("building" for governor gear); a wrong guess must not
+            # hide the right answer, so also search everything and keep the closest chunks.
+            unfiltered = await rag_service.search(query, limit=limit)
+            merged = {
+                str(_field(chunk, "chunk_id", id(chunk))): chunk
+                for chunk in matches + [c for c in unfiltered or [] if float(_field(c, "distance", 99)) <= cutoff]
+            }
+            matches = sorted(merged.values(), key=lambda chunk: float(_field(chunk, "distance", 99)))[:limit]
         if not matches:
             return {"results": [], "note": "No matching knowledge in the Kingshot knowledge base."}
         return {
@@ -471,8 +485,10 @@ def make_knowledge_search_tool(rag_service: Any, *, max_distance: Optional[float
     return ChatTool(
         name="search_kingshot_knowledge",
         description=(
-            "Search the curated Kingshot game knowledge base (heroes, events, buildings, strategies). "
-            "Use it for game questions before answering from memory."
+            "Search the curated Kingshot game knowledge base: heroes (stats, skills per level, "
+            "exclusive weapons, tier lists by role), buildings and Truegold upgrade costs, pets, "
+            "masters, research (Academy, War Academy, Advanced Truegold, Alliance), governor gear "
+            "and charms. Use it for game questions before answering from memory."
         ),
         parameters={
             "type": "object",
@@ -480,7 +496,12 @@ def make_knowledge_search_tool(rag_service: Any, *, max_distance: Optional[float
                 "query": {"type": "string", "description": "What to look up, in English."},
                 "entity_type": {
                     "type": "string",
-                    "description": "Optional filter such as hero, event or building.",
+                    "description": (
+                        "Optional filter: hero, hero_tier_list, building, pet, master, academy_research, "
+                        "war_academy_research, advanced_truegold_research, alliance_research, "
+                        "truegold_requirements, governor_gear_overview or governor_charm_overview. "
+                        "Leave it out when unsure."
+                    ),
                 },
             },
             "required": ["query"],

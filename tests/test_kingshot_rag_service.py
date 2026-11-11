@@ -16,7 +16,14 @@ class FakeEmbeddings:
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        return SimpleNamespace(data=[SimpleNamespace(embedding=embedding())])
+        inputs = kwargs["input"] if isinstance(kwargs["input"], list) else [kwargs["input"]]
+        # Reversed on purpose: the service must restore input order from ``index``.
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=i, embedding=[0.1 + i / 1000] * 2048)
+                for i in reversed(range(len(inputs)))
+            ]
+        )
 
 
 class FakeCompletions:
@@ -196,3 +203,32 @@ def test_search_distance_cutoff_is_optional_and_configurable():
     assert len(asyncio.run(service.search("bear trap"))) == 2
     assert [chunk.distance for chunk in asyncio.run(service.search("bear trap", max_distance=0.5))] == [0.3]
     assert service.max_distance == 0.5
+
+
+def test_embed_texts_batches_requests_and_keeps_input_order():
+    client = FakeClient()
+    service = KingshotRAGService(FakeDB([]), client)
+
+    vectors = asyncio.run(service.embed_texts([" a ", "b", "c", "d", "e"], batch_size=2))
+
+    assert [call["input"] for call in client.embeddings.calls] == [["a", "b"], ["c", "d"], ["e"]]
+    assert all(call["extra_body"] == {"input_type": "passage"} for call in client.embeddings.calls)
+    assert len(vectors) == 5
+    # Each batch restarts at index 0, so in-batch order is what must be preserved.
+    assert [v[0] for v in vectors] == pytest.approx([0.1, 0.101, 0.1, 0.101, 0.1])
+
+
+def test_embed_texts_rejects_empty_text_and_short_responses():
+    service = KingshotRAGService(FakeDB([]), FakeClient())
+    with pytest.raises(KingshotRAGError, match="empty"):
+        asyncio.run(service.embed_texts(["ok", "   "]))
+
+    class ShortEmbeddings(FakeEmbeddings):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=embedding())])
+
+    client = FakeClient()
+    client.embeddings = ShortEmbeddings()
+    with pytest.raises(KingshotRAGError, match="1 vectors for 2 texts"):
+        asyncio.run(KingshotRAGService(FakeDB([]), client).embed_texts(["a", "b"]))

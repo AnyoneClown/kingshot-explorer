@@ -285,3 +285,52 @@ def test_build_registry_only_includes_available_services():
 
     assert registry.names == ["list_active_gift_codes", "lookup_governor"]
     assert not build_chat_tool_registry()
+
+
+def test_knowledge_search_falls_back_to_unfiltered_when_the_filter_misses():
+    class FakeRag:
+        max_distance = 0.7
+
+        def __init__(self):
+            self.calls = []
+
+        async def search(self, query, *, limit, entity_type=None):
+            self.calls.append(entity_type)
+            if entity_type == "building":  # the model guessed the wrong type
+                return [SimpleNamespace(chunk_id="b1", name="Embassy", entity_type="building", content="Embassy",
+                                        entity_data={}, distance=0.68)]
+            return [
+                SimpleNamespace(chunk_id="g1", name="Governor Gear", entity_type="governor_gear_overview",
+                                content="Mythic satin", entity_data={}, distance=0.35),
+                SimpleNamespace(chunk_id="b1", name="Embassy", entity_type="building", content="Embassy",
+                                entity_data={}, distance=0.68),
+            ]
+
+    rag = FakeRag()
+    registry = registry_with(make_knowledge_search_tool(rag))
+
+    data = run(registry, "search_kingshot_knowledge", '{"query": "satin to mythic", "entity_type": "building"}')["data"]
+
+    assert rag.calls == ["building", None]
+    assert [item["name"] for item in data["results"]] == ["Governor Gear", "Embassy"]
+
+
+def test_knowledge_search_keeps_a_good_filtered_result_without_a_second_search():
+    class FakeRag:
+        max_distance = 0.7
+
+        def __init__(self):
+            self.calls = []
+
+        async def search(self, query, *, limit, entity_type=None):
+            self.calls.append(entity_type)
+            return [SimpleNamespace(chunk_id="h1", name="Ava", entity_type="hero", content="Ava skills",
+                                    entity_data={}, distance=0.3)]
+
+    rag = FakeRag()
+    registry = registry_with(make_knowledge_search_tool(rag))
+
+    data = run(registry, "search_kingshot_knowledge", '{"query": "ava skills", "entity_type": "hero"}')["data"]
+
+    assert rag.calls == ["hero"]
+    assert [item["name"] for item in data["results"]] == ["Ava"]

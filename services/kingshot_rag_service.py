@@ -51,6 +51,9 @@ class KingshotRAGService:
     """Embed, store, retrieve, and answer Kingshot game knowledge."""
 
     EMBEDDING_DIMENSIONS = 2048
+    # Texts per embeddings request when storing knowledge: one request per chunk would
+    # spend the shared NVIDIA rate limit (40 requests/minute) on bulk uploads.
+    EMBEDDING_BATCH_SIZE = 16
     # Cosine distance (0 = identical, 1 = unrelated). Chunks farther than this are not
     # treated as answers; tune with the distances logged by ``search``.
     DEFAULT_MAX_DISTANCE = 0.7
@@ -84,8 +87,47 @@ class KingshotRAGService:
         """Cosine-distance cutoff above which retrieved chunks are considered unrelated."""
         return self._max_distance
 
+    async def embed_texts(
+        self, text_values: Sequence[str], *, input_type: str = "passage", batch_size: int | None = None
+    ) -> list[list[float]]:
+        """Embed several texts with one request per batch; results keep the input order."""
+        if input_type not in {"query", "passage"}:
+            raise KingshotRAGError("Embedding input_type must be 'query' or 'passage'")
+        cleaned = [self._clean_text(value) for value in text_values]
+        if any(not value for value in cleaned):
+            raise KingshotRAGError("Cannot embed empty text")
+        size = max(1, batch_size or self.EMBEDDING_BATCH_SIZE)
+        vectors: list[list[float]] = []
+        for start in range(0, len(cleaned), size):
+            batch = cleaned[start:start + size]
+            response = await self._client.embeddings.create(
+                model=self._embedding_model,
+                input=batch,
+                dimensions=self.EMBEDDING_DIMENSIONS,
+                extra_body={"input_type": input_type},
+            )
+            data = list(getattr(response, "data", None) or [])
+            if len(data) != len(batch):
+                raise KingshotRAGError(
+                    f"Embedding response returned {len(data)} vectors for {len(batch)} texts"
+                )
+            data.sort(key=lambda item: getattr(item, "index", 0) if not isinstance(item, dict) else item.get("index", 0))
+            for item in data:
+                embedding = getattr(item, "embedding", None)
+                if embedding is None and isinstance(item, dict):
+                    embedding = item.get("embedding")
+                vectors.append(self._validate_embedding(embedding))
+        logger.info(
+            "Embedded %s Kingshot texts in %s request(s): input_type=%s model=%s",
+            len(vectors),
+            -(-len(cleaned) // size) if cleaned else 0,
+            input_type,
+            self._embedding_model,
+        )
+        return vectors
+
     async def embed_text(self, text_value: str, *, input_type: str = "passage") -> list[float]:
-        """Generate a dense BGE-M3 embedding for text."""
+        """Generate a dense embedding for one text."""
         cleaned_text = self._clean_text(text_value)
         if not cleaned_text:
             raise KingshotRAGError("Cannot embed empty text")
@@ -156,6 +198,9 @@ class KingshotRAGService:
             source,
         )
 
+        # Embed before opening the transaction, so no database transaction waits on the API.
+        embeddings = await self.embed_texts([chunk.content for chunk in normalized_chunks], input_type="passage")
+
         async with self._db_manager.session() as session:
             entity = await self._upsert_entity_in_session(session, entity_type, slug, name, data, source)
             logger.info("Upserted Kingshot entity: id=%s slug=%s", entity.id, entity.slug)
@@ -169,15 +214,14 @@ class KingshotRAGService:
                 )
 
             inserted_chunks = 0
-            for index, chunk in enumerate(normalized_chunks, 1):
-                logger.info(
-                    "Embedding Kingshot chunk: entity_slug=%s chunk_index=%s content_chars=%s metadata_keys=%s",
+            for index, (chunk, embedding) in enumerate(zip(normalized_chunks, embeddings), 1):
+                logger.debug(
+                    "Storing Kingshot chunk: entity_slug=%s chunk_index=%s content_chars=%s metadata_keys=%s",
                     slug,
                     index,
                     len(chunk.content),
                     sorted((chunk.metadata or {}).keys()),
                 )
-                embedding = await self.embed_text(chunk.content, input_type="passage")
                 await session.execute(
                     text(
                         """

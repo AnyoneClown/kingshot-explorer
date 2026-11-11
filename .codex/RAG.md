@@ -158,3 +158,38 @@ Amane can blind people.
   Governor ID tools.
 - `/kingshot_upsert` is restricted to bot operators (`ADMIN_USER_IDS`) because the
   knowledge base is shared by every server.
+
+## kingshot.net knowledge import (2026-11-11)
+
+The knowledge base holds the kingshot.net database, hero and hero tier-list pages: 471 entities and
+3,548 chunks (heroes 37, hero tier lists 8 roles, buildings 10, pets 14, masters 10, Academy / War
+Academy / Advanced Truegold / Alliance research 373, governor gear and charms, Truegold TG1–TG8, plus an
+overview entity per section). It replaced the 31 heroes scraped from kingshotguide.org in May 2026 (same
+slugs, so no duplicates); a copy of those rows, without vectors, is on the Pi in
+`~/backups/ds-translator/kingshot-entities-before-kingshot-net-20261111.json`.
+
+Refresh:
+
+```bash
+uv run python scripts/parse_kingshot_net.py --fetch -o kingshot_net.json   # ~470 pages, 1 request/s
+uv run python scripts/upload_kingshot_knowledge.py -i kingshot_net.json --dry-run
+uv run python scripts/upload_kingshot_knowledge.py -i kingshot_net.json --backup backup.json
+```
+
+- robots.txt allows these pages and disallows `/api/`; the parser never calls `/api/`.
+- The parser reads `<main>` (skipping `aria-hidden` decoration, taking exact numbers from `title`
+  attributes instead of the rounded "6K" text, keeping hidden tab panels and closed accordions), the
+  page's JSON-LD `FAQPage` (one chunk per question) and the embedded page data for skill levels (the
+  HTML shows only the max level). Every chunk names its entity, type and section, and table chunks
+  their row range, so one retrieved chunk stands on its own; chunks stay under 850 characters because
+  the chat tool clips results at 900.
+- The uploader embeds 16 chunks per request and before the transaction opens; a full upload takes
+  about 22 minutes with the default 1.5 s pause between entities (shared 40 requests/minute limit).
+- Entities that disappear from the site are not deleted by an upload: it upserts by slug only.
+- Verification: four independent reviews compared chunks with the pages (all table rows of buildings,
+  pets, research, gear and charms, 1,290 hero skill values, every tier placement) until no mismatches
+  were left; an end-to-end run of the bot's tool loop retrieved the right entities for hero, building,
+  pet, Truegold and governor gear questions in English and Ukrainian.
+- Known limits: master research covers only the stage rendered on the page (Masterful); overview lists
+  of research cards have no separators between name, stat and value; some cell badges run together
+  ("Requires: Embassy 24 Barracks 24").
