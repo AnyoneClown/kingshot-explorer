@@ -281,6 +281,42 @@ Cross-kingdom lookups work for any `kid`; there is no transfer-group or event ga
 
 Use `score` as the game-displayed raw integer. `score_decimal` is included only for boards that are genuinely decimal. Integer-score boards such as Mystic Trial should use `score`. `update_ts` is a Unix timestamp.
 
+### `/leaderboard` integration notes
+
+`/leaderboard` (`services/leaderboard_service.py`, `handlers/leaderboard_handler.py`) shows
+every board above except `27` and `28`, for one kingdom or for all kingdoms. Checked
+against the live API on 2026-11-11:
+
+- `limit` is capped at 100 entries by the server; a larger value still returns 100. A
+  resolved board of 100 takes about 1.5 s.
+- Types `27` and `28` returned no entries for a kingdom or globally (off-season), so the
+  command does not offer them.
+- A kingdom that does not exist answers `200` with no entries and
+  `"error": "gateway refusal"`. The command reports it as a wrong kingdom number; an empty
+  board without that field is reported as off-season.
+- Alliance boards (`1`, `2`) carry the alliance id in `uid`. Do not pass `resolve=true`
+  for them: the id is then looked up as a player and comes back as `lord<number>`.
+- `/v1/alliances/{aid}?kid=` returned the roster without the alliance's `name` and `abbr`.
+  `KingshotDataService.get_alliance_identity` reads them from a member's profile, the
+  leader first. The lookup needs the right `kid`: with another kingdom the roster is empty.
+- Alliance names for a board page come from two places. Resolved player boards carry each
+  player's alliance (`aid`, `abbr`, `name`), so the Personal Power and Kill Count boards of
+  the same scope name the strongest alliances with two requests. The rest are looked up
+  one by one, six at a time and for at most 12 s per page; found names are remembered for
+  the life of the process.
+- A global alliance board has no kingdom to look alliances up in. Alliance ids follow
+  `(kingdom + 9) * 100000 + n` for kingdoms 240, 271, 555 and 830, so the kingdom is
+  guessed from the id. This is an observation, not a documented rule; when the guess is
+  wrong the roster is empty and the alliance is shown by its id.
+- The Town Center board's score is the profile's `stove_lv`. Levels above 30 are shown as
+  Truegold levels: every fifth level is a `TG` level (35 = TG1, 70 = TG8) and the four
+  between are its steps (`TG7-3`).
+- Boards are cached for 120 s per board and scope. Paging does not call the API again.
+
+Verification: all 18 offered boards were fetched for kingdom 830 and globally, and the
+cards for Personal Power, Alliance Power, Alliance Kills, Town Center Level and Radiant
+Spire were drawn from live data with every alliance on the checked pages named.
+
 ## Raw Passthrough Endpoint
 
 `POST /v1/call` is a raw passthrough endpoint for first-party debugging. It encodes any of the game gateway `req_*` protocols and returns the decoded response body.

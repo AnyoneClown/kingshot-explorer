@@ -384,6 +384,20 @@ class KingshotDataService:
                 return self._ranked_alliance(candidate, tag, alliance.get("name"), member_count)
         return self._ranked_alliance(candidate, None, fallback_name, member_count)
 
+    async def get_alliance_identity(self, aid: int | str, kid: int | str) -> Optional[Dict[str, Any]]:
+        """Tag, name and member count of one alliance; None when they cannot be found.
+
+        The alliance endpoint often returns the roster without tag and name, which are
+        then read from a member's profile (the leader first).
+        """
+        normalized_aid = self._positive_int(aid)
+        if normalized_aid is None:
+            return None
+        resolved = await self._resolve_ranked_alliance({"aid": normalized_aid}, kid)
+        if resolved is None or not (resolved.get("abbr") or resolved.get("name")):
+            return None
+        return {key: resolved.get(key) for key in ("aid", "abbr", "name", "member_count")}
+
     @staticmethod
     def _ranked_alliance(
         candidate: Dict[str, int],

@@ -27,6 +27,7 @@ from handlers import (
     GuildConfigHandler,
     HelpHandler,
     KVKHandler,
+    LeaderboardHandler,
     PlayerInfoHandler,
     StatusHandler,
     TranslationHandler,
@@ -34,6 +35,7 @@ from handlers import (
 from handlers.permissions import AccessPolicy, build_denied_embed
 from services.chat_tools import build_chat_tool_registry
 from services.kvk_dossier_service import KvKDossierService
+from services.leaderboard_service import LeaderboardService
 from services.usage_stats_service import UsageStatsService
 from services import (
     EventSchedulerService,
@@ -250,6 +252,7 @@ class TranslatorBot:
             max_distance=config.kingshot_rag_max_distance,
         )
         self.kvk_dossier_service = KvKDossierService(self.kingshot_data_service, self.kvk_service)
+        self.leaderboard_service = LeaderboardService(self.kingshot_data_service)
         # Chat replies use the same OpenAI-compatible NIM client. Direct mentions may call
         # read-only, server-scoped tools through the tool-capable NVIDIA_MODEL.
         self.chat_tool_registry = build_chat_tool_registry(
@@ -295,6 +298,11 @@ class TranslatorBot:
             kingshot_data_service=self.kingshot_data_service,
         )
         self.kvk_handler = KVKHandler(self.kvk_service, self.bot, dossier_service=self.kvk_dossier_service)
+        self.leaderboard_handler = LeaderboardHandler(
+            self.leaderboard_service,
+            self.bot,
+            guild_configuration_service=self.guild_configuration_service,
+        )
         self.gift_code_handler = GiftCodeHandler(
             self.gift_code_service,
             self.player_info_service,
@@ -504,6 +512,7 @@ class TranslatorBot:
         logger.info("Registering command handlers...")
         self.player_info_handler.register_commands()
         self.kvk_handler.register_commands()
+        self.leaderboard_handler.register_commands()
         self.translation_handler.register_commands()
         self.translation_handler.register_events()
         self.event_handler.register_commands()

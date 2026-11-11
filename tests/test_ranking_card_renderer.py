@@ -44,6 +44,22 @@ def test_leaderboard_is_capped_and_accepts_rows_without_values():
     assert opened(renderer.render_leaderboard_card("Top", [])).width
 
 
+def test_leaderboard_page_keeps_the_scale_and_count_of_the_whole_ranking():
+    page = rows(5)
+    own_scale = opened(renderer.render_leaderboard_card("Top", page))
+    board_scale = opened(renderer.render_leaderboard_card("Top", page, scale=4000, count=100))
+
+    assert own_scale.size == board_scale.size
+    # Against the board's best value the bars of a later page are shorter.
+    gold = renderer.PODIUM[1]
+    assert own_scale.convert("RGB").getcolors(1 << 24) != board_scale.convert("RGB").getcolors(1 << 24)
+    assert sum(n for n, color in board_scale.convert("RGB").getcolors(1 << 24) if color == gold) < sum(
+        n for n, color in own_scale.convert("RGB").getcolors(1 << 24) if color == gold
+    )
+    # A scale of zero falls back to the page's own largest value.
+    assert opened(renderer.render_leaderboard_card("Top", page, scale=0)).tobytes() == own_scale.tobytes()
+
+
 def test_ranked_row_labels_and_values():
     assert RankedRow(name="Mila", tag="AQM").label == "[AQM] Mila"
     assert RankedRow(name="Mila").label == "Mila"

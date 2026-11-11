@@ -12,7 +12,8 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
   gift-code channel, daily event calendar, bot manager role) and per-server gift-code
   rosters.
 - Picture cards instead of walls of text: the event calendar, gift-code results, KvK
-  history, KvK comparison, the prep dossier's rankings, the scout leaderboard and the
+  history, KvK comparison, the prep dossier's rankings, the scout leaderboard, the
+  `/leaderboard` rankings and the
   reminders dashboard are drawn
   as images in one shared style (`services/card_drawing.py`) and attached to their embeds.
   When a card cannot be drawn or attached, the same information is posted as text.
@@ -297,6 +298,16 @@ Additional commands are provided by translation, event, player info, KVK, and da
 - `/scout` shows a ranked Mystic Trial leaderboard summary for a kingdom. Selecting a
   player loads their profile in the same public message; **Previous / Next** page
   through players. It defaults to 5 players and caps the limit at 15.
+- `/leaderboard` shows the game's rankings as a picture card: Personal Power, Kill Count,
+  Alliance Power and Kills, Town Center Level, hero, pet and master power, Island
+  Prosperity, Rebel Conquest, Mystic Trial and the six trial towers. `board` picks the
+  ranking (Personal Power by default), `kingdom` the kingdom (this server's kingdom
+  when left empty), and `scope: All kingdoms` the cross-kingdom board. The panel holds
+  the top 100 in pages of 15; a menu switches the board and a button switches between
+  the kingdom and all kingdoms, in the same public message. Boards are kept for two
+  minutes. Tower scores are shown without the game's tower offset and Town Center
+  levels above 30 as Truegold levels (`TG8`). An alliance that cannot be named shows
+  its ID.
 - `/kvk prep kingdom_a kingdom_b` (also the **Prep dossier** button on `/kvk compare`)
   posts a dossier for both kingdoms: castle holder and king history, top alliances,
   top players by power and kills, and KvK records. Sections that fail show as
@@ -321,11 +332,12 @@ docker compose up -d translator-bot-local
 - Commands are grouped: `/gift codes|add|remove|accounts|submit|roster` for everyone,
   `/giftadmin redeem|import|panel` for server managers (hidden from members, because
   Discord hides whole commands, not subcommands), `/kvk history|compare|prep`, `/player`,
-  `/scout`, `/calendar`, `/reminders`, `/remind`, `/settings`, `/status`, `/help`.
+  `/scout`, `/leaderboard`, `/calendar`, `/reminders`, `/remind`, `/settings`, `/status`, `/help`.
 - `/kvk history` shows the castle and prep records, the streak and the last ten seasons as
   a card; `/kvk compare` puts two kingdoms side by side, one row per metric with the better
   side highlighted; `/kvk prep` draws top alliances, top power and top kills of both
-  kingdoms in two columns on one scale; `/scout` draws the Mystic Trial leaderboard.
+  kingdoms in two columns on one scale; `/scout` draws the Mystic Trial leaderboard and
+  `/leaderboard` any ranking board, with bars on the scale of the board's first place.
   Player and alliance names are drawn in Latin, Cyrillic, Greek, Chinese, Japanese,
   Korean and Thai; characters outside those (emoji, Arabic and other scripts that need
   shaping) are left out, and a name with none left is labeled as unsupported.

@@ -15,10 +15,12 @@ from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_erro
 # with a space, like Discord shows it ("gift codes").
 GROUPS = {
     "Players": (
-        "Look up a Governor ID or internal player UID, or browse a kingdom's Mystic Trial leaderboard.",
+        "Look up a Governor ID or internal player UID, browse a kingdom's Mystic Trial leaderboard, "
+        "or open the game's rankings (power, kills, alliances, trials) for a kingdom or all kingdoms.",
         (
             ("player", "View player", "/player player_id:123456"),
             ("scout", "Scout kingdom", "/scout kingdom:830 limit:5"),
+            ("leaderboard", "Leaderboards", "/leaderboard board:Personal Power kingdom:830"),
             ("gift roster", "Server roster", "/gift roster"),
         ),
     ),

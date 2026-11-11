@@ -626,3 +626,45 @@ def test_alliance_full_uses_long_timeout_and_is_not_retried_on_timeout():
     assert result["success"] is False
     assert len(calls) == 1
     assert calls[0]["timeout"] == KingshotDataService.FULL_ROSTER_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_get_alliance_identity_reads_the_tag_from_the_leader_profile():
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/alliances/83900004":
+            # The roster comes back without the alliance's own tag and name.
+            return httpx.Response(200, json={"members": [{"uid": 7, "rank": 1}, {"uid": 9, "rank": 5}]})
+        if path == "/v1/alliances/83900999":
+            return httpx.Response(200, json={"members": []})
+        if path == "/v1/players/9":
+            return httpx.Response(
+                200, json={"uid": 9, "alliance": {"aid": 83900004, "abbr": "KOR", "name": " Serendipity "}}
+            )
+        return httpx.Response(404, json={})
+
+    service = KingshotDataService(api_key="key", base_url="https://ks.example")
+    service._client = httpx.AsyncClient(
+        base_url="https://ks.example",
+        headers=service._build_headers(),
+        transport=httpx.MockTransport(handle),
+    )
+
+    try:
+        found = await service.get_alliance_identity("83900004", 830)
+        missing = await service.get_alliance_identity(83900999, 830)
+        invalid = await service.get_alliance_identity("abc", 830)
+    finally:
+        await service.close()
+
+    assert found == {"aid": 83900004, "abbr": "KOR", "name": "Serendipity", "member_count": 2}
+    assert missing is None and invalid is None
+    # The leader is asked first, so one profile is enough.
+    assert [request.url.path for request in requests] == [
+        "/v1/alliances/83900004",
+        "/v1/players/9",
+        "/v1/alliances/83900999",
+    ]

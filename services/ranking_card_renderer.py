@@ -88,13 +88,19 @@ def render_leaderboard_card(
     *,
     note: str = "",
     accent: Color = BLUE,
+    scale: Optional[float] = None,
+    count: Optional[int | str] = None,
 ) -> bytes:
-    """A ranked list with a bar per row; the first three places get podium colors."""
+    """A ranked list with a bar per row; the first three places get podium colors.
+
+    A page of a longer ranking passes ``scale`` (the value of a full bar, so later
+    pages keep the first page's scale) and ``count`` (what the header pill shows).
+    """
     shown = list(rows[:MAX_LEADERBOARD_ROWS])
-    largest = _largest(shown)
+    largest = scale if scale and scale > 0 else _largest(shown)
     with RENDER_LOCK:
         card = Card(HEADER_HEIGHT + len(shown) * LEADERBOARD_ROW_HEIGHT + 10)
-        card.header(0, title, accent, count=len(rows), note=note)
+        card.header(0, title, accent, count=len(rows) if count is None else count, note=note)
         name_font, value_font, rank_font = get_font(10.5, 500), get_font(10.5, 600), get_font(9.5, 700)
         name_left = PADDING + 26
         bar_left, bar_right = PADDING + 176, CARD_WIDTH - PADDING - 74

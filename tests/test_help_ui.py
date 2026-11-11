@@ -206,8 +206,8 @@ async def test_help_is_registered_with_all_workflows_and_native_alliance_autocom
     app = TranslatorBot(config)
     names = {command.name for command in app.bot.tree.get_commands()}
     assert names == {
-        "help", "status", "player", "scout", "kvk", "calendar", "gift", "giftadmin", "reminders", "remind",
-        "settings", "Translate",
+        "help", "status", "player", "scout", "leaderboard", "kvk", "calendar", "gift", "giftadmin", "reminders",
+        "remind", "settings", "Translate",
     }
     subcommands = {
         group: sorted(command.name for command in app.bot.tree.get_command(group).commands)

@@ -6,6 +6,7 @@ from .gift_code_handler import GiftCodeHandler
 from .guild_config_handler import GuildConfigHandler
 from .help_handler import HelpHandler
 from .kvk_handler import KVKHandler
+from .leaderboard_handler import LeaderboardHandler
 from .player_info_handler import PlayerInfoHandler
 from .status_handler import StatusHandler
 from .translation_handler import TranslationHandler
@@ -19,5 +20,6 @@ __all__ = [
     "GuildConfigHandler",
     "HelpHandler",
     "KVKHandler",
+    "LeaderboardHandler",
     "StatusHandler",
 ]
