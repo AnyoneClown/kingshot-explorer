@@ -4,7 +4,6 @@ from datetime import date, datetime
 from typing import Any, List, Optional
 
 from sqlalchemy import (
-    JSON,
     BigInteger,
     Boolean,
     Date,
@@ -304,14 +303,17 @@ class GuildConfiguration(Base):
     __tablename__ = "guild_configurations"
 
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Discord guild ID
-    use_voice_replies: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     use_random_replies: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Members with this role can manage the bot in this guild (besides Manage Server).
     manager_role_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     # Where gift-code redemption summaries for this guild's roster are posted.
     gift_code_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    # Where automatic alliance reports (roster changes, inactivity) are posted.
-    alliance_report_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # The kingdom this server plays in (one per server).
+    kingdom_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Where the daily event calendar of that kingdom is posted.
+    calendar_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # UTC day of the last calendar post, so a restart does not post the same day twice.
+    calendar_last_posted_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -323,35 +325,8 @@ class GuildConfiguration(Base):
     def __repr__(self) -> str:
         return (
             f"<GuildConfiguration(guild_id={self.guild_id}, "
-            f"use_voice_replies={self.use_voice_replies}, "
             f"use_random_replies={self.use_random_replies})>"
         )
-
-
-class AlliancePowerTracking(Base):
-    """One alliance selected for power tracking per Discord guild."""
-
-    __tablename__ = "alliance_power_tracking"
-
-    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    kingdom_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    alliance_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
-class AlliancePowerSnapshot(Base):
-    """Daily alliance power and member observations shared across guilds."""
-
-    __tablename__ = "alliance_power_snapshots"
-
-    kingdom_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    alliance_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    snapshot_date: Mapped[date] = mapped_column(Date, primary_key=True)
-    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    alliance_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    alliance_tag: Mapped[str] = mapped_column(String(32), nullable=False)
-    total_power: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    members: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
 class KingshotEntity(Base):

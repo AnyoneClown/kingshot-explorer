@@ -10,7 +10,6 @@ import pytest
 from discord import app_commands
 from discord.ext import commands
 
-from handlers.alliance_power_handler import AlliancePowerHandler
 from handlers.event_handler import EventHandler, SchedulerHealth
 from handlers.guild_config_handler import GuildConfigView
 from handlers.help_handler import HelpHandler
@@ -22,7 +21,6 @@ from handlers.translation_handler import TranslationHandler, language_for_locale
 from services.guild_configuration_service import GuildConfigurationService, GuildSettings
 from services.translation_service import has_translatable_text, looks_clearly_english
 from services.usage_stats_service import UsageStatsService
-from services.voice_message_service import VoiceMessageService
 from tests.sqlite_helpers import SqliteDb
 from tests.test_chatbot_service import CONTEXT, TOOL_MODEL, bad_request, make_registry, make_service
 from tests.test_translation_handler_auto import FakeGuildConfig, FakeMessage, FakeTranslation, make_handler
@@ -230,14 +228,13 @@ def test_long_model_language_names_do_not_lose_the_translation_log_row():
     assert len(tracking.calls[0]["source_language"]) == 50
 
 
-def test_ai_and_voice_replies_stay_off_when_the_settings_lookup_fails():
+def test_ai_replies_stay_off_when_the_settings_lookup_fails():
     class BrokenGuildConfig:
         async def get_or_create_for_guild(self, guild_id):
             raise RuntimeError("database is down")
 
-    handler, _ = make_handler(guild_config=BrokenGuildConfig(), enable_voice_replies=True)
+    handler, _ = make_handler(guild_config=BrokenGuildConfig())
     assert asyncio.run(handler._ai_replies_enabled_for_guild(456, default_enabled=True)) is False
-    assert asyncio.run(handler._voice_replies_enabled_for_guild(456)) is False
 
 
 def test_a_declined_random_reply_does_not_use_up_the_users_direct_mention():
@@ -288,19 +285,6 @@ def test_system_messages_are_not_chat():
         handler._handle_auto_translation.assert_awaited_once()
 
     asyncio.run(check())
-
-
-def test_unsupported_languages_get_no_audio_instead_of_the_english_voice():
-    service = VoiceMessageService(
-        backend=SimpleNamespace(), default_voice="Magpie-Multilingual.EN-US.Aria", default_language_code="en-US"
-    )
-    assert service._resolve_language_code(None) == "en-US"
-    assert service._resolve_language_code("Spanish (Mexico)") == "es-US"
-    assert service._resolve_language_code("Ukrainian") is None
-    assert asyncio.run(service.generate_audio("Привіт усім", language_hint="Ukrainian")) is None
-
-
-# --------------------------------------------------------------------- chat
 
 
 def test_one_unrelated_bad_request_does_not_switch_tools_off():
@@ -380,14 +364,14 @@ def test_log_file_keeps_one_name_so_rotation_bounds_the_directory(tmp_path, monk
 
 def test_settings_cache_does_not_restore_a_row_read_before_an_update():
     async def check():
-        service = GuildConfigurationService(default_use_voice_replies=False, db_manager=object())
+        service = GuildConfigurationService(db_manager=object())
         row = {"use_random_replies": False}
         read_started, release_read = asyncio.Event(), asyncio.Event()
 
         def settings():
             return GuildSettings(
-                guild_id=5, use_voice_replies=False, use_random_replies=row["use_random_replies"],
-                manager_role_id=None, gift_code_channel_id=None, alliance_report_channel_id=None,
+                guild_id=5, use_random_replies=row["use_random_replies"],
+                manager_role_id=None, gift_code_channel_id=None,
             )
 
         async def slow_read(operation, *, retry_on_integrity_error=False):
@@ -432,8 +416,8 @@ def test_manager_role_lookup_is_bounded(monkeypatch):
 def test_configure_shows_saved_values_in_menus_and_rechecks_manager_rights():
     async def check():
         settings = SimpleNamespace(
-            guild_id=999, use_voice_replies=False, use_random_replies=False,
-            gift_code_channel_id=111, alliance_report_channel_id=None, manager_role_id=222,
+            guild_id=999, use_random_replies=False,
+            gift_code_channel_id=111, calendar_channel_id=None, manager_role_id=222,
         )
         service = SimpleNamespace(
             get_or_create_for_guild=AsyncMock(return_value=settings),
@@ -445,9 +429,12 @@ def test_configure_shows_saved_values_in_menus_and_rechecks_manager_rights():
         )
         embed = await view.build_embed()
         assert [value.id for value in view.gift_channel_select.default_values] == [111]
-        assert view.report_channel_select.default_values == []
+        assert view.calendar_channel_select.default_values == []
         assert [value.id for value in view.manager_role_select.default_values] == [222]
-        assert "Setup 1/2 — no channel yet for: alliance reports" in embed.description
+        assert (
+            "Setup 1/3 — still to pick: the server's kingdom, a channel for the daily event calendar."
+            in embed.description
+        )
 
         def click(*, roles):
             sent = AsyncMock()
@@ -596,14 +583,6 @@ def test_scheduler_shutdown_waits_for_the_running_pass():
     asyncio.run(check())
 
 
-def test_three_character_alliance_input_is_always_a_tag():
-    parse = AlliancePowerHandler._parse_selection
-    assert parse(830, "777") == (None, "777")
-    assert parse(830, "AQM") == (None, "AQM")
-    assert parse(830, "83900004") == (83900004, None)
-    assert parse(830, "ab") is None and parse(None, "AQM") is None
-
-
 # ------------------------------------------------------------- player lookups
 
 
@@ -664,8 +643,8 @@ def test_usage_dates_are_utc_days():
 def test_configure_does_not_preselect_deleted_or_unsupported_channels_and_roles():
     async def check():
         settings = SimpleNamespace(
-            guild_id=999, use_voice_replies=False, use_random_replies=False,
-            gift_code_channel_id=111, alliance_report_channel_id=333, manager_role_id=222,
+            guild_id=999, use_random_replies=False,
+            gift_code_channel_id=111, calendar_channel_id=333, manager_role_id=222,
         )
         service = SimpleNamespace(get_or_create_for_guild=AsyncMock(return_value=settings))
         channels = {
@@ -680,7 +659,7 @@ def test_configure_does_not_preselect_deleted_or_unsupported_channels_and_roles(
         )
         await view.build_embed()
         assert [value.id for value in view.gift_channel_select.default_values] == [111]
-        assert view.report_channel_select.default_values == []  # a thread is not a menu choice
+        assert view.calendar_channel_select.default_values == []  # a thread is not a menu choice
         assert view.manager_role_select.default_values == []  # the role was deleted
 
     asyncio.run(check())

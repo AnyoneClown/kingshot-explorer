@@ -1,4 +1,4 @@
-"""Small text helpers shared by translation, chat and voice replies."""
+"""Small text helpers shared by translation and chat replies."""
 
 from __future__ import annotations
 

@@ -21,12 +21,11 @@ from config import BotConfig
 from config.logging_config import setup_logging
 from db import init_db
 from handlers import (
-    AlliancePowerHandler,
+    CalendarHandler,
     EventHandler,
     GiftCodeHandler,
     GuildConfigHandler,
     HelpHandler,
-    KingshotRAGHandler,
     KVKHandler,
     PlayerInfoHandler,
     StatusHandler,
@@ -37,12 +36,12 @@ from services.chat_tools import build_chat_tool_registry
 from services.kvk_dossier_service import KvKDossierService
 from services.usage_stats_service import UsageStatsService
 from services import (
-    AlliancePowerService,
     EventSchedulerService,
     GiftCodeService,
     GuildConfigurationService,
     InteractionTrackingService,
     ChatbotService,
+    KingshotCalendarService,
     KingshotRAGService,
     KVKService,
     PlayerInfoService,
@@ -52,7 +51,6 @@ from services import (
     KingshotDataService,
     MightPulseService,
     MightPulseAllianceDirectory,
-    VoiceMessageService,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,7 +211,6 @@ class TranslatorBot:
         self.gift_code_service = GiftCodeService(self.db_manager)
         self.player_registry_service = PlayerRegistryService(self.db_manager)
         self.guild_configuration_service = GuildConfigurationService(
-            default_use_voice_replies=False,
             default_use_random_replies=False,
             db_manager=self.db_manager,
         )
@@ -231,6 +228,8 @@ class TranslatorBot:
         self.database_health_service = DatabaseHealthService(self.db_manager)
         self.kvk_service = KVKService()
         self.bot.add_cleanup("KVK history client", self.kvk_service.close)
+        self.kingshot_calendar_service = KingshotCalendarService()
+        self.bot.add_cleanup("event calendar client", self.kingshot_calendar_service.close)
         self.kingshot_data_service = KingshotDataService(
             api_key=config.ks_data_api_key,
             base_url=config.ks_data_base_url,
@@ -243,7 +242,6 @@ class TranslatorBot:
             if config.mightpulse_api_key else None
         )
         self.alliance_directory_service = MightPulseAllianceDirectory()
-        self.alliance_power_service = AlliancePowerService(self.db_manager, self.kingshot_data_service)
         self.kingshot_rag_service = KingshotRAGService(
             self.db_manager,
             self.nvidia_client,
@@ -251,32 +249,16 @@ class TranslatorBot:
             chat_model=config.nvidia_model,
             max_distance=config.kingshot_rag_max_distance,
         )
-        self.voice_message_service = (
-            VoiceMessageService.from_nvidia(
-                api_key=config.nvidia_api_key,
-                server=config.nvidia_tts_server,
-                use_ssl=config.nvidia_tts_use_ssl,
-                function_id=config.nvidia_tts_function_id,
-                default_voice=config.nvidia_tts_default_voice,
-                default_language_code=config.nvidia_tts_default_language_code,
-                audio_encoding=config.nvidia_tts_audio_encoding,
-                sample_rate_hz=config.nvidia_tts_sample_rate_hz,
-                max_text_chars=config.nvidia_tts_max_text_chars,
-            )
-            if config.enable_voice_replies
-            else None
-        )
-        if self.voice_message_service is not None:
-            self.bot.add_cleanup("TTS channel", self.voice_message_service.close)
         self.kvk_dossier_service = KvKDossierService(self.kingshot_data_service, self.kvk_service)
         # Chat replies use the same OpenAI-compatible NIM client. Direct mentions may call
         # read-only, server-scoped tools through the tool-capable NVIDIA_MODEL.
         self.chat_tool_registry = build_chat_tool_registry(
-            alliance_power_service=self.alliance_power_service,
             event_scheduler_service=self.event_scheduler_service,
             gift_code_service=self.gift_code_service,
             kingshot_data_service=self.kingshot_data_service,
             rag_service=self.kingshot_rag_service,
+            calendar_service=self.kingshot_calendar_service,
+            guild_configuration_service=self.guild_configuration_service,
         )
         self.chatbot_service = ChatbotService(
             self.nvidia_client,
@@ -296,7 +278,6 @@ class TranslatorBot:
             self.chatbot_service,
             self.bot,
             config,
-            voice_message_service=self.voice_message_service,
             interaction_tracking_service=self.interaction_tracking_service,
             guild_configuration_service=self.guild_configuration_service,
             access_policy=self.access_policy,
@@ -327,25 +308,18 @@ class TranslatorBot:
             mightpulse_service=self.mightpulse_service,
             alliance_directory_service=self.alliance_directory_service,
         )
+        self.calendar_handler = CalendarHandler(
+            self.kingshot_calendar_service,
+            self.bot,
+            guild_configuration_service=self.guild_configuration_service,
+            access_policy=self.access_policy,
+        )
         self.guild_config_handler = GuildConfigHandler(
             self.bot,
             self.guild_configuration_service,
             admin_user_ids=config.admin_user_ids,
             access_policy=self.access_policy,
-        )
-        self.alliance_power_handler = AlliancePowerHandler(
-            self.alliance_power_service,
-            self.bot,
-            config.admin_user_ids,
-            alliance_choices=self.gift_code_handler._get_alliance_autocomplete_choices,
-            kid_choices=self.gift_code_handler._get_kid_autocomplete_choices,
-            access_policy=self.access_policy,
-            guild_configuration_service=self.guild_configuration_service,
-        )
-        self.kingshot_rag_handler = KingshotRAGHandler(
-            self.kingshot_rag_service,
-            self.bot,
-            access_policy=self.access_policy,
+            calendar_handler=self.calendar_handler,
         )
 
         self.status_handler = StatusHandler(
@@ -353,7 +327,7 @@ class TranslatorBot:
             config,
             event_handler=self.event_handler,
             gift_code_handler=self.gift_code_handler,
-            alliance_power_handler=self.alliance_power_handler,
+            calendar_handler=self.calendar_handler,
             database_health_service=self.database_health_service,
             kingshot_data_service=self.kingshot_data_service,
             started_at=self.started_at,
@@ -368,8 +342,7 @@ class TranslatorBot:
 
         # Shutdown runs in reverse registration order: these stop background work
         # before the API clients and the database pool above are closed.
-        self.bot.add_cleanup("translation background tasks", self.translation_handler.wait_for_background_tasks)
-        self.bot.add_cleanup("alliance power polling", self._stop_alliance_power_polling)
+        self.bot.add_cleanup("daily calendar posts", self._stop_calendar_posts)
         self.bot.add_cleanup("event scheduler", self._stop_event_scheduler)
         self.bot.add_cleanup("maintenance", self._stop_maintenance)
         self._maintenance_loop = tasks.loop(hours=24)(self._run_maintenance)
@@ -413,13 +386,14 @@ class TranslatorBot:
 
             # Buttons of gift-code panels posted before this start work again.
             self.gift_code_handler.register_persistent_views()
+            self.calendar_handler.register_persistent_views()
 
             self.event_handler.start_scheduler_task()
             logger.info("Event scheduler task started")
 
             self.gift_code_handler.start_polling_task()
             logger.info("Auto gift code polling task started")
-            self.alliance_power_handler.start_polling_task()
+            self.calendar_handler.start_daily_task()
             if not self._maintenance_loop.is_running():
                 self._maintenance_loop.start()
             if not self._usage_flush_loop.is_running():
@@ -464,9 +438,8 @@ class TranslatorBot:
     async def _stop_event_scheduler(self) -> None:
         await self.event_handler.shutdown_scheduler()
 
-    async def _stop_alliance_power_polling(self) -> None:
-        if self.alliance_power_handler.is_polling_running():
-            self.alliance_power_handler._collect_snapshots.cancel()
+    async def _stop_calendar_posts(self) -> None:
+        self.calendar_handler.stop_daily_task()
 
     async def _stop_maintenance(self) -> None:
         if self._maintenance_loop.is_running():
@@ -514,8 +487,9 @@ class TranslatorBot:
             title=f"Thanks for adding {getattr(self.bot.user, 'display_name', None) or 'the bot'}",
             description=(
                 "**Server managers:** run `/giftpanel` in the channel where members should sign up for gift "
-                "codes, and `/configure` for the alliance report channel and an optional bot manager role.\n"
-                "**Everyone:** run `/help` for a tour of gift codes, player lookups, alliance trends, events "
+                "codes, and `/configure` for the server's kingdom, the daily event calendar and an "
+                "optional bot manager role.\n"
+                "**Everyone:** run `/help` for a tour of gift codes, player lookups, the event calendar, reminders "
                 "and translation (right-click a message → Apps → Translate)."
             ),
             color=discord.Color.blurple(),
@@ -534,9 +508,8 @@ class TranslatorBot:
         self.translation_handler.register_events()
         self.event_handler.register_commands()
         self.gift_code_handler.register_commands()
-        self.alliance_power_handler.register_commands()
+        self.calendar_handler.register_commands()
         self.guild_config_handler.register_commands()
-        self.kingshot_rag_handler.register_commands()
         self.status_handler.register_commands()
         self.help_handler.register_commands()
         logger.info("All command handlers registered")

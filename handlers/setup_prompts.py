@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # setting name -> (what is posted there, button label)
 CHANNEL_SETTINGS = {
     "gift_code_channel_id": ("gift-code announcements", "Announce gift codes here"),
-    "alliance_report_channel_id": ("daily alliance reports", "Post daily reports here"),
+    "calendar_channel_id": ("daily event calendar posts", "Post the daily calendar here"),
 }
 
 
@@ -40,7 +40,7 @@ def bot_can_post(channel) -> bool:
 
 
 def is_announcement_target(channel) -> bool:
-    """Whether a channel may be saved as a gift-code or report channel.
+    """Whether a channel may be saved as a gift-code or calendar channel.
 
     Threads archive (announcements would then be dropped silently) and voice
     channels are not what ``/configure`` offers, so only text and news channels count.

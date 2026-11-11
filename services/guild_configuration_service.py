@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, fields
+from datetime import date
 
 from sqlalchemy import select
 
@@ -17,11 +18,12 @@ logger = logging.getLogger(__name__)
 # Settings that can be changed through ``update_for_guild``.
 EDITABLE_GUILD_SETTINGS = frozenset(
     {
-        "use_voice_replies",
         "use_random_replies",
         "manager_role_id",
         "gift_code_channel_id",
-        "alliance_report_channel_id",
+        "calendar_channel_id",
+        "kingdom_id",
+        "calendar_last_posted_on",
     }
 )
 
@@ -31,11 +33,12 @@ class GuildSettings:
     """Immutable, cache-safe snapshot of a guild's configuration row."""
 
     guild_id: int
-    use_voice_replies: bool = False
     use_random_replies: bool = False
     manager_role_id: int | None = None
     gift_code_channel_id: int | None = None
-    alliance_report_channel_id: int | None = None
+    calendar_channel_id: int | None = None
+    kingdom_id: int | None = None
+    calendar_last_posted_on: date | None = None
 
     @classmethod
     def from_model(cls, model) -> "GuildSettings":
@@ -54,12 +57,10 @@ class GuildConfigurationService:
 
     def __init__(
         self,
-        default_use_voice_replies: bool = False,
         default_use_random_replies: bool = False,
         db_manager: DatabaseManager | None = None,
         cache_ttl_seconds: float = 300.0,
     ):
-        self._default_use_voice_replies = default_use_voice_replies
         self._default_use_random_replies = default_use_random_replies
         self._db_manager = db_manager
         self._cache_ttl_seconds = cache_ttl_seconds
@@ -75,43 +76,20 @@ class GuildConfigurationService:
     async def get_or_create_guild_configuration(
         session,
         guild_id: int,
-        default_use_voice_replies: bool,
         default_use_random_replies: bool = False,
     ):
         repo = GuildConfigurationRepository(session)
-        return await repo.get_or_create(guild_id, default_use_voice_replies, default_use_random_replies)
-
-    @staticmethod
-    async def set_use_voice_replies(
-        session,
-        guild_id: int,
-        use_voice_replies: bool,
-        default_use_voice_replies: bool,
-        default_use_random_replies: bool = False,
-    ):
-        repo = GuildConfigurationRepository(session)
-        return await repo.set_voice_replies(
-            guild_id,
-            use_voice_replies,
-            default_use_voice_replies,
-            default_use_random_replies,
-        )
+        return await repo.get_or_create(guild_id, default_use_random_replies)
 
     @staticmethod
     async def set_use_random_replies(
         session,
         guild_id: int,
         use_random_replies: bool,
-        default_use_voice_replies: bool,
         default_use_random_replies: bool = False,
     ):
         repo = GuildConfigurationRepository(session)
-        return await repo.set_random_replies(
-            guild_id,
-            use_random_replies,
-            default_use_voice_replies,
-            default_use_random_replies,
-        )
+        return await repo.set_random_replies(guild_id, use_random_replies, default_use_random_replies)
 
     def _cached(self, guild_id: int) -> GuildSettings | None:
         entry = self._cache.get(guild_id)
@@ -151,7 +129,6 @@ class GuildConfigurationService:
             model = await self.get_or_create_guild_configuration(
                 session,
                 guild_id,
-                self._default_use_voice_replies,
                 self._default_use_random_replies,
             )
             return GuildSettings.from_model(model)
@@ -177,7 +154,6 @@ class GuildConfigurationService:
             model = await self.get_or_create_guild_configuration(
                 session,
                 guild_id,
-                self._default_use_voice_replies,
                 self._default_use_random_replies,
             )
             for name, value in changes.items():
@@ -200,9 +176,6 @@ class GuildConfigurationService:
             self.invalidate(guild_id)
             return settings
         return self._remember(settings)
-
-    async def set_use_voice_replies_for_guild(self, guild_id: int, use_voice_replies: bool) -> GuildSettings:
-        return await self.update_for_guild(guild_id, use_voice_replies=use_voice_replies)
 
     async def set_use_random_replies_for_guild(self, guild_id: int, use_random_replies: bool) -> GuildSettings:
         return await self.update_for_guild(guild_id, use_random_replies=use_random_replies)

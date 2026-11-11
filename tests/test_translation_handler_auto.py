@@ -118,7 +118,7 @@ class FakeAccess:
 
 class FakeGuildConfig:
     def __init__(self, use_random_replies=True):
-        self.settings = SimpleNamespace(use_voice_replies=False, use_random_replies=use_random_replies)
+        self.settings = SimpleNamespace(use_random_replies=use_random_replies)
 
     async def get_or_create_for_guild(self, guild_id):
         return self.settings
@@ -132,7 +132,6 @@ def make_config(**overrides):
         chat_history_limit=5,
         random_reply_chance=0,
         random_reply_cooldown_seconds=180,
-        enable_voice_replies=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)

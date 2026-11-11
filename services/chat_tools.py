@@ -13,8 +13,10 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
+
+from services.kingshot_calendar_service import KingdomNotTrackedError
 
 logger = logging.getLogger(__name__)
 
@@ -183,131 +185,6 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-# ---------------------------------------------------------------------------
-# Alliance power (AlliancePowerService.get_report)
-# ---------------------------------------------------------------------------
-
-
-def _member_rows(snapshot: Any) -> dict[str, dict]:
-    members = _field(snapshot, "members") or {}
-    if not isinstance(members, dict):
-        return {}
-    return {str(uid): row for uid, row in members.items() if isinstance(row, dict)}
-
-
-def _snapshot_summary(snapshot: Any) -> Optional[dict]:
-    if snapshot is None:
-        return None
-    return {
-        "date": _iso(_field(snapshot, "snapshot_date")),
-        "total_power": _int_or_none(_field(snapshot, "total_power")),
-        "member_count": len(_member_rows(snapshot)),
-    }
-
-
-def _change(latest: Any, previous: Any) -> Optional[dict]:
-    if latest is None or previous is None:
-        return None
-    now, then = _int_or_none(_field(latest, "total_power")), _int_or_none(_field(previous, "total_power"))
-    if now is None or then is None:
-        return None
-    return {
-        "since": _iso(_field(previous, "snapshot_date")),
-        "total_power_change": now - then,
-        "percent": round((now - then) * 100 / then, 2) if then else None,
-    }
-
-
-def _member_movers(latest: Any, previous: Any, *, count: int = 3) -> Optional[dict]:
-    if latest is None or previous is None:
-        return None
-    before = _member_rows(previous)
-    deltas = []
-    for uid, row in _member_rows(latest).items():
-        old = before.get(uid)
-        now_power, old_power = _int_or_none(row.get("power")), _int_or_none((old or {}).get("power"))
-        if now_power is None or old_power is None:
-            continue
-        deltas.append((now_power - old_power, _clip(row.get("name"), 40)))
-    deltas.sort()
-    return {
-        "top_gainers": [{"name": name, "power_change": delta} for delta, name in reversed(deltas[-count:]) if delta > 0],
-        "top_decliners": [{"name": name, "power_change": delta} for delta, name in deltas[:count] if delta < 0],
-    }
-
-
-def _names(rows: Any, limit: int = 5) -> list[str]:
-    names = []
-    for row in list(rows or [])[:limit]:
-        if isinstance(row, (tuple, list)) and row:
-            row = row[-1] if isinstance(row[-1], (str, dict)) else row[0]
-        name = _field(row, "name") if not isinstance(row, str) else row
-        names.append(_clip(name, 40))
-    return names
-
-
-def _optional_report_extras(report: Any) -> dict:
-    """Roster changes and inactivity, when the service provides them (shape may evolve)."""
-    extras: dict = {}
-    try:
-        changes = _field(report, "changes")
-        if changes is not None:
-            extras["roster_changes"] = {
-                "since": _iso(_field(changes, "older_date")),
-                "joined": _names(_field(changes, "joined")),
-                "left": _names(_field(changes, "left")),
-                "joined_count": len(_field(changes, "joined") or []),
-                "left_count": len(_field(changes, "left") or []),
-            }
-        inactive = _field(report, "inactive")
-        if isinstance(inactive, dict):
-            extras["flat_power_member_counts"] = {
-                f"{days}_days": len(members) for days, members in inactive.items() if members is not None
-            }
-    except Exception:
-        logger.debug("Optional alliance report fields had an unexpected shape", exc_info=True)
-        return {}
-    return extras
-
-
-def make_alliance_power_tool(alliance_power_service: Any) -> ChatTool:
-    async def handler(context: ToolContext, _arguments: dict) -> Any:
-        report = await alliance_power_service.get_report(context.guild_id)
-        if not report:
-            return {"tracked": False, "note": "This server is not tracking an alliance. Admins can set one up with /alliance."}
-        latest = _field(report, "latest")
-        members = sorted(
-            _member_rows(latest).values(),
-            key=lambda row: _int_or_none(row.get("power")) or 0,
-            reverse=True,
-        )
-        return _optional_report_extras(report) | {
-            "tracked": True,
-            "kingdom_id": _field(report, "kingdom_id"),
-            "alliance_id": _field(report, "alliance_id"),
-            "alliance_name": _clip(_field(latest, "alliance_name"), 60) if latest is not None else None,
-            "alliance_tag": _clip(_field(latest, "alliance_tag"), 10) if latest is not None else None,
-            "latest": _snapshot_summary(latest),
-            "daily_change": _change(latest, _field(report, "daily")),
-            "weekly_change": _change(latest, _field(report, "weekly")),
-            "weekly_member_movers": _member_movers(latest, _field(report, "weekly")),
-            "history": [_snapshot_summary(item) for item in (_field(report, "history") or [])][-7:],
-            "top_members": [
-                {"name": _clip(row.get("name"), 40), "power": _int_or_none(row.get("power"))} for row in members[:5]
-            ],
-        }
-
-    return ChatTool(
-        name="get_alliance_power_report",
-        description=(
-            "Get the power report of the alliance this Discord server tracks: total power, daily and weekly "
-            "change, recent history, strongest members and biggest weekly movers."
-        ),
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=handler,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -511,19 +388,115 @@ def make_knowledge_search_tool(rag_service: Any, *, max_distance: Optional[float
     )
 
 
+# ---------------------------------------------------------------------------
+# Kingdom event calendar (KingshotCalendarService, kingshot.net)
+# ---------------------------------------------------------------------------
+
+
+def make_event_calendar_tool(
+    calendar_service: Any,
+    guild_configuration_service: Any = None,
+    *,
+    now_provider=None,
+    limit: int = 20,
+    upcoming_days: int = 14,
+) -> ChatTool:
+    now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+
+    def status(value: Any) -> Optional[dict]:
+        if value is None:
+            return None
+        target = _field(value, "target")
+        return {
+            "number": _field(value, "number"),
+            "phase": _field(value, "phase_name") or _field(value, "phase"),
+            # For the phase "countdown" this is when it starts; otherwise when the phase ends.
+            "phase_changes_utc": _iso(target),
+            "discord_timestamp": _discord_timestamp(target),
+        }
+
+    def row(event: Any) -> dict:
+        return {
+            "title": _clip(_field(event, "display_title"), 80),
+            "category": str(_field(event, "category") or "").lower(),
+            "starts_utc": _iso(_field(event, "start")),
+            "ends_utc": _iso(_field(event, "end")),
+            "ends_discord_timestamp": _discord_timestamp(_field(event, "end")),
+            "date_confirmed": not _field(event, "estimated", False),
+        }
+
+    async def handler(context: ToolContext, arguments: dict) -> Any:
+        kingdom = _int_or_none(arguments.get("kingdom"))
+        if kingdom is None and guild_configuration_service is not None:
+            settings = await guild_configuration_service.get_settings(context.guild_id)
+            kingdom = _int_or_none(_field(settings, "kingdom_id"))
+        if kingdom is None or kingdom <= 0:
+            raise ToolError(
+                "No kingdom is set for this server. Ask which kingdom, or a server manager can set it in /configure."
+            )
+        try:
+            calendar = await calendar_service.get_calendar(kingdom)
+        except Exception as error:
+            if isinstance(error, KingdomNotTrackedError):
+                raise ToolError(f"Kingdom {kingdom} is not on the kingshot.net calendar.") from error
+            raise ToolError("The event calendar (kingshot.net) is unavailable right now.") from error
+
+        now = now_provider()
+        horizon = now + timedelta(days=upcoming_days)
+        # Packs are shop offers; they would crowd out the events people ask about.
+        events = [event for event in _field(calendar, "events", ()) if _field(event, "category") != "PACK"]
+        running = sorted(
+            (event for event in events if event.start <= now < event.end), key=lambda event: event.end
+        )
+        upcoming = sorted(
+            (event for event in events if now < event.start <= horizon), key=lambda event: event.start
+        )
+        return {
+            "kingdom": kingdom,
+            "now_utc": _iso(now),
+            "kvk": status(_field(calendar, "kvk")),
+            "transfer": status(_field(calendar, "transfer")),
+            "running_now": [row(event) for event in running[:limit]],
+            "upcoming": [row(event) for event in upcoming[:limit]],
+            "note": (
+                "Game time is UTC. Only this week and the next are known. "
+                "Members can open the full calendar with /calendar."
+            ),
+        }
+
+    return ChatTool(
+        name="get_event_calendar",
+        description=(
+            "Kingshot in-game event calendar of a kingdom: the running or next KvK and transfer, "
+            "events running now and events starting within two weeks. Uses this server's kingdom "
+            "unless another kingdom number is given."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "kingdom": {
+                    "type": "integer",
+                    "description": "Kingdom number. Omit to use this server's kingdom.",
+                }
+            },
+            "additionalProperties": False,
+        },
+        handler=handler,
+    )
+
+
 def build_chat_tool_registry(
     *,
-    alliance_power_service: Any = None,
     event_scheduler_service: Any = None,
     gift_code_service: Any = None,
     kingshot_data_service: Any = None,
     rag_service: Any = None,
     rag_max_distance: Optional[float] = None,
+    calendar_service: Any = None,
+    guild_configuration_service: Any = None,
 ) -> ChatToolRegistry:
     """Build the default read-only registry from whichever services are available."""
     tools: list[ChatTool] = []
-    if alliance_power_service is not None:
-        tools.append(make_alliance_power_tool(alliance_power_service))
     if event_scheduler_service is not None:
         tools.append(make_reminders_tool(event_scheduler_service))
     if gift_code_service is not None:
@@ -532,6 +505,8 @@ def build_chat_tool_registry(
         tools.append(make_governor_lookup_tool(kingshot_data_service))
     if rag_service is not None:
         tools.append(make_knowledge_search_tool(rag_service, max_distance=rag_max_distance))
+    if calendar_service is not None:
+        tools.append(make_event_calendar_tool(calendar_service, guild_configuration_service))
     registry = ChatToolRegistry(tools)
     logger.info("Chat tools available: %s", ", ".join(registry.names) or "none")
     return registry

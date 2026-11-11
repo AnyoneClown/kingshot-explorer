@@ -8,6 +8,7 @@ Project documentation lives in the repo-local `docs/` folder:
 - `docs/API.md` — full KingShot Data Service endpoint contract.
 - `docs/SCHEMAS.md` — field-level response dictionary and normalization notes.
 - `docs/INTEGRATION.md` — sibling-service integration guidance and API client examples.
+- `docs/event-calendar.md` — kingshot.net events API, `/calendar` and the daily calendar post.
 
 When changing behavior, API integration, data shapes, or operational assumptions, update the relevant file in `docs/` with:
 

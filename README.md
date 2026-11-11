@@ -8,8 +8,12 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 - A permanent gift-code panel (`/giftpanel`) with buttons: members add their Governor
   ID, check their accounts, copy active codes and send in codes the bot has not found
   yet, without knowing any command.
-- Multi-server ready: per-server settings in `/configure` (gift-code and alliance report
-  channels, bot manager role) and per-server gift-code rosters.
+- Multi-server ready: per-server settings in `/configure` (the server's kingdom, the
+  gift-code channel, daily event calendar, bot manager role) and per-server gift-code
+  rosters.
+- Kingdom event calendar from kingshot.net as picture cards with the event artwork:
+  `/calendar` shows what is running today, what is next, and a timeline of this week and
+  the next; a server can have the daily card posted every day at 08:00 UTC.
 - Auto-translation and manual translation features that keep mentions, emoji, links and
   line breaks intact, skip text that needs no translation, and cache repeated messages.
   Right-click a message → **Apps → Translate** shows a private translation in the
@@ -17,17 +21,15 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
   text.
 - NVIDIA NIM powered translation plus contextual chat replies. Mentioning the bot (or
   its own role, which Discord's autocomplete also offers) can
-  answer questions from this server's data (alliance power, reminders, active gift codes,
-  a Governor ID lookup, the Kingshot knowledge base) through read-only tools.
+  answer questions from this server's data (reminders, active gift codes,
+  a Governor ID lookup, the kingdom's event calendar, the Kingshot knowledge base) through
+  read-only tools.
 - Event scheduling with a self-healing background scheduler, role pings and delivery tracking.
 - Player info lookups with a hero and governor gear/charm card, plus KVK history,
   comparisons and a KvK prep dossier.
 - Gift code polling and auto-redemption for registered players.
 - Searchable player lists with enabled/disabled filters and direct profile lookup.
 - Single-message scout reports and paginated KVK history with comparison actions.
-- Daily alliance and member power snapshots with daily and weekly trend reports, top
-  gainers of the day and week, a trend line, roster changes (joined / left / renamed),
-  a "possibly inactive" view and an optional daily report post.
 - Live manual-redemption progress with compact results and browsable failure details.
 - Timezone-aware event forms, save previews, and edit/cancel controls.
 - Unified player profile storage in a single players table.
@@ -123,11 +125,6 @@ NVIDIA_API_KEY=your_nvidia_api_key_here
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
 NVIDIA_CHAT_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
-ENABLE_VOICE_REPLIES=false
-NVIDIA_TTS_SERVER=grpc.nvcf.nvidia.com:443
-NVIDIA_TTS_FUNCTION_ID=877104f7-e885-42b9-8de8-f6e4c6303969
-NVIDIA_TTS_DEFAULT_VOICE=Magpie-Multilingual.EN-US.Aria
-NVIDIA_TTS_AUDIO_ENCODING=LINEAR_PCM
 KS_DATA_API_KEY=your_kingshot_data_api_key
 KS_DATA_API_BASE_URL=https://ks.jeab.dev
 KS_DATA_TIMEOUT_SECONDS=30
@@ -154,8 +151,8 @@ stored translation text forever). See `.env.local.example`.
 The bot uses three access levels, enforced by `handlers/permissions.py`:
 
 - **Bot operators** (`ADMIN_USER_ID` / `ADMIN_USER_IDS`) can do everything, including
-  actions that affect every server: the shared Kingshot knowledge base
-  (`/kingshot_upsert`), unassigned legacy players and the all-servers redemption job.
+  actions that affect every server: unassigned legacy players and the all-servers
+  redemption job.
 - **Server managers** manage the bot inside one server: members with **Manage Server**
   or **Administrator**, members with the bot manager role chosen in `/configure`, and
   bot operators. They configure the server, create/edit/cancel reminders, start/stop
@@ -273,13 +270,13 @@ is reported as already claimed, not as a failed redemption.
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
-- `/configure` is the server managers' settings panel: gift-code announcement channel,
-  alliance report channel, bot manager role (only members with Manage Server can change
-  it), voice replies and AI replies. The menus show the saved values, and the panel
-  says which channels are still missing. It warns when the bot cannot post in a chosen
+- `/configure` is the server managers' settings panel: the server's kingdom, gift-code
+  announcement channel, event calendar channel, bot manager role (only members with
+  Manage Server can change it) and AI replies. The menus show the saved values, and the
+  panel says what is still missing. It warns when the bot cannot post in a chosen
   channel. Managers are also offered a one-click **use this channel** prompt where it
   matters: after `/addplayer` and `/addalliance` (gift-code channel) and when opening
-  `/alliance` (report channel; the latest report is posted at once).
+  `/calendar` (calendar channel; today's calendar is posted at once).
   When the bot joins a server it posts a short hint to run `/giftpanel` and `/configure`.
 - `/stats` shows a player's profile with a hero card (portraits, stars, levels) and a
   governor gear strip (equipment with its charms; "Equipment hidden" when the player
@@ -298,34 +295,8 @@ Additional commands are provided by translation, event, player info, KVK, and da
   details (model names, server count) and scheduler error text are shown to bot
   operators only. Usage is stored as one counter per command, server and UTC day
   (`command_usage_daily`, kept 180 days), without user data.
-- `/alliance` shows this server's tracked alliance power trends. A server manager
-  starts tracking with `/alliance kid:830 alliance:<selection>` using native autocomplete
-  or an exact 3-character tag. Each server tracks one alliance; selecting another replaces
-  that server's selection. **Members** opens a compact paginated list (power, day and week change per member);
-  **Sort** switches between power, daily growth and weekly growth. The summary and the
-  daily report show the top five gainers of the day and of the week and a trend line.
-  **Changes** lists who joined, left or was renamed between the two latest complete
-  snapshots, and **Inactive** (managers) lists members whose power has not changed for
-  7 or 14 days — only a hint, since maxed players also stop growing. **Stop tracking**
-  asks for confirmation, stops collection for this server and preserves saved history.
-  After each new daily snapshot, a compact report is posted to the alliance report
-  channel set in `/configure`.
 
-Power tracking saves the first complete snapshot each UTC day and checks hourly for
-missing snapshots, including after restarts. Captures use the Data API's `/full`
-alliance roster (falling back to one profile call per member) and also store each
-member's Town Center level, VIP, life tree level and alliance rank. Empty member profiles from the
-API are retried in several rounds; if the first snapshot after selecting an alliance is still
-incomplete, tracking is saved and the hourly check keeps retrying. It sums the current roster's member power;
-roster changes therefore affect the total. Daily and weekly changes compare exact UTC
-dates (one and seven days earlier), not rolling 24-hour periods. Missing baselines show
-as new history, and failed or incomplete captures preserve the last complete snapshot.
-There is no historical backfill: trends build from the first capture. Snapshots are
-shared when multiple servers track the same alliance, and only alliances tracked by
-servers the bot has joined are collected. Viewing a report does not register players
-for gift redemption.
-
-Before running this feature, apply the database migration. For Docker:
+After an update, apply the database migrations before starting the bot. For Docker:
 
 ```bash
 docker compose build translator-bot-local
@@ -340,6 +311,15 @@ docker compose up -d translator-bot-local
   only for server managers. Player and KVK reports are posted in the channel.
   **Import alliance** explains the native `/addalliance` workflow: enter `kid`, then
   select `alliance` from autocomplete so kingdom and alliance suggestions remain available.
+- `/calendar [kingdom]` posts the kingdom's event calendar (data: kingshot.net) as
+  picture cards, with **Today**, **This week** and **Next week** tabs and a category
+  filter. The bot needs **Attach Files** in the calendar channel for the daily pictures
+  (without it the post is text). Without a
+  kingdom it uses the server's kingdom. Anyone who presses a control on someone
+  else's panel gets a private copy. In `/configure`, pick an **event calendar channel**
+  and set the server's **kingdom** to have the Today view posted every day at 08:00 UTC; the
+  first one is posted right away, and the buttons under each post keep working after
+  restarts. See [event calendar](docs/event-calendar.md).
 - `/kvk` paginates every match returned by the service. **Compare kingdom** opens a
   form with the current kingdom already selected. Comparison results also paginate
   their direct match history.
@@ -381,6 +361,8 @@ db/          SQLAlchemy models and session management
 handlers/    Discord command/event handlers
 services/    Service layer and API integrations
 alembic/     Database migrations
+images/      Game artwork for rendered cards (heroes, gear, event icons)
+assets/      Fonts for rendered cards
 main.py      Application entrypoint
 ```
 
@@ -393,7 +375,6 @@ main.py      Application entrypoint
   `TRANSLATION_LOG_RETENTION_DAYS` (default 30).
 - `/configure` can turn contextual AI replies on or off for a server, including direct mentions/replies and random chat replies.
 - Banned Discord users (`BANNED_PLAYERS`) are ignored by slash commands, translation and AI replies.
-- Voice replies are uploaded as audio attachments. Discord bots cannot send native mobile-only voice messages.
 
 Contextual replies use the OpenAI SDK against the NIM endpoint, streaming
 `NVIDIA_CHAT_MODEL` (default `nvidia/nemotron-3.5-super-vl-120b-a12b`) with thinking
@@ -414,7 +395,6 @@ per-user cooldown (`CHAT_USER_COOLDOWN_SECONDS`, default 10 s) and at most two
 concurrent model requests. `NVIDIA_MODEL` controls translation and KingShot RAG requests
 and defaults to the same Nemotron 3.5 Super VL model; these short requests (and the
 random-reply check) disable thinking to reserve their completion budget for the answer.
-Voice audio is attached a moment after the text reply.
 The chat persona favors concise, context-specific dry humor and playful sarcasm while
 avoiding hostile teasing, sensitive topics, and generic bot-like filler.
 Discord user, role, and channel mentions are resolved to readable names before the current

@@ -19,43 +19,43 @@ from tests.test_help_ui import make_bot
 def test_overlapping_settings_updates_do_not_cache_a_row_missing_the_other_change():
     async def check():
         service = GuildConfigurationService(db_manager=object())
-        row = {"use_voice_replies": False, "alliance_report_channel_id": None}
-        voice_read, release_voice = asyncio.Event(), asyncio.Event()
+        row = {"use_random_replies": False, "gift_code_channel_id": None}
+        reply_read, release_reply = asyncio.Event(), asyncio.Event()
 
         # Each update reads the row first and writes only its own column, like the ORM
         # does under READ COMMITTED: the slower writer returns its stale read of the rest.
-        async def voice_update(operation, *, retry_on_integrity_error=False):
+        async def reply_update(operation, *, retry_on_integrity_error=False):
             snapshot = dict(row)
-            voice_read.set()
-            await release_voice.wait()
-            row["use_voice_replies"] = True
-            snapshot["use_voice_replies"] = True
+            reply_read.set()
+            await release_reply.wait()
+            row["use_random_replies"] = True
+            snapshot["use_random_replies"] = True
             return GuildSettings(guild_id=5, **snapshot)
 
-        async def report_update(operation, *, retry_on_integrity_error=False):
-            row["alliance_report_channel_id"] = 77
+        async def channel_update(operation, *, retry_on_integrity_error=False):
+            row["gift_code_channel_id"] = 77
             return GuildSettings(guild_id=5, **row)
 
-        service._run = voice_update
-        slow = asyncio.create_task(service.update_for_guild(5, use_voice_replies=True))
-        await voice_read.wait()
-        service._run = report_update
-        fast = await service.update_for_guild(5, alliance_report_channel_id=77)
-        release_voice.set()
+        service._run = reply_update
+        slow = asyncio.create_task(service.update_for_guild(5, use_random_replies=True))
+        await reply_read.wait()
+        service._run = channel_update
+        fast = await service.update_for_guild(5, gift_code_channel_id=77)
+        release_reply.set()
         stale = await slow
 
-        assert fast.alliance_report_channel_id == 77
-        assert stale.alliance_report_channel_id is None  # The slower writer's own (stale) view.
+        assert fast.gift_code_channel_id == 77
+        assert stale.gift_code_channel_id is None  # The slower writer's own (stale) view.
         cached = service._cached(5)
-        # The cache must not keep "no report channel" for minutes while the DB has 77.
-        assert cached is None or cached.alliance_report_channel_id == 77
+        # The cache must not keep "no gift-code channel" for minutes while the DB has 77.
+        assert cached is None or cached.gift_code_channel_id == 77
 
         async def fresh_read(operation, *, retry_on_integrity_error=False):
             return GuildSettings(guild_id=5, **row)
 
         service._run = fresh_read
         settings = await service.get_or_create_for_guild(5)
-        assert settings.use_voice_replies is True and settings.alliance_report_channel_id == 77
+        assert settings.use_random_replies is True and settings.gift_code_channel_id == 77
 
     asyncio.run(check())
 

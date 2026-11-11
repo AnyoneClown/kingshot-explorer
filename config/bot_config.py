@@ -38,15 +38,6 @@ class BotConfig:
     nvidia_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     nvidia_chat_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     nvidia_embedding_model: str = "nvidia/nemotron-3.5-embed-1b"
-    enable_voice_replies: bool = False
-    nvidia_tts_server: str = "grpc.nvcf.nvidia.com:443"
-    nvidia_tts_use_ssl: bool = True
-    nvidia_tts_function_id: str = "877104f7-e885-42b9-8de8-f6e4c6303969"
-    nvidia_tts_default_language_code: str = "en-US"
-    nvidia_tts_default_voice: str = "Magpie-Multilingual.EN-US.Aria"
-    nvidia_tts_audio_encoding: str = "LINEAR_PCM"
-    nvidia_tts_sample_rate_hz: int = 44100
-    nvidia_tts_max_text_chars: int = 350
     random_reply_chance: float = 0.0
     random_reply_cooldown_seconds: int = 180
     chat_history_limit: int = 25
@@ -94,10 +85,6 @@ class BotConfig:
         # Discord rejects messages over 2000 characters, so a larger value would make
         # long replies fail to send.
         self.max_chat_response_chars = min(self.max_chat_response_chars, 2000)
-        if self.nvidia_tts_sample_rate_hz < 8000:
-            raise ValueError("NVIDIA_TTS_SAMPLE_RATE_HZ must be >= 8000")
-        if self.nvidia_tts_max_text_chars < 1:
-            raise ValueError("NVIDIA_TTS_MAX_TEXT_CHARS must be >= 1")
         if self.max_players_per_guild < 1:
             raise ValueError("MAX_PLAYERS_PER_GUILD must be >= 1")
         if self.max_self_registered_players < 0:
@@ -185,21 +172,6 @@ class BotConfig:
                 "NVIDIA_EMBEDDING_MODEL",
                 "nvidia/nemotron-3.5-embed-1b",
             ),
-            enable_voice_replies=parse_bool(os.getenv("ENABLE_VOICE_REPLIES"), False),
-            nvidia_tts_server=os.getenv("NVIDIA_TTS_SERVER", "grpc.nvcf.nvidia.com:443"),
-            nvidia_tts_use_ssl=parse_bool(os.getenv("NVIDIA_TTS_USE_SSL"), True),
-            nvidia_tts_function_id=os.getenv(
-                "NVIDIA_TTS_FUNCTION_ID",
-                "877104f7-e885-42b9-8de8-f6e4c6303969",
-            ),
-            nvidia_tts_default_language_code=os.getenv("NVIDIA_TTS_DEFAULT_LANGUAGE_CODE", "en-US"),
-            nvidia_tts_default_voice=os.getenv(
-                "NVIDIA_TTS_DEFAULT_VOICE",
-                "Magpie-Multilingual.EN-US.Aria",
-            ),
-            nvidia_tts_audio_encoding=os.getenv("NVIDIA_TTS_AUDIO_ENCODING", "LINEAR_PCM"),
-            nvidia_tts_sample_rate_hz=_env_int("NVIDIA_TTS_SAMPLE_RATE_HZ", 44100),
-            nvidia_tts_max_text_chars=_env_int("NVIDIA_TTS_MAX_TEXT_CHARS", 350),
             random_reply_chance=_env_float("RANDOM_REPLY_CHANCE", 0),
             random_reply_cooldown_seconds=_env_int("RANDOM_REPLY_COOLDOWN_SECONDS", 180),
             chat_history_limit=_env_int("CHAT_HISTORY_LIMIT", 25),

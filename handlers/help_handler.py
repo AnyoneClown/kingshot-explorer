@@ -28,12 +28,6 @@ GROUPS = {
             ("kvk_prep", "Prep dossier", "/kvk_prep kingdom_a:830 kingdom_b:831"),
         ),
     ),
-    "Alliance": (
-        "Track daily and weekly member power, roster changes and possibly inactive members. "
-        "A server manager starts tracking with /alliance kid:830 alliance:<selection>; "
-        "history starts with the first complete daily snapshot.",
-        (("alliance", "Power trends", "/alliance"),),
-    ),
     "Gifts": (
         "Add your Governor ID with /addplayer to receive new codes automatically, check your "
         "accounts with /myaccounts, and send in a code the bot has not found yet with /submitcode. "
@@ -50,6 +44,13 @@ GROUPS = {
             ("giftpanel", "Post sign-up panel", "/giftpanel"),
         ),
     ),
+    "Calendar": (
+        "See what is on in a kingdom today, this week and next week: KvK and transfer countdowns, "
+        "events that start or end today, and what is coming. Leave the kingdom empty to use this "
+        "server's kingdom. Server managers can have the summary posted every day at 08:00 UTC: "
+        "set the server's kingdom and pick the channel in /configure.",
+        (("calendar", "Event calendar", "/calendar kingdom:795"),),
+    ),
     "Events": (
         "Review upcoming reminders. Creating, editing, and cancelling reminders "
         "requires a server manager.",
@@ -59,14 +60,9 @@ GROUPS = {
             ("cancel", "Cancel event", "/cancel event_id:12"),
         ),
     ),
-    "Knowledge": (
-        "Ask questions answered from the stored Kingshot knowledge base. You can also mention the "
-        "bot in chat to ask about this server's alliance, events or active gift codes.",
-        (("kingshot_ask", "Ask a question", "/kingshot_ask question:How does Bear Trap work?"),),
-    ),
     "Settings": (
-        "Server-wide settings: gift-code and alliance report channels, the bot manager role, "
-        "voice and AI replies. Available to server managers.",
+        "Server-wide settings: the server's kingdom, the gift-code channel, the daily event calendar, "
+        "the bot manager role and AI replies. Available to server managers.",
         (("configure", "Open settings", "/configure"),),
     ),
 }
@@ -239,7 +235,7 @@ class HelpHandler:
                 action for action in actions
                 if self._bot.tree.get_command(action[0]) is not None
                 and (action[0] not in ADMIN_COMMANDS or is_admin)
-                and (category not in {"Events", "Settings", "Gifts", "Alliance"} or interaction.guild is not None)
+                and (category not in {"Events", "Settings", "Gifts"} or interaction.guild is not None)
             )
             if available:
                 groups[category] = (description, available)

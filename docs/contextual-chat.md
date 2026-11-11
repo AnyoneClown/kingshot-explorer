@@ -31,8 +31,8 @@ a free slot and then gets the fallback; the random-reply yes/no check is limited
 the channel's random-reply cooldown starts before generation, so two candidates
 arriving together produce at most one random reply.
 
-Per-server AI replies and voice replies are opt-in. If the server settings cannot be
-loaded, both are treated as off.
+Per-server AI replies are opt-in. If the server settings cannot be loaded, they are
+treated as off.
 
 The retry override applies to that invocation only. It preserves other configured
 chat-template options and does not mutate the shared client's defaults. Thinking

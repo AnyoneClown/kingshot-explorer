@@ -18,7 +18,7 @@ Vectors from different embedding models are not comparable. After changing the m
 `kingshot_chunks` row with the new one (content, metadata and entities stay as they are).
 
 History: the previous model `nvidia/llama-nemotron-embed-1b-v2` reached end of life on NVIDIA on
-2026-08-25 and returned `410 Gone`, so every knowledge search, `/kingshot_ask` and `/kingshot_upsert`
+2026-08-25 and returned `410 Gone`, so every knowledge search and upsert
 failed until 2026-11-11. That day the model was switched to `nvidia/nemotron-3.5-embed-1b` (same 2048
 dimensions, same `input_type`) and all 320 chunks were re-embedded in one transaction. Verified with
 in-memory search (each of five hero queries, one in Ukrainian, ranked the right hero first at distance
@@ -43,12 +43,12 @@ It creates:
   - `embedding VECTOR(2048)`
   - `metadata JSONB`
 
-Search reads from `kingshot_chunks`, not only `kingshot_entities`. If an entity exists but no chunk exists, `/kingshot_ask` cannot retrieve it.
+Search reads from `kingshot_chunks`, not only `kingshot_entities`. If an entity exists but no chunk exists, a search cannot retrieve it.
 
 ## Main Code Paths
 
 - Service: `services/kingshot_rag_service.py`
-- Discord handler: `handlers/kingshot_rag_handler.py`
+- Chat tool: `search_kingshot_knowledge` in `services/chat_tools.py`
 - App wiring: `main.py`
 - Config: `config/bot_config.py`
 
@@ -59,77 +59,14 @@ Reusable service methods:
 - `search(...)`
 - `answer_question(...)`
 
-Discord commands:
+Discord access (changed 2026-11-11): the `/kingshot_ask` and `/kingshot_upsert` slash commands
+and their handler were removed. Members reach the knowledge base by mentioning the bot (the
+`search_kingshot_knowledge` chat tool); knowledge is added with the upload scripts below, which
+call `upsert_knowledge(...)`. `answer_question(...)` stays in the service but nothing calls it.
 
-- `/kingshot_upsert`
-  - admin-only
-  - creates or updates one entity by `slug`
-  - replaces prior chunks for that slug
-  - embeds chunk content as `passage`
-- `/kingshot_ask`
-  - embeds question as `query`
-  - retrieves nearest chunks by cosine distance
-  - sends retrieved chunk content and entity JSON data to the chat model
-
-## Slug Convention
-
-`slug` is the stable unique key for a knowledge item. Reusing a slug updates the existing item.
-
-Examples:
-
-- `bear-trap`
-- `frostfire-mine`
-- `amane`
-- `city-hall-level-30`
-
-Prefer lowercase hyphenated slugs. The current code does not force lowercase, so `Amane` and `amane` would be different slugs.
-
-## Debugging Retrieval
-
-The service logs these useful diagnostics:
-
-- ask/upsert command user, guild, channel, entity type, slug
-- embedding input type, model, dimension, text length
-- chunk deletion and insertion counts during upsert
-- search query, entity type filter, result count
-- retrieved chunk slug, entity type, distance, content length, content preview
-- answer generation context size and top retrieved slug
-
-Important log interpretation:
-
-- `Kingshot search returned no chunks`
-  - likely no rows in `kingshot_chunks`, or entity type filter is too restrictive
-- `Kingshot search returned 1 chunks` followed by answer `I don't know`
-  - retrieval worked; inspect chunk content and entity JSON data because context may be too thin
 - Earlier NVIDIA error:
   - `input_type parameter is required for asymmetric models`
   - fixed by passing `input_type=query` or `input_type=passage`
-
-## Example Upsert
-
-Discord `/kingshot_upsert`:
-
-```text
-entity_type: hero
-slug: amane
-name: Amane
-content: Amane can blind people.
-data_json: {"skill":"blinding people"}
-metadata_json: {"topic":"hero_skill"}
-source: manual
-```
-
-Then ask:
-
-```text
-/kingshot_ask question:"what amane can do?"
-```
-
-Expected answer:
-
-```text
-Amane can blind people.
-```
 
 ## Operational Notes
 
@@ -147,17 +84,14 @@ Amane can blind people.
 
 - `KingshotRAGService.search()` ignores chunks whose cosine distance exceeds
   `max_distance` (env `KINGSHOT_RAG_MAX_DISTANCE`, default `0.7`, i.e. similarity ≥ 0.3).
-  The default is a starting guess; tune it from the distances logged by `/kingshot_ask`.
+  The default is a starting guess; tune it from the distances the service logs for each search.
 - When nothing passes the cutoff, `answer_question` returns a fixed "no matching
-  knowledge" answer without calling the chat model, and `/kingshot_ask` shows a
-  **No Matching Knowledge** embed.
+  knowledge" answer without calling the chat model.
 - Retrieved text and the question are wrapped in `<knowledge>` / `<question>` tags and
   marked as untrusted data in the prompt.
 - Mention chat can search the knowledge base through the `search_kingshot_knowledge` chat tool
-  (`services/chat_tools.py`), alongside server-scoped alliance, reminder, gift-code and
+  (`services/chat_tools.py`), alongside the reminder, gift-code, event calendar and
   Governor ID tools.
-- `/kingshot_upsert` is restricted to bot operators (`ADMIN_USER_IDS`) because the
-  knowledge base is shared by every server.
 
 ## kingshot.net knowledge import (2026-11-11)
 

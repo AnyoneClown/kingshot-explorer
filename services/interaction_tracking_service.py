@@ -10,7 +10,6 @@ from typing import Any, Optional
 from db.session import DatabaseManager, get_db
 from repositories.discord_repositories import (
     GiftCodeRedemptionRepository,
-    GuildConfigurationRepository,
     RegisteredPlayerRepository,
     TranslationLogRepository,
     UserRepository,
@@ -238,13 +237,3 @@ class InteractionTrackingService:
             return await GiftCodeRedemptionRepository(db_session).create_many(rows)
 
         return await self._run(operation, session=session)
-
-    async def is_voice_replies_enabled(self, guild_id: int, default_enabled: bool = True) -> bool:
-        async with self._session() as db_session:
-            repo = GuildConfigurationRepository(db_session)
-            guild_config = await repo.get(guild_id)
-
-        if guild_config is None:
-            return default_enabled
-
-        return guild_config.use_voice_replies

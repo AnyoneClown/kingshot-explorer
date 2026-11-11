@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from services.chat_tools import (
@@ -8,7 +8,6 @@ from services.chat_tools import (
     ChatToolRegistry,
     ToolContext,
     build_chat_tool_registry,
-    make_alliance_power_tool,
     make_gift_codes_tool,
     make_governor_lookup_tool,
     make_knowledge_search_tool,
@@ -71,70 +70,6 @@ def test_registry_requires_a_guild():
     registry = registry_with(ChatTool("x", "", {"type": "object"}, handler))
 
     assert run(registry, "x", context=ToolContext(guild_id=0))["ok"] is False
-
-
-def snapshot(day, total, members):
-    return SimpleNamespace(
-        snapshot_date=day,
-        captured_at=datetime(day.year, day.month, day.day, tzinfo=timezone.utc),
-        alliance_name="Aquarium",
-        alliance_tag="AQM",
-        total_power=total,
-        members=members,
-    )
-
-
-class FakeAllianceService:
-    def __init__(self, report):
-        self.report = report
-        self.calls = []
-
-    async def get_report(self, guild_id):
-        self.calls.append(guild_id)
-        return self.report
-
-
-def test_alliance_power_tool_summarises_report_for_current_guild_only():
-    today = date(2026, 11, 5)
-    latest = snapshot(
-        today,
-        300,
-        {"1": {"name": "Ann", "power": 200}, "2": {"name": "Bo", "power": 100}},
-    )
-    daily = snapshot(today - timedelta(days=1), 250, {"1": {"name": "Ann", "power": 180}})
-    weekly = snapshot(today - timedelta(days=7), 200, {"1": {"name": "Ann", "power": 150}, "2": {"name": "Bo", "power": 120}})
-    service = FakeAllianceService(
-        {
-            "kingdom_id": 3,
-            "alliance_id": 99,
-            "latest": latest,
-            "daily": daily,
-            "weekly": weekly,
-            "history": [weekly, daily, latest],
-            "changes": SimpleNamespace(older_date=daily.snapshot_date, joined=[("2", {"name": "Bo"})], left=[]),
-            "inactive": {7: [], 14: None},
-        }
-    )
-    registry = registry_with(make_alliance_power_tool(service))
-
-    data = run(registry, "get_alliance_power_report")["data"]
-
-    assert service.calls == [456]
-    assert data["alliance_tag"] == "AQM"
-    assert data["latest"] == {"date": "2026-11-05", "total_power": 300, "member_count": 2}
-    assert data["daily_change"]["total_power_change"] == 50
-    assert data["weekly_change"]["percent"] == 50.0
-    assert data["top_members"][0] == {"name": "Ann", "power": 200}
-    assert data["weekly_member_movers"]["top_gainers"] == [{"name": "Ann", "power_change": 50}]
-    assert data["weekly_member_movers"]["top_decliners"] == [{"name": "Bo", "power_change": -20}]
-    assert data["roster_changes"]["joined"] == ["Bo"]
-    assert data["flat_power_member_counts"] == {"7_days": 0}
-
-
-def test_alliance_power_tool_reports_untracked_guild():
-    registry = registry_with(make_alliance_power_tool(FakeAllianceService(None)))
-
-    assert run(registry, "get_alliance_power_report")["data"]["tracked"] is False
 
 
 class FakeScheduler:
@@ -334,3 +269,93 @@ def test_knowledge_search_keeps_a_good_filtered_result_without_a_second_search()
 
     assert rag.calls == ["hero"]
     assert [item["name"] for item in data["results"]] == ["Ava"]
+
+
+def test_event_calendar_tool_uses_the_servers_kingdom():
+    from datetime import datetime, timedelta, timezone
+
+    from services.chat_tools import make_event_calendar_tool
+    from services.kingshot_calendar_service import (
+        CalendarEvent,
+        CalendarStatus,
+        CalendarUnavailableError,
+        KingdomCalendar,
+        KingdomNotTrackedError,
+    )
+
+    now = datetime(2026, 11, 11, 8, tzinfo=timezone.utc)
+
+    def event(title, category, start_days, end_days, **kwargs):
+        return CalendarEvent(
+            key=title,
+            title=title,
+            category=category,
+            start=now + timedelta(days=start_days),
+            end=now + timedelta(days=end_days),
+            **kwargs,
+        )
+
+    class FakeCalendarService:
+        def __init__(self):
+            self.calls = []
+            self.error = None
+
+        async def get_calendar(self, kingdom):
+            self.calls.append(kingdom)
+            if self.error is not None:
+                raise self.error
+            return KingdomCalendar(
+                kingdom=kingdom,
+                fetched_at=now,
+                current_week=1,
+                events=(
+                    event("Sanctuary Battle", "WAR", -1, 3, is_main=True),
+                    event("Enhance Gear", "PACK", -2, 5),
+                    event("Old Event", "GROWTH", -5, -1),
+                    event("Mystic Divination", "DEALS", 2, 4, estimated=True),
+                    event("Far Away", "SPECIAL", 30, 31),
+                ),
+                kvk=CalendarStatus(
+                    kind="kvk", phase="countdown", phase_name="Next KvK", number=21, target=now + timedelta(days=18)
+                ),
+                transfer=None,
+            )
+
+    class FakeSettings:
+        def __init__(self, kingdom):
+            self.kingdom = kingdom
+
+        async def get_settings(self, guild_id):
+            assert guild_id == CONTEXT.guild_id
+            return SimpleNamespace(kingdom_id=self.kingdom)
+
+    service = FakeCalendarService()
+    registry = registry_with(make_event_calendar_tool(service, FakeSettings(795), now_provider=lambda: now))
+
+    data = run(registry, "get_event_calendar", "{}")["data"]
+
+    assert service.calls == [795]
+    assert data["kingdom"] == 795
+    assert data["kvk"]["number"] == 21 and data["kvk"]["phase_changes_utc"] == "2026-11-29T08:00+00:00"
+    assert data["transfer"] is None
+    assert [row["title"] for row in data["running_now"]] == ["Sanctuary Battle"]
+    assert data["running_now"][0]["ends_utc"] == "2026-11-14T08:00+00:00"
+    assert [(row["title"], row["date_confirmed"]) for row in data["upcoming"]] == [("Mystic Divination", False)]
+
+    assert run(registry, "get_event_calendar", '{"kingdom": 830}')["data"]["kingdom"] == 830
+    assert service.calls == [795, 830]
+
+    service.error = KingdomNotTrackedError(4242)
+    missing = run(registry, "get_event_calendar", '{"kingdom": 4242}')
+    assert missing["ok"] is False and "not on the kingshot.net calendar" in missing["error"]
+    service.error = CalendarUnavailableError("down")
+    assert "unavailable" in run(registry, "get_event_calendar", "{}")["error"]
+
+    unset = registry_with(make_event_calendar_tool(service, FakeSettings(None), now_provider=lambda: now))
+    assert "No kingdom is set" in run(unset, "get_event_calendar", "{}")["error"]
+
+
+def test_registry_includes_the_calendar_tool_when_the_service_is_available():
+    registry = build_chat_tool_registry(calendar_service=object(), guild_configuration_service=object())
+
+    assert registry.names == ["get_event_calendar"]

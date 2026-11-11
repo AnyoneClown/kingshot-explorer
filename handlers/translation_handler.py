@@ -1,10 +1,8 @@
-import asyncio
 import contextlib
 import logging
 import random
 import re
 import time
-from io import BytesIO
 from typing import Dict, List
 
 import discord
@@ -25,7 +23,6 @@ from services.translation_service import (
     is_english_language,
     looks_clearly_english,
 )
-from services.voice_message_service import VoiceMessageService
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +64,6 @@ class TranslationHandler:
         chatbot_service: IChatbotService,
         bot: commands.Bot,
         config=None,
-        voice_message_service: VoiceMessageService | None = None,
         interaction_tracking_service: InteractionTrackingService | None = None,
         guild_configuration_service: GuildConfigurationService | None = None,
         access_policy=None,
@@ -86,10 +82,8 @@ class TranslationHandler:
         self._chatbot_service = chatbot_service
         self._bot = bot
         self._config = config
-        self._voice_message_service = voice_message_service
         self._last_chat_reply_at: Dict[int, float] = {}
         self._last_user_reply_at: Dict[int, float] = {}
-        self._background_tasks: set[asyncio.Task] = set()
         self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
         self._guild_configuration_service = guild_configuration_service
         self._access = access_policy
@@ -343,13 +337,9 @@ class TranslationHandler:
                 description=self._quote_for_embed(translated_text),
                 color=EmbedColors.INFO,
             )
-            await self._reply_with_optional_voice(
+            await self._send_reply(
                 ctx.reply,
                 embed=embed,
-                guild_id=ctx.guild.id if ctx.guild else None,
-                voice_text=translated_text,
-                language_hint=target_language,
-                filename_stem="translation",
             )
 
             await self._track_translation(
@@ -415,13 +405,9 @@ class TranslationHandler:
                 description=self._quote_for_embed(translated_text),
                 color=EmbedColors.INFO,
             )
-            await self._reply_with_optional_voice(
+            await self._send_reply(
                 ctx.reply,
                 embed=embed,
-                guild_id=ctx.guild.id if ctx.guild else None,
-                voice_text=translated_text,
-                language_hint="English",
-                filename_stem="translation",
             )
 
             await self._track_translation(
@@ -518,14 +504,10 @@ class TranslationHandler:
 
         try:
             chunks = self._quoted_chunks(translated_text)
-            await self._reply_with_optional_voice(
+            await self._send_reply(
                 message.reply,
                 content=chunks[0],
                 mention_author=False,
-                guild_id=message.guild.id if message.guild else None,
-                voice_text=translated_text,
-                language_hint="English",
-                filename_stem="translation",
             )
             for chunk in chunks[1:]:
                 await message.channel.send(content=chunk, allowed_mentions=NO_MENTIONS)
@@ -633,18 +615,13 @@ class TranslationHandler:
                 )
                 return
 
-            is_fallback = bool(getattr(reply_text, "is_fallback", False))
-            await self._reply_with_optional_voice(
+            await self._send_reply(
                 message.reply,
                 content=truncate_cleanly(
                     str(reply_text),
                     self._config.max_chat_response_chars if self._config else 500,
                 ),
                 mention_author=False,
-                guild_id=guild_id,
-                voice_text=None if is_fallback else str(reply_text),
-                language_hint=getattr(reply_text, "language", None),
-                filename_stem="chat-reply",
             )
 
             self._last_chat_reply_at[message.channel.id] = time.monotonic()
@@ -671,110 +648,23 @@ class TranslationHandler:
             }
         return True
 
-    # ------------------------------------------------------------------ replies and voice
+    # ------------------------------------------------------------------ replies
 
-    async def _reply_with_optional_voice(
+    async def _send_reply(
         self,
         reply_callable,
         *,
         content: str | None = None,
         embed: discord.Embed | None = None,
         mention_author: bool = False,
-        guild_id: int | None = None,
-        voice_text: str | None = None,
-        language_hint: str | None = None,
-        filename_stem: str = "reply",
     ):
-        """Send the text reply now; attach generated audio afterwards if enabled."""
+        """Send a reply that never pings anyone."""
         reply_kwargs = {"allowed_mentions": NO_MENTIONS, "mention_author": mention_author}
         if content is not None:
             reply_kwargs["content"] = content
         if embed is not None:
             reply_kwargs["embed"] = embed
-
-        sent = await reply_callable(**reply_kwargs)
-
-        if voice_text and self._voice_message_service is not None and sent is not None:
-            if await self._voice_replies_enabled_for_guild(guild_id):
-                self._spawn_background(
-                    self._attach_voice(
-                        sent,
-                        voice_text,
-                        language_hint=language_hint,
-                        filename_stem=filename_stem,
-                    )
-                )
-        return sent
-
-    def _spawn_background(self, coro) -> asyncio.Task:
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
-
-    async def wait_for_background_tasks(self) -> None:
-        """Wait for pending voice attachments (used by tests and shutdown)."""
-        while self._background_tasks:
-            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
-
-    async def _attach_voice(self, sent, text: str, *, language_hint: str | None, filename_stem: str) -> None:
-        try:
-            voice_file = await self._build_voice_file(text, language_hint=language_hint, filename_stem=filename_stem)
-            if voice_file is None:
-                return
-            edit = getattr(sent, "edit", None)
-            if edit is None:
-                return
-            await edit(attachments=[voice_file])
-        except Exception as exc:
-            logger.warning("Could not attach voice reply: %s", exc, exc_info=True)
-
-    async def _build_voice_file(
-        self,
-        text: str | None,
-        *,
-        language_hint: str | None = None,
-        filename_stem: str = "reply",
-    ) -> discord.File | None:
-        if not self._voice_message_service or not text:
-            return None
-
-        try:
-            audio = await self._voice_message_service.generate_audio(
-                text,
-                language_hint=language_hint,
-                filename_stem=filename_stem,
-            )
-        except Exception as exc:
-            logger.error("Voice message generation failed: %s", exc, exc_info=True)
-            return None
-
-        if audio is None:
-            return None
-
-        return discord.File(BytesIO(audio.data), filename=audio.filename)
-
-    async def _voice_replies_enabled_for_guild(self, guild_id: int | None) -> bool:
-        default_enabled = getattr(self._config, "enable_voice_replies", True)
-        if guild_id is None:
-            return default_enabled
-
-        if self._guild_configuration_service is not None:
-            try:
-                guild_config = await self._guild_configuration_service.get_or_create_for_guild(guild_id)
-                if guild_config is not None:
-                    return bool(guild_config.use_voice_replies)
-            except Exception as exc:
-                logger.error(
-                    "Guild configuration lookup failed for guild %s: %s",
-                    guild_id,
-                    exc,
-                    exc_info=True,
-                )
-                # Voice is opt-in per server: a database hiccup must not switch it on.
-                return False
-
-        return default_enabled
+        return await reply_callable(**reply_kwargs)
 
     async def _should_attempt_reply(self, message: discord.Message, *, direct_trigger: bool | None = None) -> bool:
         """Return True if the bot should try generating a chat reply."""

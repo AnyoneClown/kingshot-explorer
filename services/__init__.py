@@ -1,6 +1,5 @@
 """Services module for business logic."""
 
-from .alliance_power_service import AlliancePowerService
 from .event_scheduler_service import EventSchedulerService
 from .gift_code_service import GiftCodeService
 from .guild_configuration_service import GuildConfigurationService
@@ -11,16 +10,16 @@ from .chatbot_service import ChatbotService, IChatbotService
 from .kingshot_rag_service import KingshotChunkInput, KingshotRAGError, KingshotRAGService, KingshotRetrievedChunk
 from .kvk_service import KVKService
 from .player_info_service import PlayerInfoService
+from .kingshot_calendar_service import KingshotCalendarService
 from .kingshot_data_service import KingshotDataService
 from .mightpulse_service import MightPulseAllianceDirectory, MightPulseService
 from .translation_service import TranslationService
-from .voice_message_service import VoiceMessageAudio, VoiceMessageService
 
 __all__ = [
-    "AlliancePowerService",
     "TranslationService",
     "EventSchedulerService",
     "PlayerInfoService",
+    "KingshotCalendarService",
     "KingshotDataService",
     "MightPulseService",
     "MightPulseAllianceDirectory",
@@ -36,6 +35,4 @@ __all__ = [
     "KingshotRetrievedChunk",
     "ChatbotService",
     "IChatbotService",
-    "VoiceMessageService",
-    "VoiceMessageAudio",
 ]

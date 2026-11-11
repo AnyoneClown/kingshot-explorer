@@ -28,7 +28,7 @@ class StatusHandler:
         *,
         event_handler=None,
         gift_code_handler=None,
-        alliance_power_handler=None,
+        calendar_handler=None,
         kingshot_data_service: _KingshotDataHealthService | None = None,
         started_at: datetime,
         scheduler_enabled: bool | None = None,
@@ -40,7 +40,7 @@ class StatusHandler:
         self._config = config
         self._event_handler = event_handler
         self._gift_code_handler = gift_code_handler
-        self._alliance_power_handler = alliance_power_handler
+        self._calendar_handler = calendar_handler
         self._kingshot_data_service = kingshot_data_service
         self._started_at = started_at
         self._access = access_policy
@@ -76,11 +76,11 @@ class StatusHandler:
             status_method="is_polling_running",
             component="gift-code polling",
         )
-        power_polling_state = self._get_worker_state(
-            enabled=self._alliance_power_handler is not None,
-            handler=self._alliance_power_handler,
-            status_method="is_polling_running",
-            component="alliance power polling",
+        calendar_state = self._get_worker_state(
+            enabled=self._calendar_handler is not None,
+            handler=self._calendar_handler,
+            status_method="is_daily_post_running",
+            component="daily calendar posts",
         )
 
         now = datetime.now(timezone.utc)
@@ -96,8 +96,8 @@ class StatusHandler:
             required_checks.append(scheduler_state == "running")
         if self._gift_polling_enabled:
             required_checks.append(gift_polling_state == "running")
-        if self._alliance_power_handler is not None:
-            required_checks.append(power_polling_state == "running")
+        if self._calendar_handler is not None:
+            required_checks.append(calendar_state == "running")
         color = EmbedColors.SUCCESS if all(required_checks) else EmbedColors.WARNING
 
         scheduler_health = self._scheduler_health()
@@ -128,7 +128,8 @@ class StatusHandler:
             scheduler_value = f"{scheduler_value}\n{summary}"[:1024]
         embed.add_field(name="Scheduler", value=scheduler_value, inline=True)
         embed.add_field(name="Gift Polling", value=self._component_value(gift_polling_state), inline=True)
-        embed.add_field(name="Power Tracking", value=self._component_value(power_polling_state), inline=True)
+        if self._calendar_handler is not None:
+            embed.add_field(name="Calendar Posts", value=self._component_value(calendar_state), inline=True)
 
         # Deployment details are only useful to (and only shown to) bot operators.
         if is_operator:
