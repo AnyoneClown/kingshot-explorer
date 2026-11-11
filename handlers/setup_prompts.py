@@ -39,11 +39,23 @@ def bot_can_post(channel) -> bool:
     return bool(permissions.view_channel and bot_send_permission(channel, permissions) and permissions.embed_links)
 
 
+def bot_can_attach(channel) -> bool:
+    """Whether the bot may upload files in ``channel`` (True when it cannot be checked)."""
+    guild = getattr(channel, "guild", None)
+    me = getattr(guild, "me", None)
+    if me is None or not hasattr(channel, "permissions_for"):
+        return True
+    try:
+        return bool(channel.permissions_for(me).attach_files)
+    except Exception:
+        return True
+
+
 def is_announcement_target(channel) -> bool:
     """Whether a channel may be saved as a gift-code or calendar channel.
 
     Threads archive (announcements would then be dropped silently) and voice
-    channels are not what ``/configure`` offers, so only text and news channels count.
+    channels are not what ``/settings`` offers, so only text and news channels count.
     Objects that are not discord channels (test doubles) are accepted.
     """
     if isinstance(channel, discord.abc.GuildChannel) or isinstance(channel, discord.Thread):
@@ -90,7 +102,7 @@ class ChannelSetupView(OwnedView):
                 title="✅ Channel saved",
                 description=(
                     f"{what.capitalize()} will be posted in <#{self._channel_id}>. "
-                    "Change it any time in `/configure`."
+                    "Change it any time in `/settings`."
                 ),
                 color=EmbedColors.SUCCESS,
             ),
@@ -157,7 +169,7 @@ async def offer_channel_setup(
                     f"Post them in <#{channel_id}>?"
                 ),
                 color=EmbedColors.INFO,
-                footer="You can pick another channel in /configure.",
+                footer="You can pick another channel in /settings.",
             ),
             view=view,
             ephemeral=True,

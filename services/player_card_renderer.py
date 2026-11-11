@@ -1,4 +1,4 @@
-"""Pure, thread-safe rendering of the /stats player card.
+"""Pure, thread-safe rendering of the /player player card.
 
 The card stacks the Arena defense heroes (portrait, hero level, stars, exclusive
 weapon, hero gear) above the governor gear strip (six equipment slots, each with

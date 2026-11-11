@@ -93,7 +93,7 @@ async def test_gift_code_list_with_unreadable_or_odd_payload_never_crashes(monke
     result = await GiftCodeService().get_available_gift_codes()
     assert result == {"success": False, "message": "Gift code API returned an invalid response"}
 
-    # A null gift-code list must still be a list: /giftcodes iterates it.
+    # A null gift-code list must still be a list: /gift codes iterates it.
     _serve(monkeypatch, _FakeRequest(_FakeResponse(payload={"status": "success", "data": {"giftCodes": None}})))
     assert await GiftCodeService().get_available_gift_codes() == {"success": True, "data": []}
 

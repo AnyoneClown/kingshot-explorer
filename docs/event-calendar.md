@@ -62,7 +62,7 @@ week yet") until Monday. The views select events by time, so stale weeks never s
 ## `/calendar`
 
 `/calendar [kingdom]` posts a public panel. Without `kingdom` it uses the server's kingdom
-from `/configure`; without either it explains how to give one. Works in direct
+from `/settings`; without either it explains how to give one. Works in direct
 messages with an explicit kingdom. Cooldown: 4 uses per 30 s per user.
 
 Tabs (`handlers/calendar_handler.py`). Each is an embed with the KvK and transfer lines
@@ -80,7 +80,10 @@ Tabs (`handlers/calendar_handler.py`). Each is an embed with the KvK and transfe
 ## Pictures
 
 `services/calendar_card_renderer.py` draws the cards with Pillow, styled after the calendar on
-kingshot.net (its dark theme colors and its heading font, Space Grotesk).
+kingshot.net (its dark theme colors and its heading font, Space Grotesk). The canvas, fonts and
+colors live in `services/card_drawing.py`, shared with the other cards the bot draws: gift-code
+results (`gift_card_renderer.py`), KvK history and comparison (`kvk_card_renderer.py`), and the
+scout leaderboard and prep-dossier rankings (`ranking_card_renderer.py`).
 
 - **One card per embed.** Discord fits an embed image into a small box (about 400 × 300
   points, not confirmed against a current client). One tall picture with everything on it is
@@ -100,12 +103,16 @@ kingshot.net (its dark theme colors and its heading font, Space Grotesk).
   the event id.
 - **Font:** `assets/fonts/SpaceGrotesk.ttf` (variable weight, SIL Open Font License, see
   `assets/fonts/OFL.txt`). It covers Latin only; event titles come from the API in English.
+  Cards that print player or alliance names fall back, character by character, to the Noto
+  fonts in `assets/fonts/fallback/` (Latin/Cyrillic/Greek, Chinese/Japanese/Korean, Thai,
+  symbols; about 17 MB, OFL). Emoji and scripts that need shaping (Arabic, Indic) are left out,
+  because the Pillow wheels have no shaping engine (`raqm` is unavailable on macOS and the Pi).
 - Drawing runs in a worker thread behind a lock (FreeType fonts are not thread-safe) and
   results are cached per calendar, view, category filter and minute, so a daily post for many
   servers of one kingdom draws once.
 - **Fallback to text:** if a card cannot be drawn, or the bot lacks **Attach Files** in the
   calendar channel, the same information is posted as embed fields (`build_today_embed` /
-  `build_week_embed`). `/configure` warns about the missing permission.
+  `build_week_embed`). `/settings` warns about the missing permission.
 
 New dependency: `pillow` (wheels exist for the Raspberry Pi's aarch64).
 
@@ -119,19 +126,19 @@ Only error messages name kingshot.net, so a manager can tell where a problem com
 ## Daily post
 
 A server gets the Today view every day at **08:00 UTC** once a manager picked both an
-**event calendar channel** and set the server's **kingdom** in `/configure`. Picking a channel
+**event calendar channel** and set the server's **kingdom** in `/settings`. Picking a channel
 before a kingdom opens a form for the kingdom and saves both. A manager who runs `/calendar`
 in a server without a calendar channel is offered "Post the daily calendar here" once.
 
 - Settings live in `guild_configurations`: `kingdom_id` (the kingdom the server plays in, one
-  per server; a general setting shown as **Kingdom** in `/configure`, so other features can
+  per server; a general setting shown as **Kingdom** in `/settings`, so other features can
   default to it later), `calendar_channel_id` and `calendar_last_posted_on`
   (migration `20261112120000`).
 - The loop wakes every ten minutes on the clock (so exactly at 08:00) and posts for every
   connected server whose `calendar_last_posted_on` is not today. This is what makes it
   restart-safe: a bot that was down at 08:00 posts when it is back the same UTC day, and a
   restart never posts a day twice. The first pass also runs right after start-up.
-- Changing the channel or kingdom in `/configure` posts today's calendar immediately as a
+- Changing the channel or kingdom in `/settings` posts today's calendar immediately as a
   visible check and counts as that day's post; the panel reports the result or the problem
   (missing permissions, deleted channel, unknown kingdom).
 - A failed post is retried on the next ten-minute mark. The reason is logged once per change,

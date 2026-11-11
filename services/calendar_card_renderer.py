@@ -28,13 +28,36 @@ from __future__ import annotations
 import functools
 import io
 import logging
-import threading
 from datetime import datetime, time, timedelta
-from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
+from services.card_drawing import (
+    AMBER,
+    BACKGROUND,
+    BLUE,
+    CARD_WIDTH,
+    FONT_PATH,
+    GOOD,
+    HEADER_HEIGHT,
+    MUTED,
+    PADDING,
+    RED,
+    RENDER_LOCK as _RENDER_LOCK,
+    ROOT_DIR,
+    SCALE,
+    TEXT,
+    TRACK,
+    Card as _Card,
+    Color,
+    ellipsize as _ellipsize,
+    get_font as _font,
+    format_duration,
+    mix as _mix,
+    px as _px,
+    text_width as _width,
+)
 from services.kingshot_calendar_service import (
     CATEGORY_ALLIANCE,
     CATEGORY_DEALS,
@@ -50,15 +73,8 @@ from services.kingshot_calendar_service import (
 
 logger = logging.getLogger(__name__)
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
 EVENT_ICONS_DIR = ROOT_DIR / "images" / "events"
-FONT_PATH = ROOT_DIR / "assets" / "fonts" / "SpaceGrotesk.ttf"
 
-# Layout sizes below are in points; the image is SCALE times larger.
-SCALE = 2.5
-CARD_WIDTH = 440
-PADDING = 12
-HEADER_HEIGHT = 34
 COLUMNS = 2
 CELL_HEIGHT = 52
 COMPACT_CELL_HEIGHT = 38
@@ -72,82 +88,25 @@ TIMELINE_LABEL_WIDTH = 164
 TIMELINE_DAYS_HEIGHT = 22
 TIMELINE_ROW_HEIGHT = 20
 
-Color = tuple[int, int, int]
-
-# The dark theme of kingshot.net.
-BACKGROUND: Color = (34, 31, 29)
-LINE: Color = (56, 53, 51)
-TRACK: Color = (58, 55, 53)
-PILL: Color = (46, 42, 41)
-TEXT: Color = (250, 250, 249)
-MUTED: Color = (166, 160, 155)
-GOOD: Color = (103, 187, 107)
-AMBER: Color = (240, 165, 50)
 TODAY_TINT: Color = (42, 39, 37)
 
 CATEGORY_COLORS: dict[str, Color] = {
-    CATEGORY_WAR: (255, 100, 103),
-    CATEGORY_ALLIANCE: (70, 153, 254),
+    CATEGORY_WAR: RED,
+    CATEGORY_ALLIANCE: BLUE,
     CATEGORY_GROWTH: GOOD,
     CATEGORY_DEALS: MUTED,
     CATEGORY_SPECIAL: (74, 168, 255),
     CATEGORY_PACK: AMBER,
 }
 
-_RENDER_LOCK = threading.Lock()
 _MIDNIGHT = time(0, 0)
-
-
-def _px(points: float) -> int:
-    return round(points * SCALE)
 
 
 def category_color(event: CalendarEvent) -> Color:
     return CATEGORY_COLORS.get(event.category, CATEGORY_COLORS[CATEGORY_SPECIAL])
 
 
-def _mix(color: Color, background: Color, amount: float) -> Color:
-    """``color`` at ``amount`` opacity over ``background``."""
-    return tuple(round(c * amount + b * (1 - amount)) for c, b in zip(color, background))  # type: ignore[return-value]
-
-
 # ----------------------------------------------------------------------- text
-
-
-@functools.lru_cache(maxsize=64)
-def _font(size: float, weight: int) -> ImageFont.FreeTypeFont:
-    font = ImageFont.truetype(str(FONT_PATH), _px(size))
-    try:
-        font.set_variation_by_axes([weight])
-    except (OSError, AttributeError):
-        # A FreeType build without variable-font support: the default weight still reads fine.
-        logger.debug("Variable font weights are unavailable", exc_info=True)
-    return font
-
-
-def _width(text: str, font: ImageFont.FreeTypeFont) -> float:
-    return font.getlength(text)
-
-
-def _ellipsize(text: str, font: ImageFont.FreeTypeFont, max_width: float) -> str:
-    if _width(text, font) <= max_width:
-        return text
-    cut = text
-    while cut and _width(cut.rstrip() + "…", font) > max_width:
-        cut = cut[:-1]
-    return cut.rstrip() + "…" if cut else ""
-
-
-def format_duration(delta: timedelta) -> str:
-    """``1d 4h``, ``5h 12m`` or ``42m``, like the countdowns on the site."""
-    minutes = max(0, int(delta.total_seconds() // 60))
-    days, rest = divmod(minutes, 1440)
-    hours, mins = divmod(rest, 60)
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
 
 
 def _moment_label(moment: datetime, now: datetime) -> str:
@@ -222,88 +181,7 @@ def _placeholder_icon(event: CalendarEvent, size: int) -> Image.Image:
     return tile
 
 
-# -------------------------------------------------------------------- canvas
-
-
-class _Card:
-    """A card being drawn. Coordinates are layout points, converted on the way in."""
-
-    def __init__(self, height: float):
-        self.height = height
-        self.image = Image.new("RGB", (_px(CARD_WIDTH), _px(height)), BACKGROUND)
-        self.draw = ImageDraw.Draw(self.image)
-
-    def text(self, x: float, baseline: float, text: str, font, fill: Color, *, anchor: str = "ls") -> float:
-        """Draw text on a baseline; returns its width in points."""
-        self.draw.text((_px(x), _px(baseline)), text, font=font, fill=fill, anchor=anchor)
-        return _width(text, font) / SCALE
-
-    def line(self, x1: float, y1: float, x2: float, y2: float, fill: Color = LINE) -> None:
-        self.draw.line((_px(x1), _px(y1), _px(x2), _px(y2)), fill=fill, width=max(1, _px(0.5)))
-
-    def bar(self, x: float, y: float, width: float, height: float, fill: Color, *, radius: Optional[float] = None) -> None:
-        if width <= 0:
-            return
-        radius = height / 2 if radius is None else radius
-        self.draw.rounded_rectangle(
-            (_px(x), _px(y), max(_px(x) + 1, _px(x + width)), _px(y + height)), radius=_px(radius), fill=fill
-        )
-
-    def striped_bar(self, x: float, y: float, width: float, height: float, color: Color, *, radius: float) -> None:
-        """A hatched bar: the mark for a date that is only estimated."""
-        box_width, box_height = max(2, _px(width)), max(2, _px(height))
-        layer = Image.new("RGB", (box_width, box_height), _mix(color, BACKGROUND, 0.28))
-        stripes = ImageDraw.Draw(layer)
-        step = max(4, _px(4))
-        for offset in range(-box_height, box_width + box_height, step):
-            stripes.line((offset, box_height, offset + box_height, 0), fill=color, width=max(1, _px(1.1)))
-        mask = Image.new("L", (box_width, box_height), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, box_width - 1, box_height - 1), radius=_px(radius), fill=255)
-        self.image.paste(layer, (_px(x), _px(y)), mask)
-
-    def paste(self, icon: Image.Image, x: float, y: float, box: float) -> None:
-        """Paste ``icon`` centered in a square of ``box`` points."""
-        size = _px(box)
-        left = _px(x) + (size - icon.width) // 2
-        top = _px(y) + (size - icon.height) // 2
-        self.image.paste(icon, (left, top), icon)
-
-    def badge(self, x: float, baseline: float, text: str, color: Color) -> float:
-        """A small outlined label; returns the width it took, in points."""
-        font = _font(7.5, 600)
-        width = _width(text, font) / SCALE + 8
-        top = baseline - 9.5
-        self.draw.rounded_rectangle(
-            (_px(x), _px(top), _px(x + width), _px(top + 12.5)),
-            radius=_px(3),
-            outline=_mix(color, BACKGROUND, 0.75),
-            width=max(1, _px(0.6)),
-        )
-        self.text(x + 4, baseline - 0.4, text, font, color)
-        return width
-
-    def header(self, top: float, title: str, color: Color, *, count: Optional[int] = None, note: str = "") -> None:
-        middle = top + HEADER_HEIGHT / 2
-        self.draw.ellipse(
-            (_px(PADDING), _px(middle - 3.5), _px(PADDING + 7), _px(middle + 3.5)), fill=color
-        )
-        self.text(PADDING + 14, middle, title, _font(13.5, 600), TEXT, anchor="lm")
-        right = CARD_WIDTH - PADDING
-        if count is not None:
-            font = _font(9.5, 500)
-            label = str(count)
-            width = max(20.0, _width(label, font) / SCALE + 12)
-            self.bar(right - width, middle - 8, width, 16, PILL)
-            self.text(right - width / 2, middle, label, font, MUTED, anchor="mm")
-            right -= width + 8
-        if note:
-            self.text(right, middle, note, _font(9.5, 400), MUTED, anchor="rm")
-        self.line(0, top + HEADER_HEIGHT, CARD_WIDTH, top + HEADER_HEIGHT)
-
-    def png(self) -> bytes:
-        buffer = io.BytesIO()
-        self.image.save(buffer, format="PNG", optimize=True)
-        return buffer.getvalue()
+# ----------------------------------------------------------------------- grid
 
 
 def _rows(count: int) -> int:

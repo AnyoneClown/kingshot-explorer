@@ -11,63 +11,64 @@ from handlers.permissions import AccessPolicy, interaction_guild_id
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 
 
+# Actions are (command, button label, example); a command inside a group is named
+# with a space, like Discord shows it ("gift codes").
 GROUPS = {
     "Players": (
         "Look up a Governor ID or internal player UID, or browse a kingdom's Mystic Trial leaderboard.",
         (
-            ("stats", "View player", "/stats player_id:123456"),
-            ("scout", "Scout kingdom", "/scout kingdom_number:830 limit:5"),
-            ("listplayers", "Server roster", "/listplayers"),
+            ("player", "View player", "/player player_id:123456"),
+            ("scout", "Scout kingdom", "/scout kingdom:830 limit:5"),
+            ("gift roster", "Server roster", "/gift roster"),
         ),
     ),
     "KVK": (
         "Browse match history, compare two kingdoms, or build a prep dossier before a KvK.",
         (
-            ("kvk", "Kingdom history", "/kvk kingdom_number:830"),
-            ("kvk_compare", "Compare kingdoms", "/kvk_compare kingdom_a:830 kingdom_b:831"),
-            ("kvk_prep", "Prep dossier", "/kvk_prep kingdom_a:830 kingdom_b:831"),
+            ("kvk history", "Kingdom history", "/kvk history kingdom:830"),
+            ("kvk compare", "Compare kingdoms", "/kvk compare kingdom_a:830 kingdom_b:831"),
+            ("kvk prep", "Prep dossier", "/kvk prep kingdom_a:830 kingdom_b:831"),
         ),
     ),
     "Gifts": (
-        "Add your Governor ID with /addplayer to receive new codes automatically, check your "
-        "accounts with /myaccounts, and send in a code the bot has not found yet with /submitcode. "
-        "Server managers can post a sign-up panel with buttons, import alliances and run /redeem "
-        "for this server's roster.",
+        "Add your Governor ID with /gift add to receive new codes automatically, check your "
+        "accounts with /gift accounts, and send in a code the bot has not found yet with /gift submit. "
+        "Server managers can post a sign-up panel with buttons, import alliances and redeem a code "
+        "for this server's roster with /giftadmin.",
         (
-            ("giftcodes", "Available codes", "/giftcodes"),
-            ("addplayer", "Add players", "/addplayer player_ids:123456,654321"),
-            ("myaccounts", "My accounts", "/myaccounts"),
-            ("submitcode", "Submit a code", "/submitcode code:EXAMPLE"),
-            ("removeplayer", "Remove player", "/removeplayer player_id:123456"),
-            ("addalliance", "Import alliance", "/addalliance kid:830"),
-            ("redeem", "Redeem code", "/redeem gift_code:EXAMPLE"),
-            ("giftpanel", "Post sign-up panel", "/giftpanel"),
+            ("gift codes", "Available codes", "/gift codes"),
+            ("gift add", "Add players", "/gift add player_ids:123456,654321"),
+            ("gift accounts", "My accounts", "/gift accounts"),
+            ("gift submit", "Submit a code", "/gift submit code:EXAMPLE"),
+            ("gift remove", "Remove player", "/gift remove player_id:123456"),
+            ("giftadmin import", "Import alliance", "/giftadmin import kid:830"),
+            ("giftadmin redeem", "Redeem code", "/giftadmin redeem gift_code:EXAMPLE"),
+            ("giftadmin panel", "Post sign-up panel", "/giftadmin panel"),
         ),
     ),
     "Calendar": (
         "See what is on in a kingdom today, this week and next week: KvK and transfer countdowns, "
         "events that start or end today, and what is coming. Leave the kingdom empty to use this "
         "server's kingdom. Server managers can have the summary posted every day at 08:00 UTC: "
-        "set the server's kingdom and pick the channel in /configure.",
+        "set the server's kingdom and pick the channel in /settings.",
         (("calendar", "Event calendar", "/calendar kingdom:795"),),
     ),
-    "Events": (
-        "Review upcoming reminders. Creating, editing, and cancelling reminders "
-        "requires a server manager.",
+    "Reminders": (
+        "Review this channel's reminders. Creating, editing, and cancelling reminders "
+        "requires a server manager; edit and cancel are buttons on the reminder list.",
         (
-            ("events", "Upcoming events", "/events"),
-            ("schedule", "Create event", "/schedule"),
-            ("cancel", "Cancel event", "/cancel event_id:12"),
+            ("reminders", "Upcoming reminders", "/reminders"),
+            ("remind", "Create reminder", "/remind"),
         ),
     ),
     "Settings": (
         "Server-wide settings: the server's kingdom, the gift-code channel, the daily event calendar, "
         "the bot manager role and AI replies. Available to server managers.",
-        (("configure", "Open settings", "/configure"),),
+        (("settings", "Open settings", "/settings"),),
     ),
 }
 # Actions only offered to server managers (Manage Server, the manager role, or bot operators).
-ADMIN_COMMANDS = {"redeem", "schedule", "cancel", "configure", "addalliance", "giftpanel"}
+ADMIN_COMMANDS = {"giftadmin redeem", "giftadmin import", "giftadmin panel", "remind", "settings"}
 # Discord allows five buttons per row; action buttons fill these rows in order.
 ACTION_ROWS = (1, 2)
 BUTTONS_PER_ROW = 5
@@ -81,7 +82,7 @@ FIELD_LABELS = {
     "gift_code": "Gift code",
     "code": "Gift code",
     "event_id": "Event ID",
-    "kingdom_number": "Kingdom number",
+    "kingdom": "Kingdom number",
     "kingdom_a": "First kingdom",
     "kingdom_b": "Second kingdom",
 }
@@ -131,7 +132,7 @@ class CommandInputModal(discord.ui.Modal):
                     )
                     return
             values[parameter.name] = value
-        await self.handler.run_command(interaction, self.command.name, values)
+        await self.handler.run_command(interaction, self.command.qualified_name, values)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         await send_ui_error(interaction, error)
@@ -219,6 +220,14 @@ class HelpHandler:
             return cached
         return self._access.is_super_admin(interaction.user.id)
 
+    def find_command(self, name: str):
+        """Resolve "gift codes" style names: a top-level command or a subcommand of a group."""
+        first, *rest = name.split()
+        command = self._bot.tree.get_command(first)
+        for part in rest:
+            command = command.get_command(part) if isinstance(command, app_commands.Group) else None
+        return None if isinstance(command, app_commands.Group) else command
+
     def register_commands(self) -> None:
         @self._bot.tree.command(name="help", description="Browse available features and start a workflow")
         async def help_command(interaction: discord.Interaction):
@@ -233,9 +242,9 @@ class HelpHandler:
         for category, (description, actions) in GROUPS.items():
             available = tuple(
                 action for action in actions
-                if self._bot.tree.get_command(action[0]) is not None
+                if self.find_command(action[0]) is not None
                 and (action[0] not in ADMIN_COMMANDS or is_admin)
-                and (category not in {"Events", "Settings", "Gifts"} or interaction.guild is not None)
+                and (category not in {"Reminders", "Settings", "Gifts"} or interaction.guild is not None)
             )
             if available:
                 groups[category] = (description, available)
@@ -261,18 +270,18 @@ class HelpHandler:
         if not self._allowed(interaction, name):
             await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
             return
-        command = self._bot.tree.get_command(name)
-        if name == "addalliance":
+        command = self.find_command(name)
+        if name == "giftadmin import":
             await interaction.response.send_message(
                 embed=build_status_embed(
                     title="Import alliance",
                     description=(
-                        "Run `/addalliance` in this channel. Enter the kingdom number in `kid`, "
+                        "Run `/giftadmin import` in this channel. Enter the kingdom number in `kid`, "
                         "then choose `alliance` from Discord's autocomplete list.\n\n"
                         "The list shows the top 15 alliances by power. When a tag is unavailable, "
                         "the alliance ID identifies the choice. Options may take a moment to load; "
                         "you can also enter an exact 3-character tag.\n\n"
-                        "Example: open `/addalliance`, enter `830` for `kid`, then choose an alliance."
+                        "Example: open `/giftadmin import`, enter `830` for `kid`, then choose an alliance."
                     ),
                 ),
                 ephemeral=True,
@@ -288,7 +297,7 @@ class HelpHandler:
     async def run_command(
         self, interaction: discord.Interaction, name: str, values: dict, *, refresh: bool = True
     ) -> None:
-        command = self._bot.tree.get_command(name)
+        command = self.find_command(name)
         if refresh:
             await self.refresh_access(interaction)
         if command is None or not self._allowed(interaction, name):

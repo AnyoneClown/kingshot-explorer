@@ -145,8 +145,8 @@ def test_help_buttons_without_a_form_check_access_once():
     handler = HelpHandler(bot, access_policy=access)
 
     async def check():
-        await handler.open_command(help_interaction(2), name="giftcodes", label="Available codes")
-        assert calls == [("giftcodes",)]
+        await handler.open_command(help_interaction(2), name="gift codes", label="Available codes")
+        assert calls == [("gift codes",)]
         assert access.can_manage.await_count == 1
         # A manager-only action still re-checks (and is refused) on the same path.
         denied = help_interaction(2)

@@ -7,7 +7,7 @@ Three levels are used across the bot:
   toggles.
 * **Server managers** can manage the bot inside one server: members with the
   Discord *Manage Server* or *Administrator* permission, members holding the
-  manager role chosen in ``/configure``, and bot operators.
+  manager role chosen in ``/settings``, and bot operators.
 * Everyone else can use member features.
 
 Slash commands that only managers should see are additionally hidden with

@@ -60,9 +60,9 @@ Important response behavior:
 - Privacy settings can hide fields such as VIP, gear, or profile details.
 - Power may appear as top-level `power`, or in `stats["8"]` for sparse responses.
 
-`/stats` and `/addplayer` resolve the in-game Governor ID with
+`/player` and `/gift add` resolve the in-game Governor ID with
 `GET /v1/players/by-fid/{fid}`. The old Century Games `/api/player` lookup has been
-removed, so it is not used for profiles. `/stats` reuses that modern profile for power,
+removed, so it is not used for profiles. `/player` reuses that modern profile for power,
 alliance, and arena lookups. An explicit `fid not found` is reported as missing; a
 gateway failure is reported as a temporary lookup problem.
 
@@ -104,11 +104,11 @@ is an invalid player, and `TOO FREQUENT` is a bounded rate-limit retry. After th
 requests run in batches of three; a global code error found later stops subsequent
 batches.
 
-`/redeem` starts this work as a background job instead of keeping the slash-command
+`/giftadmin redeem` starts this work as a background job instead of keeping the slash-command
 webhook open. The requester immediately receives an ephemeral start confirmation with
 the queued player count. Completion or failure is posted as a normal message in the
 original channel and mentions the requester. Only one manual redemption job can run at
-a time; another `/redeem` is rejected until the active job posts its result. Jobs are
+a time; another `/giftadmin redeem` is rejected until the active job posts its result. Jobs are
 in-memory and do not survive a bot restart.
 
 ## Alliance Endpoints
@@ -135,7 +135,7 @@ Current lean roster entries may contain only:
 {"uid":30669791,"rank":4}
 ```
 
-Future responses may include `fid`; `/addalliance` should use `fid` when present because gift code redemption needs Governor ID, not internal `uid`.
+Future responses may include `fid`; `/giftadmin import` should use `fid` when present because gift code redemption needs Governor ID, not internal `uid`.
 
 As observed for kingdom 830 on 2026-09-25, the alliance board returned 15 AIDs, while
 the alliance summary had null `abbr` and `name`, and a member lookup by UID had null
@@ -165,7 +165,7 @@ roster, verifies the returned AID and kingdom, then joins members **only by UID*
 current KingShot Data API roster. MightPulse's documented data may be up to one hour old;
 stale extra members cannot be imported because their UIDs are absent from the current
 roster. Unmatched current members are tried through the local UID cache and KingShot
-profile endpoint. When no source yields Governor IDs, `/addalliance` reports that no
+profile endpoint. When no source yields Governor IDs, `/giftadmin import` reports that no
 members were imported instead of claiming success. Without a MightPulse key, imports
 still work for members whose FIDs are already in the local cache or supplied by the
 KingShot Data API.
@@ -348,9 +348,9 @@ These are server-side variables for the API service itself. The bot normally onl
 
 Current project usage:
 
-- Governor ID validation and `/stats` use `GET /v1/players/by-fid/{fid}` through `PlayerInfoService` (the gift-code API is reserved for redemptions and its 30 requests/minute budget). `by-fid` answers unknown IDs with `{"fid": …, "error": "fid not found"}` ("not found"); transport, auth and gateway errors and incomplete profiles raise `PlayerLookupUnavailable` (alias `PlayerInfoUnavailableError`), so users see "Player Lookup Unavailable" instead of "player not found". When a Governor ID is unknown, `/stats` also accepts an internal player UID through `GET /v1/players/{uid}`. The lookup's profile is reused for the stats card (no second profile request); Mystic Trial and Arena load concurrently and renders a hero strip (with hero level) plus a governor gear strip off the event loop. Gear and charm IDs are mapped to `images/gear/{equipid}.png` (`equipid = slot * 1000 + tier`, files 1001–6008) and `images/charms/{charm}.png` (`troop * 100 + level`: 1xx shield, 2xx horse, 3xx bow). The mapping is inferred from the shipped artwork and the SCHEMAS.md examples (1005, 201), not from an official table; unknown IDs fall back to slot silhouettes.
+- Governor ID validation and `/player` use `GET /v1/players/by-fid/{fid}` through `PlayerInfoService` (the gift-code API is reserved for redemptions and its 30 requests/minute budget). `by-fid` answers unknown IDs with `{"fid": …, "error": "fid not found"}` ("not found"); transport, auth and gateway errors and incomplete profiles raise `PlayerLookupUnavailable` (alias `PlayerInfoUnavailableError`), so users see "Player Lookup Unavailable" instead of "player not found". When a Governor ID is unknown, `/player` also accepts an internal player UID through `GET /v1/players/{uid}`. The lookup's profile is reused for the stats card (no second profile request); Mystic Trial and Arena load concurrently and renders a hero strip (with hero level) plus a governor gear strip off the event loop. Gear and charm IDs are mapped to `images/gear/{equipid}.png` (`equipid = slot * 1000 + tier`, files 1001–6008) and `images/charms/{charm}.png` (`troop * 100 + level`: 1xx shield, 2xx horse, 3xx bow). The mapping is inferred from the shipped artwork and the SCHEMAS.md examples (1005, 201), not from an official table; unknown IDs fall back to slot silhouettes.
 - `/scout` uses `GET /v1/leaderboards/kingdom/20?kid={kid}&limit={limit}&resolve=true`, then resolves player profiles with `GET /v1/players/{uid}` (or `GET /v1/players/by-fid/{fid}` when only a Governor ID is available). Profiles are reused across the summary, selector, and stats-style detail cards in one message. The command defaults to 5 players and caps the limit at 15.
-- `/addalliance kid:<kid> alliance:<choice>` loads the public MightPulse kingdom directory for named top-15 alliances. The AID is the choice value; labels use `[TAG] Name - N members`. If the directory fails, it uses KingShot alliance-power leaderboard type `1` and displays AID fallback labels for missing names. A slow fallback leaderboard shows a temporary loading choice and keeps the lookup running. After selection, the bot loads `/v1/alliances/{aid}?kid={kid}` and resolves Governor IDs from direct roster fields, the local UID cache, the optional key-protected MightPulse roster, or player profiles.
+- `/giftadmin import kid:<kid> alliance:<choice>` loads the public MightPulse kingdom directory for named top-15 alliances. The AID is the choice value; labels use `[TAG] Name - N members`. If the directory fails, it uses KingShot alliance-power leaderboard type `1` and displays AID fallback labels for missing names. A slow fallback leaderboard shows a temporary loading choice and keeps the lookup running. After selection, the bot loads `/v1/alliances/{aid}?kid={kid}` and resolves Governor IDs from direct roster fields, the local UID cache, the optional key-protected MightPulse roster, or player profiles.
 
 Verification: mocked tests cover the 15-AID/null-tag response, AID autocomplete and
 selection, the modern Governor-ID profile, cross-source UID joining and alliance
@@ -372,7 +372,7 @@ probe returned `[KOR] Serendipity`, `[FFL] FireLeague`, and `[FKA] FateKillsAll`
 the choices in 0.46 seconds. Mocked tests cover source identity checks, named choice
 labels, and fallback to the KingShot board when the directory fails.
 
-- `/kvk_prep` and the **Prep dossier** button use `GET /v1/kingdoms/{kid}/castle?kvk=true&resolve=true` (retried once without `kvk` on a 500/502), kingdom board `1` through the ranked-alliance resolver, and boards `3`/`4` with `resolve=true&limit=5`, plus kingshot.net KvK history. A cold dossier costs about 4 Data API calls plus roughly 5 alliance-resolution calls per kingdom; results are cached 10 minutes (60 s when a section failed), concurrent requests share one load, and at most 3 Data API calls run at once. The command has a 2-per-minute per-user cooldown. `get_kingdom_kings` and `get_player_reigns` are available in the client but not used by the dossier, because the castle response already includes reign history.
+- `/kvk prep` and the **Prep dossier** button use `GET /v1/kingdoms/{kid}/castle?kvk=true&resolve=true` (retried once without `kvk` on a 500/502), kingdom board `1` through the ranked-alliance resolver, and boards `3`/`4` with `resolve=true&limit=5`, plus kingshot.net KvK history. A cold dossier costs about 4 Data API calls plus roughly 5 alliance-resolution calls per kingdom; results are cached 10 minutes (60 s when a section failed), concurrent requests share one load, and at most 3 Data API calls run at once. The command has a 2-per-minute per-user cooldown. `get_kingdom_kings` and `get_player_reigns` are available in the client but not used by the dossier, because the castle response already includes reign history.
 
 ## Client Etiquette
 

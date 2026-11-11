@@ -27,7 +27,14 @@ def test_kvk_history_pagination_comparison_and_missing_values():
         assert len(view.pages) == 3 and sum(map(len, view.pages)) == 13
         embed = view.build_embed()
         assert embed.color == EmbedColors.INFO
-        fields = {field.name: field.value for field in embed.fields}
+        # The record is on the attached card; the embed keeps the match list.
+        assert embed.image.url == "attachment://kvk-history.png"
+        assert [field.name for field in embed.fields] == ["Match History"]
+        sent_files = interaction.followup.send.call_args.kwargs["files"]
+        assert [file.filename for file in sent_files] == ["kvk-history.png"]
+        assert sent_files[0].fp.read(8) == b"\x89PNG\r\n\x1a\n"
+        # Without a card the same numbers are text fields.
+        fields = {field.name: field.value for field in handler._build_history_embed(830, stats).fields}
         assert fields["Castle Record"] == "0-13"
         assert fields["Castle Win Rate"] == "0.00%"
         assert fields["Prep Record"] == "Unavailable" and fields["Prep Win Rate"] == "Unavailable"
@@ -131,17 +138,19 @@ def test_kvk_commands_use_ranges_and_validate_before_deferring():
 
     bot = commands.Bot(command_prefix="!", intents=Intents.none())
     KVKHandler(SimpleNamespace(), bot, dossier_service=SimpleNamespace()).register_commands()
-    for name, parameters in (("kvk", ["kingdom_number"]), ("kvk_compare", ["kingdom_a", "kingdom_b"]),
-                             ("kvk_prep", ["kingdom_a", "kingdom_b"])):
-        command = bot.tree.get_command(name)
+    group = bot.tree.get_command("kvk")
+    for name, parameters in (("history", ["kingdom"]), ("compare", ["kingdom_a", "kingdom_b"]),
+                             ("prep", ["kingdom_a", "kingdom_b"])):
+        command = group.get_command(name)
         for parameter in parameters:
             option = command.get_parameter(parameter)
             assert (option.min_value, option.max_value) == (1, 99999), (name, parameter)
-    assert bot.tree.get_command("kvk_prep").checks  # per-user cooldown
+    assert group.get_command("prep").checks  # per-user cooldown
 
     plain_bot = commands.Bot(command_prefix="!", intents=Intents.none())
     KVKHandler(SimpleNamespace(), plain_bot).register_commands()
-    assert plain_bot.tree.get_command("kvk_prep") is None
+    assert plain_bot.tree.get_command("kvk").get_command("prep") is None
+    assert plain_bot.tree.get_command("kvk").get_command("history") is not None
 
     async def check():
         handler = KVKHandler(SimpleNamespace(get_kingdom_stats=AsyncMock(), compare_kingdoms=AsyncMock()), object(),
@@ -253,7 +262,15 @@ def test_compare_panel_offers_public_prep_dossier():
         dossier_service.build_dossier.assert_awaited_once_with(830, 831)
         click.response.defer.assert_awaited_once_with(thinking=True)
         sent = click.followup.send.call_args
-        assert sent.kwargs["embed"].title == "🛡️ KvK Prep · K830 vs K831"
+        first, second = sent.kwargs["embeds"]
+        assert first.title == "🛡️ KvK Prep · K830 vs K831"
+        # Rankings are two picture cards; castle and record stay as text.
+        assert first.image.url == "attachment://kvk-prep-alliances.png"
+        assert second.image.url == "attachment://kvk-prep-players.png"
+        assert [file.filename for file in sent.kwargs["files"]] == ["kvk-prep-alliances.png", "kvk-prep-players.png"]
+        assert not any("top alliances" in field.name or "top power" in field.name for field in first.fields)
+        assert any("Castle & throne" in field.name for field in first.fields)
+        assert second.footer.text.startswith("Cached up to 10 min") and not first.footer.text
         assert "ephemeral" not in sent.kwargs
 
         plain = KVKHandler(service, object())

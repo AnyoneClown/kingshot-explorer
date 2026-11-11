@@ -379,7 +379,7 @@ class GuildConfigHandler:
         logger.info("GuildConfigHandler initialized")
 
     def register_commands(self):
-        @self._bot.tree.command(name="configure", description="Open the server's bot settings: kingdom, channels, manager role, AI replies")
+        @self._bot.tree.command(name="settings", description="Open the server's bot settings: kingdom, channels, manager role, AI replies")
         @manager_only_command
         async def configure(interaction: discord.Interaction):
             await self._handle_configure(interaction)

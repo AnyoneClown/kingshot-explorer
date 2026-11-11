@@ -5,12 +5,16 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 ## Features
 
 - Slash commands with interactive Discord panels and a private `/help` guide.
-- A permanent gift-code panel (`/giftpanel`) with buttons: members add their Governor
+- A permanent gift-code panel (`/giftadmin panel`) with buttons: members add their Governor
   ID, check their accounts, copy active codes and send in codes the bot has not found
   yet, without knowing any command.
-- Multi-server ready: per-server settings in `/configure` (the server's kingdom, the
+- Multi-server ready: per-server settings in `/settings` (the server's kingdom, the
   gift-code channel, daily event calendar, bot manager role) and per-server gift-code
   rosters.
+- Picture cards instead of walls of text: the event calendar, gift-code results, KvK
+  history, KvK comparison, the prep dossier's rankings and the scout leaderboard are drawn
+  as images in one shared style (`services/card_drawing.py`) and attached to their embeds.
+  When a card cannot be drawn or attached, the same information is posted as text.
 - Kingdom event calendar from kingshot.net as picture cards with the event artwork:
   `/calendar` shows what is running today, what is next, and a timeline of this week and
   the next; a server can have the daily card posted every day at 08:00 UTC.
@@ -48,16 +52,23 @@ Gift code support includes:
   owner (`guild_player_registrations`). Members can enroll up to
   `MAX_SELF_REGISTERED_PLAYERS` (3) accounts of their own; server managers can fill the
   roster up to `MAX_PLAYERS_PER_GUILD` (300) and import alliances.
-- Enabling/disabling roster entries from `/listplayers` (owners for their own entries,
+- Enabling/disabling roster entries from `/gift roster` (owners for their own entries,
   managers for all), plus a manager **Roster health** report: how many of the server's
   players recent codes reached, and players whose redemptions keep failing permanently,
   with a one-click **Disable these**.
 - Polling the upstream gift code source every minute (with back-off on network errors).
   Discovery runs independently of redemption, so a new code is recorded even while
-  another code is being redeemed. Members can also send in a code with `/submitcode`
+  another code is being redeemed. Members can also send in a code with `/gift submit`
   (or **Submit a code** on the panel): it is checked with one account (the member's own
   when they have one) and, if it works, queued for everyone; one submission per member
   per minute.
+- The summary posted after an automatic run carries a result card (picture): share of
+  accounts that have the reward, counts of received / already had it / rejected / invalid
+  ID, and the same split per kingdom (the five largest; the rest folded into one row).
+  The code itself stays as copyable text. Where the bot lacks **Attach Files**, or the
+  card cannot be drawn, the counts are posted as text instead. Cards are drawn by
+  `services/gift_card_renderer.py` with the same drawing code as the calendar cards
+  (`services/card_drawing.py`).
 - Members' own accounts go first: a run redeems self-registered accounts (owners with
   at most `MAX_SELF_REGISTERED_PLAYERS` entries in a server), then the rest of the
   server rosters, then unassigned legacy profiles. The gift-code server allows about 30
@@ -65,7 +76,7 @@ Gift code support includes:
 - Auto-redeeming new codes for every enabled profile that is enabled in at least one
   server roster. Profiles created before per-server rosters ("unassigned legacy") keep
   being redeemed until a bot operator assigns them to a server (**Assign unassigned
-  here** in `/listplayers`). Removing a server's last roster entry deletes the profile.
+  here** in `/gift roster`). Removing a server's last roster entry deletes the profile.
 - Resumable runs. New codes are stored as `pending`; each player's result is saved as
   soon as it is known, and every poll resumes pending, unexpired codes, skipping players
   already handled. A restart or deploy mid-run therefore continues where it stopped.
@@ -77,19 +88,19 @@ Gift code support includes:
   failures keeps the code pending and retries just those players after 15 minutes (up
   to 6 passes, or until the code expires). A pass that could not reach everyone does not
   count toward those 6: the code stays pending until it expires, or for 72 hours when
-  it has no expiry date. `/redeem` is refused while the bot is shutting down.
+  it has no expiry date. `/giftadmin redeem` is refused while the bot is shutting down.
 - Accounts that keep failing are paused. After a completed run, an account whose
   Governor ID or kingdom was rejected on at least 3 of the last 5 codes (including the
   current one) and that none of them reached is disabled: its roster entry in every
   server, or the profile itself when it is unassigned. The server's gift-code channel
   and the bot operators (by DM) get the list; a manager or the owner re-enables an
-  entry in `/listplayers` after fixing the ID.
+  entry in `/gift roster` after fixing the ID.
 - One job per code: automatic and manual runs share a guard, so a code is never
   redeemed twice concurrently; each server can run one manual job at a time.
 - Posting summary embeds when at least one auto-redemption succeeds: each server's
-  summary (its own players only) goes to the gift-code channel set in `/configure`, and
+  summary (its own players only) goes to the gift-code channel set in `/settings`, and
   the legacy `AUTO_REDEEM_CHANNELS` receive the global summary (a legacy channel that a
-  server also chose in `/configure` gets only that server's summary). While at least a
+  server also chose in `/settings` gets only that server's summary). While at least a
   minute of a run is left, the same message is posted early as "New Gift Code —
   Redeeming…" with the code, its expiry, progress and how to claim it by hand; it is
   refreshed about once a minute and becomes the summary. Message IDs are stored, so a
@@ -154,7 +165,7 @@ The bot uses three access levels, enforced by `handlers/permissions.py`:
   actions that affect every server: unassigned legacy players and the all-servers
   redemption job.
 - **Server managers** manage the bot inside one server: members with **Manage Server**
-  or **Administrator**, members with the bot manager role chosen in `/configure`, and
+  or **Administrator**, members with the bot manager role chosen in `/settings`, and
   bot operators. They configure the server, create/edit/cancel reminders, start/stop
   alliance tracking, import alliances and run redemptions for the server's roster.
 - **Members** use everything else: lookups, reports, translation, AI replies, and
@@ -231,20 +242,20 @@ The bot registers slash commands through handler modules in handlers/.
 
 Gift code related commands include:
 
-- `/redeem gift_code:<code>` (managers) redeems for this server's enabled roster; bot
+- `/giftadmin redeem gift_code:<code>` (managers) redeems for this server's enabled roster; bot
   operators can add `all_servers:true` to run the global job.
-- `/addplayer player_ids:<ids>` adds Governor IDs to this server's roster (private reply).
-- `/addalliance kid:<id> alliance:<choice>` (managers; top 15 by power with names from
+- `/gift add player_ids:<ids>` adds Governor IDs to this server's roster (private reply).
+- `/giftadmin import kid:<id> alliance:<choice>` (managers; top 15 by power with names from
   MightPulse's public kingdom view; AIDs remain the choice values and appear as fallback
   labels when names are unavailable). Governor IDs come from the roster, the local UID
   cache, the optional key-protected MightPulse roster (`MIGHTPULSE_API_KEY`) or player profiles.
-- `/removeplayer player_id:<id>` removes an entry from this server's roster after confirmation.
-- `/listplayers` (alias `/playerlist`) browses this server's roster.
-- `/giftcodes` lists active codes as copyable lines.
-- `/myaccounts` privately shows the caller's own accounts in this server, whether each
+- `/gift remove player_id:<id>` removes an entry from this server's roster after confirmation.
+- `/gift roster` browses this server's roster.
+- `/gift codes` lists active codes as copyable lines.
+- `/gift accounts` privately shows the caller's own accounts in this server, whether each
   is receiving codes, and the result of the three latest codes.
-- `/submitcode code:<code>` sends in a code the bot has not found yet (see Gift Code Flow).
-- `/giftpanel` (managers) posts the permanent panel with **Add my ID**, **My accounts**,
+- `/gift submit code:<code>` sends in a code the bot has not found yet (see Gift Code Flow).
+- `/giftadmin panel` (managers) posts the permanent panel with **Add my ID**, **My accounts**,
   **Active codes** and **Submit a code** buttons; the buttons keep working after
   restarts. If the server has no gift-code channel yet, the panel's channel becomes it.
 
@@ -257,35 +268,35 @@ Manual runs always report their outcome, including all-failure and early-abort r
 automatic announcements are posted only when at least one redemption succeeded.
 Century Games advertises a 30-request-per-minute limit, so requests are globally paced
 with at least two seconds between starts. Each request is attempted once by the API
-client; the only retry layer is `GiftRedemptionService.redeem_with_retries`. `/redeem`
+client; the only retry layer is `GiftRedemptionService.redeem_with_retries`. `/giftadmin redeem`
 immediately starts a single background job and acknowledges it privately. A normal
 channel message shows a progress bar, processed players, outcome counts, an ETA and a
 **Cancel** button (requester or managers), then becomes the final summary, independent
 of Discord's interaction webhook lifetime; a separate short message pings the requester
 when the job finishes. Failed and
 skipped players can be inspected with the Details button for six hours (by the requester
-and server managers). `/redeem` is refused in a channel where the bot cannot post the
+and server managers). `/giftadmin redeem` is refused in a channel where the bot cannot post the
 progress card. An already-claimed code
 is reported as already claimed, not as a failed redemption.
 
 Additional commands are provided by translation, event, player info, KVK, and database handlers.
 
-- `/configure` is the server managers' settings panel: the server's kingdom, gift-code
+- `/settings` is the server managers' settings panel: the server's kingdom, gift-code
   announcement channel, event calendar channel, bot manager role (only members with
   Manage Server can change it) and AI replies. The menus show the saved values, and the
   panel says what is still missing. It warns when the bot cannot post in a chosen
   channel. Managers are also offered a one-click **use this channel** prompt where it
-  matters: after `/addplayer` and `/addalliance` (gift-code channel) and when opening
+  matters: after `/gift add` and `/giftadmin import` (gift-code channel) and when opening
   `/calendar` (calendar channel; today's calendar is posted at once).
-  When the bot joins a server it posts a short hint to run `/giftpanel` and `/configure`.
-- `/stats` shows a player's profile with a hero card (portraits, stars, levels) and a
+  When the bot joins a server it posts a short hint to run `/giftadmin panel` and `/settings`.
+- `/player` shows a player's profile with a hero card (portraits, stars, levels) and a
   governor gear strip (equipment with its charms; "Equipment hidden" when the player
   hides it). Lookups use the KingShot Data API; when it is unavailable the bot says so
   instead of reporting the player as not found.
 - `/scout` shows a ranked Mystic Trial leaderboard summary for a kingdom. Selecting a
   player loads their profile in the same public message; **Previous / Next** page
   through players. It defaults to 5 players and caps the limit at 15.
-- `/kvk_prep kingdom_a kingdom_b` (also the **Prep dossier** button on `/kvk_compare`)
+- `/kvk prep kingdom_a kingdom_b` (also the **Prep dossier** button on `/kvk compare`)
   posts a dossier for both kingdoms: castle holder and king history, top alliances,
   top players by power and kills, and KvK records. Sections that fail show as
   unavailable; results are cached for 10 minutes.
@@ -306,38 +317,48 @@ docker compose up -d translator-bot-local
 
 ### Interactive workflows
 
+- Commands are grouped: `/gift codes|add|remove|accounts|submit|roster` for everyone,
+  `/giftadmin redeem|import|panel` for server managers (hidden from members, because
+  Discord hides whole commands, not subcommands), `/kvk history|compare|prep`, `/player`,
+  `/scout`, `/calendar`, `/reminders`, `/remind`, `/settings`, `/status`, `/help`.
+- `/kvk history` shows the castle and prep records, the streak and the last ten seasons as
+  a card; `/kvk compare` puts two kingdoms side by side, one row per metric with the better
+  side highlighted; `/kvk prep` draws top alliances, top power and top kills of both
+  kingdoms in two columns on one scale; `/scout` draws the Mystic Trial leaderboard.
+  Player and alliance names are drawn in Latin, Cyrillic, Greek, Chinese, Japanese,
+  Korean and Thai; characters outside those (emoji, Arabic and other scripts that need
+  shaping) are left out, and a name with none left is labeled as unsupported.
 - `/help` privately groups the features available on the current bot. Buttons open
   the existing workflows; actions requiring input open a form. Manager actions appear
   only for server managers. Player and KVK reports are posted in the channel.
-  **Import alliance** explains the native `/addalliance` workflow: enter `kid`, then
+  **Import alliance** explains the native `/giftadmin import` workflow: enter `kid`, then
   select `alliance` from autocomplete so kingdom and alliance suggestions remain available.
 - `/calendar [kingdom]` posts the kingdom's event calendar (data: kingshot.net) as
   picture cards, with **Today**, **This week** and **Next week** tabs and a category
   filter. The bot needs **Attach Files** in the calendar channel for the daily pictures
   (without it the post is text). Without a
   kingdom it uses the server's kingdom. Anyone who presses a control on someone
-  else's panel gets a private copy. In `/configure`, pick an **event calendar channel**
+  else's panel gets a private copy. In `/settings`, pick an **event calendar channel**
   and set the server's **kingdom** to have the Today view posted every day at 08:00 UTC; the
   first one is posted right away, and the buttons under each post keep working after
   restarts. See [event calendar](docs/event-calendar.md).
-- `/kvk` paginates every match returned by the service. **Compare kingdom** opens a
+- `/kvk history` paginates every match returned by the service. **Compare kingdom** opens a
   form with the current kingdom already selected. Comparison results also paginate
   their direct match history.
-- `/listplayers` supports name/ID search, enabled/disabled filters, **View player**,
+- `/gift roster` supports name/ID search, enabled/disabled filters, **View player**,
   **Enable/Disable**, and (managers) **Roster health**.
-  `/giftcodes` lists active codes as copyable lines with a note on redeeming them on the
+  `/gift codes` lists active codes as copyable lines with a note on redeeming them on the
   website; server managers also get **Redeem selected code**.
-- `/schedule` refuses a channel where the bot cannot post, and the preview warns when
+- `/remind` refuses a channel where the bot cannot post, and the preview warns when
   the bot lacks **Mention @everyone** there (the reminder would be posted without a ping).
-- `/schedule` without arguments opens a form. Enter the event date/time, an IANA
+- `/remind` without arguments opens a form. Enter the event date/time, an IANA
   timezone such as `Europe/Kyiv`, the message, reminder lead time, and optional repeat
   interval. Slash-command arguments remain available, with `time_zone` defaulting to
   `UTC`. Both routes show a private preview; nothing is saved until **Save reminder**.
-- `/events` provides **Edit reminder**, **Cancel event** (with confirmation), and
+- `/reminders` provides **Edit reminder**, **Cancel event** (with confirmation), and
   **Create event** controls for server managers, and shows each reminder's pings, last
-  delivery and last problem. `/cancel event_id:123` uses the stable ID shown on the event
-  card (with autocomplete), rather than its position in the list. Editing changes the stored reminder time
-  directly. Recurring reminders keep the same UTC time; local time may change with
+  delivery and last problem. Each card shows the reminder's stable ID. Editing changes the
+  stored reminder time directly. Recurring reminders keep the same UTC time; local time may change with
   daylight saving. Ambiguous or nonexistent local times must be corrected before saving.
 
 Reminder delivery: the scheduler runs every minute and survives errors (a failing
@@ -370,10 +391,10 @@ main.py      Application entrypoint
 
 - OCR functionality has been removed from this project.
 - Keep AUTO_REDEEM_CHANNELS empty if you do not want the global announcement; servers
-  choose their own gift-code channel in `/configure`.
+  choose their own gift-code channel in `/settings`.
 - Stored translation text (`translation_logs`) is purged daily after
   `TRANSLATION_LOG_RETENTION_DAYS` (default 30).
-- `/configure` can turn contextual AI replies on or off for a server, including direct mentions/replies and random chat replies.
+- `/settings` can turn contextual AI replies on or off for a server, including direct mentions/replies and random chat replies.
 - Banned Discord users (`BANNED_PLAYERS`) are ignored by slash commands, translation and AI replies.
 
 Contextual replies use the OpenAI SDK against the NIM endpoint, streaming

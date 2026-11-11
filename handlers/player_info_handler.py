@@ -8,10 +8,12 @@ from discord import app_commands
 from discord.ext import commands
 
 from services import player_card_renderer as card_renderer
+from services import ranking_card_renderer
+from services.card_drawing import as_number
 from services.player_info_service import IPlayerInfoService, PlayerInfoUnavailableError
 from services.interaction_tracking_service import InteractionTrackingService
 from services.kingshot_data_service import KingshotDataService
-from handlers.ui import EmbedColors, OwnedView
+from handlers.ui import EmbedColors, OwnedView, card_files, render_card
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,8 @@ class ScoutReportView(OwnedView):
         self.current_player = 0
         self.showing_summary = True
         self._loading = False
+        # The leaderboard picture of the summary; attached again when coming back from a player.
+        self.summary_card: bytes | None = None
         self._update_controls()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -63,7 +67,50 @@ class ScoutReportView(OwnedView):
                 default=index == self.current_player and not self.showing_summary,
             ))
 
+    def leaderboard_rows(self) -> list[ranking_card_renderer.RankedRow]:
+        """The entries as rows of the leaderboard card."""
+        rows = []
+        for index, entry in enumerate(self.entries):
+            player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
+            rank = entry.get("rank", index + 1)
+            score = entry.get("score")
+            rows.append(
+                ranking_card_renderer.RankedRow(
+                    name=str(player.get("name") or "Unknown player"),
+                    value=as_number(score),
+                    text=self.handler._format_number(score) if score is not None else "–",
+                    rank=rank if isinstance(rank, int) else index + 1,
+                )
+            )
+        return rows
+
+    async def render_summary_card(self) -> None:
+        self.summary_card = await render_card(
+            ranking_card_renderer.render_leaderboard_card,
+            f"Kingdom {self.kingdom_number} · Mystic Trial",
+            self.leaderboard_rows(),
+            note="score",
+        )
+
+    def summary_files(self) -> list[discord.File]:
+        return card_files(self.summary_card, ranking_card_renderer.LEADERBOARD_FILENAME)
+
     def build_summary(self) -> discord.Embed:
+        if self.summary_card:
+            # The ranking is on the attached card.
+            embed = discord.Embed(
+                title=f"🔎 Scout Report · Kingdom {self.kingdom_number}",
+                description="**Mystic Trial leaderboard**",
+                color=EmbedColors.INFO,
+            )
+            embed.set_image(url=f"attachment://{ranking_card_renderer.LEADERBOARD_FILENAME}")
+            embed.set_footer(
+                text=(
+                    f"{len(self.entries)} players · Pick a player to open their profile in this public message · "
+                    "Scores are Mystic Trial scores"
+                )
+            )
+            return embed
         lines = []
         for index, entry in enumerate(self.entries):
             player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
@@ -131,7 +178,7 @@ class ScoutReportView(OwnedView):
     async def summary_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.showing_summary = True
         self._update_controls()
-        await interaction.response.edit_message(embed=self.build_summary(), attachments=[], view=self)
+        await interaction.response.edit_message(embed=self.build_summary(), attachments=self.summary_files(), view=self)
 
 
 class PlayerInfoHandler:
@@ -175,7 +222,7 @@ class PlayerInfoHandler:
     def register_commands(self):
         """Register all player info commands with the bot."""
 
-        @self._bot.tree.command(name="stats", description="Fetch and display player statistics")
+        @self._bot.tree.command(name="player", description="Player profile: stats, heroes and governor gear")
         @app_commands.describe(player_id="Governor ID or internal player UID to look up")
         async def get_player_stats(interaction: discord.Interaction, player_id: str):
             """Fetch and display player statistics."""
@@ -183,16 +230,16 @@ class PlayerInfoHandler:
 
         @self._bot.tree.command(name="scout", description="Scout top Mystic Trial players in a kingdom")
         @app_commands.describe(
-            kingdom_number="Kingdom number to scout",
+            kingdom="Kingdom number to scout",
             limit=f"Number of leaderboard players to scout, default {SCOUT_DEFAULT_LIMIT}, max {SCOUT_MAX_LIMIT}",
         )
         async def scout_kingdom(
             interaction: discord.Interaction,
-            kingdom_number: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
+            kingdom: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
             limit: app_commands.Range[int, 1, SCOUT_MAX_LIMIT] = SCOUT_DEFAULT_LIMIT,
         ):
             """Scout top Mystic Trial players in a kingdom."""
-            await self._handle_scout_slash(interaction, kingdom_number, limit)
+            await self._handle_scout_slash(interaction, kingdom, limit)
 
     async def _handle_player_stats_slash(self, interaction: discord.Interaction, player_id: str):
         """
@@ -437,7 +484,10 @@ class PlayerInfoHandler:
 
             await asyncio.gather(*(resolve_player(entry) for entry in entries))
             view = ScoutReportView(self, kingdom_number, entries, interaction.user.id)
-            view.message = await interaction.followup.send(embed=view.build_summary(), view=view, wait=True)
+            await view.render_summary_card()
+            view.message = await interaction.followup.send(
+                embed=view.build_summary(), view=view, wait=True, files=view.summary_files()
+            )
 
             logger.info("Successfully sent scout report for kingdom %s", kingdom_number)
 

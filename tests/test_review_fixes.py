@@ -90,7 +90,7 @@ def test_command_tree_counts_commands_but_not_autocomplete():
 
 def test_status_shows_usage_and_hides_scheduler_errors_from_non_operators():
     async def check():
-        usage = SimpleNamespace(top_commands=AsyncMock(return_value=[("stats", 12), ("alliance", 3)]))
+        usage = SimpleNamespace(top_commands=AsyncMock(return_value=[("player", 12), ("gift codes", 3)]))
         health = SchedulerHealth(
             running=True, last_run_at=datetime.now(timezone.utc), last_success_at=datetime.now(timezone.utc),
             last_error="Could not load due reminders: password authentication failed for host db.internal",
@@ -122,7 +122,7 @@ def test_status_shows_usage_and_hides_scheduler_errors_from_non_operators():
 
         member = await run(2)
         assert "Sent 4 · Failed 1" in member["Scheduler"] and "password" not in member["Scheduler"]
-        assert member["Most used commands · 30 days · this server"] == "`/stats` 12 · `/alliance` 3"
+        assert member["Most used commands · 30 days · this server"] == "`/player` 12 · `/gift codes` 3"
         usage.top_commands.assert_awaited_with(30, guild_id=77, limit=8)
 
         operator = await run(1)
@@ -516,10 +516,14 @@ def test_help_forms_respect_command_cooldowns():
         bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
         runs = []
 
-        @bot.tree.command(name="kvk_prep")
+        kvk = app_commands.Group(name="kvk", description="KvK")
+
+        @kvk.command(name="prep")
         @app_commands.checks.cooldown(1, 60.0, key=lambda interaction: interaction.user.id)
         async def kvk_prep(interaction: discord.Interaction, kingdom_a: int, kingdom_b: int):
             runs.append((kingdom_a, kingdom_b))
+
+        bot.tree.add_command(kvk)
 
         handler = HelpHandler(bot, {1})
 
@@ -530,9 +534,9 @@ def test_help_forms_respect_command_cooldowns():
                 response=SimpleNamespace(send_message=AsyncMock()),
             )
 
-        await handler.run_command(click(), "kvk_prep", {"kingdom_a": 1, "kingdom_b": 2})
+        await handler.run_command(click(), "kvk prep", {"kingdom_a": 1, "kingdom_b": 2})
         second = click()
-        await handler.run_command(second, "kvk_prep", {"kingdom_a": 1, "kingdom_b": 2})
+        await handler.run_command(second, "kvk prep", {"kingdom_a": 1, "kingdom_b": 2})
         assert runs == [(1, 2)]
         assert "Slow down" in second.response.send_message.call_args.args[0]
 

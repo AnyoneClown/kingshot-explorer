@@ -535,8 +535,8 @@ def test_calendar_command_asks_for_a_kingdom_when_none_is_known():
         assert handler.service.calls == []
         server_embed = in_server.edit_original_response.call_args.kwargs["embed"]
         assert server_embed.title == "Which kingdom?"
-        assert "/calendar kingdom:795" in server_embed.description and "/configure" in server_embed.description
-        assert "/configure" not in in_dm.edit_original_response.call_args.kwargs["embed"].description
+        assert "/calendar kingdom:795" in server_embed.description and "/settings" in server_embed.description
+        assert "/settings" not in in_dm.edit_original_response.call_args.kwargs["embed"].description
         in_server.followup.send.assert_not_awaited()
 
     asyncio.run(check())

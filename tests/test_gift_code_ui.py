@@ -22,7 +22,7 @@ def make_handler():
             redeem_gift_code_remote=AsyncMock(return_value={"success": True, "message": "OK"}),
         ),
         player_info_service=SimpleNamespace(),
-        bot=SimpleNamespace(tree=SimpleNamespace(get_command=lambda name: stats if name == "stats" else None)),
+        bot=SimpleNamespace(tree=SimpleNamespace(get_command=lambda name: stats if name == "player" else None)),
         config=SimpleNamespace(admin_user_ids=[123]),
         interaction_tracking_service=AsyncMock(),
         player_registry_service=AsyncMock(),
@@ -58,7 +58,7 @@ async def test_player_search_filters_pagination_and_selected_action():
     view.player_select._values = ["2"]
     await view.player_select.callback(action)
     await view.view_player.callback(action)
-    handler._bot.tree.get_command("stats").callback.assert_awaited_once_with(action, player_id="12")
+    handler._bot.tree.get_command("player").callback.assert_awaited_once_with(action, player_id="12")
 
     view.status_select._values = ["disabled"]
     await view.status_select.callback(action)

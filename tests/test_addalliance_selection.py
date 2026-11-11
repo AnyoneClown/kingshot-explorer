@@ -168,7 +168,7 @@ async def test_command_autocompletes_kid_and_alliance_and_prefetches_selected_ki
 
     try:
         handler.register_commands()
-        command = bot.tree.get_command("addalliance")
+        command = bot.tree.get_command("giftadmin").get_command("import")
         assert command is not None
         assert [parameter.name for parameter in command.parameters] == ["kid", "alliance"]
         assert command.parameters[0].type is discord.AppCommandOptionType.integer
@@ -809,9 +809,13 @@ def test_addalliance_command_is_hidden_from_members_by_default():
     bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
     handler = _build_handler(FakeRankedAllianceService(_result()), bot=bot)
     handler.register_commands()
-    command = bot.tree.get_command("addalliance")
-    assert command.default_permissions is not None and command.default_permissions.manage_guild
-    assert bot.tree.get_command("redeem").default_permissions.manage_guild
-    assert bot.tree.get_command("addplayer").default_permissions is None
-    redeem_params = [parameter.name for parameter in bot.tree.get_command("redeem").parameters]
+    # Discord hides per top-level command: the manager actions are a group of their own.
+    admin, gift = bot.tree.get_command("giftadmin"), bot.tree.get_command("gift")
+    assert admin.default_permissions is not None and admin.default_permissions.manage_guild
+    assert sorted(command.name for command in admin.commands) == ["import", "panel", "redeem"]
+    assert gift.default_permissions is None and gift.guild_only and admin.guild_only
+    assert sorted(command.name for command in gift.commands) == [
+        "accounts", "add", "codes", "remove", "roster", "submit",
+    ]
+    redeem_params = [parameter.name for parameter in admin.get_command("redeem").parameters]
     assert redeem_params == ["gift_code", "all_servers"]

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from io import BytesIO
 
 import discord
 
@@ -94,3 +96,25 @@ def build_status_embed(
 def status_value(ok: bool, success_text: str = "Online", failure_text: str = "Unavailable") -> str:
     """Format a boolean health state for embeds."""
     return f"✅ {success_text}" if ok else f"⚠️ {failure_text}"
+
+
+async def render_card(render, *args, **kwargs) -> bytes | None:
+    """Draw a picture card off the event loop; None when it cannot be drawn.
+
+    A card is decoration over information the embed can also show as text, so a
+    failure here must never fail the command.
+    """
+    try:
+        return await asyncio.to_thread(render, *args, **kwargs)
+    except Exception:
+        logger.warning("Could not draw a card with %s", getattr(render, "__name__", render), exc_info=True)
+        return None
+
+
+def card_file(png: bytes, filename: str) -> discord.File:
+    """A fresh attachment for ``png``: a File can be sent only once."""
+    return discord.File(BytesIO(png), filename=filename)
+
+
+def card_files(png: bytes | None, filename: str) -> list[discord.File]:
+    return [card_file(png, filename)] if png else []

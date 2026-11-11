@@ -315,7 +315,7 @@ def test_addalliance_reports_missing_governor_ids_without_claiming_success():
 
     assert registry.added_players == []
     assert interaction.followup.sent_embed.title == "⚠️ No Governor IDs Available"
-    assert "`/addplayer`" in interaction.followup.sent_embed.description
+    assert "`/gift add`" in interaction.followup.sent_embed.description
 
 
 def test_addalliance_rejects_mismatched_alliance_payload():

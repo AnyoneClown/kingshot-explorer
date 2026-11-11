@@ -215,7 +215,7 @@ async def test_an_outage_that_starts_mid_run_ends_the_pass_early(db):  # noqa: F
 
 
 @pytest.mark.asyncio
-async def test_long_runs_announce_the_code_while_redeeming_and_then_edit_the_summary(db):  # noqa: F811
+async def test_long_runs_announce_the_code_while_redeeming_and_then_edit_the_summary(db, gift_cards):  # noqa: F811
     channel = Channel(channel_id=777, guild_id=GUILD)
     posted = SimpleNamespace(id=4242, edit=AsyncMock())
 
@@ -245,8 +245,13 @@ async def test_long_runs_announce_the_code_while_redeeming_and_then_edit_the_sum
     assert "**1/4** players processed" in live.description
     assert field(live, "Gift Code").value.startswith("`LIVE` · expires <t:")
     assert "Governor ID" in field(live, "Don't want to wait?").value
-    final = posted.edit.await_args.kwargs["embed"]
-    assert final.title == "🎁 New Gift Code Redeemed!" and "**✅ Success:** 4" in field(final, "Results").value
+    # The live message has no picture; the summary replaces the text results with the card.
+    assert "files" not in channel.sent[0]
+    edited = posted.edit.await_args.kwargs
+    final = edited["embed"]
+    assert final.title == "🎁 New Gift Code Redeemed!" and final.image.url == "attachment://gift-code.png"
+    assert [file.filename for file in edited["attachments"]] == ["gift-code.png"]
+    assert gift_cards[-1].stats.counts["success"] == 4 and gift_cards[-1].title == "Gift code redeemed"
     assert await handler._gift_code_service.get_announcements("LIVE") == {777: 4242}
 
 
@@ -274,7 +279,7 @@ async def test_a_restart_edits_the_stored_announcement_instead_of_posting_again(
 
 
 @pytest.mark.asyncio
-async def test_a_server_channel_that_is_also_a_legacy_channel_gets_only_the_server_summary(db, monkeypatch):  # noqa: F811
+async def test_a_server_channel_that_is_also_a_legacy_channel_gets_only_the_server_summary(db, monkeypatch, gift_cards):  # noqa: F811
     monkeypatch.setattr("discord.TextChannel", Channel)
     channel = Channel(channel_id=777, guild_id=GUILD)
     handler = make_handler(
@@ -293,7 +298,7 @@ async def test_a_server_channel_that_is_also_a_legacy_channel_gets_only_the_serv
 
     assert len(channel.sent) == 1
     assert "this server's roster" in channel.sent[0]["embed"].description
-    assert "**👥 Total players:** 1" in field(channel.sent[0]["embed"], "Results").value
+    assert gift_cards[-1].stats.total == 1
 
 
 # ------------------------------------------------------------- submit a code

@@ -213,7 +213,7 @@ class EventForm(discord.ui.Modal):
         logger.error("Event form failed", exc_info=(type(error), error, error.__traceback__))
         await self.handler._send_error(
             interaction,
-            "The reminder could not be prepared. Reopen /schedule or /events.",
+            "The reminder could not be prepared. Reopen /remind or /reminders.",
         )
 
 
@@ -283,12 +283,12 @@ class EventPreview(OwnedView):
             self.saving = False
             await self.handler._send_error(
                 interaction,
-                "This reminder is no longer active or its time has passed. Reopen /events or /schedule.",
+                "This reminder is no longer active or its time has passed. Reopen /reminders or /remind.",
             )
             return
         self.stop()
         self.embed.title = "Reminder updated" if event.id is not None else "Event scheduled"
-        self.embed.description = "Saved. Use /events to edit or cancel this reminder."
+        self.embed.description = "Saved. Use /reminders to edit or cancel this reminder."
         self.embed.color = EmbedColors.SUCCESS
         await interaction.edit_original_response(
             embed=self.embed, view=None, allowed_mentions=discord.AllowedMentions.none()
@@ -376,7 +376,7 @@ class EventListView(OwnedView):
                 inline=False,
             )
         embed.set_footer(
-            text=f"Event {self.index + 1}/{len(self.events)} · Times use your Discord timezone · /cancel event_id:{event.id}"
+            text=f"Event {self.index + 1}/{len(self.events)} · Times use your Discord timezone · ID {event.id}"
         )
         if len(event.message) > 1900:
             embed.description += " Message preview shortened to 1900 characters."
@@ -413,7 +413,7 @@ class EventListView(OwnedView):
         event_id = int(interaction.data["custom_id"].rsplit(":", 1)[1])
         event = next((event for event in self.events if event.id == event_id), None)
         if event is None:
-            await self.handler._send_error(interaction, "This event is no longer active. Reopen /events.")
+            await self.handler._send_error(interaction, "This event is no longer active. Reopen /reminders.")
             return
         if len(event.message) > 4000:
             await self.handler._send_error(
@@ -430,7 +430,7 @@ class EventListView(OwnedView):
         event_id = int(interaction.data["custom_id"].rsplit(":", 1)[1])
         event = next((event for event in self.events if event.id == event_id), None)
         if event is None:
-            await self.handler._send_error(interaction, "This event is no longer active. Reopen /events.")
+            await self.handler._send_error(interaction, "This event is no longer active. Reopen /reminders.")
             return
 
         async def confirm(confirm_interaction: discord.Interaction):
@@ -481,7 +481,7 @@ class EventListView(OwnedView):
             await interaction.edit_original_response(
                 embed=build_status_embed(
                     title="Event not cancelled",
-                    description="This event is no longer active. Reopen /events.",
+                    description="This event is no longer active. Reopen /reminders.",
                     color=EmbedColors.WARNING,
                 ),
                 view=None,
@@ -602,8 +602,8 @@ class EventHandler:
 
     def register_commands(self):
         @self._bot.tree.command(
-            name="schedule",
-            description="Open an event form, or preview a reminder using options",
+            name="remind",
+            description="Create a reminder: open the form, or preview one from options",
         )
         @manager_only_command
         @app_commands.describe(
@@ -634,21 +634,11 @@ class EventHandler:
             )
 
         @self._bot.tree.command(
-            name="events",
-            description="Browse scheduled events and manage reminders in this channel",
+            name="reminders",
+            description="Browse this channel's reminders; managers can edit and cancel them",
         )
         async def list_events(interaction: discord.Interaction):
             await self._handle_list_events(interaction)
-
-        @self._bot.tree.command(name="cancel", description="Cancel a scheduled event by its stable ID")
-        @manager_only_command
-        @app_commands.describe(event_id="Event ID shown on its /events card")
-        async def cancel_event(interaction: discord.Interaction, event_id: str):
-            await self._handle_cancel_event(interaction, event_id)
-
-        @cancel_event.autocomplete("event_id")
-        async def cancel_event_autocomplete(interaction: discord.Interaction, current: str):
-            return await self._cancel_choices(interaction, current)
 
     async def open_schedule_form(self, interaction: discord.Interaction, **defaults):
         if await self._can_manage(interaction):
@@ -825,7 +815,7 @@ class EventHandler:
 
     async def _handle_list_events(self, interaction: discord.Interaction):
         if interaction.channel_id is None:
-            await self._send_error(interaction, "Use /events in a channel.", title="Events unavailable")
+            await self._send_error(interaction, "Use /reminders in a channel.", title="Events unavailable")
             return
         # Defer privately so errors stay private; the panel itself is posted publicly.
         await interaction.response.defer(thinking=True, ephemeral=True)
@@ -835,7 +825,7 @@ class EventHandler:
             logger.exception("Could not load events for channel %s", interaction.channel_id)
             await self._send_error(
                 interaction,
-                "Scheduled events could not be loaded right now. Try /events again in a moment.",
+                "Scheduled events could not be loaded right now. Try /reminders again in a moment.",
                 title="Events unavailable",
             )
             return
@@ -843,7 +833,7 @@ class EventHandler:
             await interaction.followup.send(
                 embed=build_status_embed(
                     title="No scheduled events",
-                    description="There are no active reminders in this channel. Server managers can use /schedule to create one.",
+                    description="There are no active reminders in this channel. Server managers can use /remind to create one.",
                 ),
                 ephemeral=True,
             )
@@ -867,61 +857,6 @@ class EventHandler:
             await interaction.delete_original_response()
         except discord.HTTPException:
             logger.debug("Could not remove the private events receipt", exc_info=True)
-
-    async def _cancel_choices(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        """Autocomplete the channel's active reminders by ID or message text."""
-        if interaction.channel_id is None:
-            return []
-        try:
-            events = await self._scheduler_service.get_events_for_channel(interaction.channel_id)
-        except Exception:
-            logger.warning("Could not load cancel suggestions for channel %s", interaction.channel_id, exc_info=True)
-            return []
-        needle = str(current or "").strip().lstrip("#").casefold()
-        choices = []
-        for event in events:
-            if needle and needle not in str(event.id) and needle not in event.message.casefold():
-                continue
-            name = f"#{event.id} · {event.event_time:%Y-%m-%d %H:%M} UTC · {_short_label(event.message, 70)}"
-            choices.append(app_commands.Choice(name=name[:100], value=str(event.id)))
-            if len(choices) == 25:
-                break
-        return choices
-
-    async def _handle_cancel_event(self, interaction: discord.Interaction, event_id: str):
-        if not await self._can_manage(interaction):
-            return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        try:
-            event_id = int(event_id)
-            if event_id < 1 or not await self._scheduler_service.cancel_event(interaction.channel_id, event_id):
-                await self._send_error(
-                    interaction,
-                    "This event is no longer active in this channel. Use the event ID on its /events card.",
-                    title="Event not cancelled",
-                )
-                return
-            await interaction.followup.send(
-                embed=build_status_embed(
-                    title="Event cancelled",
-                    description=f"Event #{event_id} was cancelled.",
-                    color=EmbedColors.SUCCESS,
-                ),
-                ephemeral=True,
-            )
-        except ValueError:
-            await self._send_error(
-                interaction,
-                "Copy the numeric event ID shown on its /events card.",
-                title="Event not cancelled",
-            )
-        except Exception:
-            logger.exception("Error cancelling event")
-            await self._send_error(
-                interaction,
-                "This reminder could not be cancelled. Try again.",
-                title="Event not cancelled",
-            )
 
     # ------------------------------------------------------------------ scheduler
 

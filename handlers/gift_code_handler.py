@@ -11,6 +11,7 @@ import socket
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import discord
@@ -19,9 +20,11 @@ from discord.ext import commands, tasks
 
 from config.bot_config import BotConfig
 from handlers.gift_panel import GiftPanelView, build_panel_embed
-from handlers.permissions import AccessPolicy, interaction_guild_id, manager_only_command, send_denied
-from handlers.setup_prompts import bot_can_post, is_announcement_target, offer_channel_setup
-from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
+from handlers.permissions import AccessPolicy, interaction_guild_id, send_denied
+from handlers.setup_prompts import bot_can_attach, bot_can_post, is_announcement_target, offer_channel_setup
+from handlers.ui import EmbedColors, OwnedView, build_status_embed, card_files, send_ui_error
+from services import gift_card_renderer
+from services.card_drawing import AMBER, BLUE, GOOD, MUTED, RED
 from services.gift_code_service import IGiftCodeService
 from services.gift_redemption_service import (
     ALREADY_REDEEMED_ERROR_CODES,
@@ -130,7 +133,7 @@ class PlayerSearchModal(discord.ui.Modal, title="Find a player"):
         if not await view.interaction_check(interaction):
             return
         if view.is_finished():
-            await interaction.response.send_message("This player list has expired. Run /listplayers again.", ephemeral=True)
+            await interaction.response.send_message("This player list has expired. Run /gift roster again.", ephemeral=True)
             return
         view.query = str(self.query).strip()
         view.current_page = 0
@@ -325,7 +328,7 @@ class PlayerListPaginationView(OwnedView):
 
     @discord.ui.button(label="View player", style=discord.ButtonStyle.primary, row=2)
     async def view_player(self, interaction: discord.Interaction, button: discord.ui.Button):
-        command = self.handler._bot.tree.get_command("stats")
+        command = self.handler._bot.tree.get_command("player")
         if command is None or self.selected_player is None:
             await interaction.response.send_message("Player statistics are unavailable in this bot profile.", ephemeral=True)
             return
@@ -516,10 +519,14 @@ class RedemptionResultsView(OwnedView):
         access_policy: AccessPolicy | None = None,
         timeout: float = 180.0,
         all_servers: bool = False,
+        card: bytes | None = None,
     ):
         super().__init__(author_id, timeout=timeout)
         self._access = access_policy
         self._all_servers = all_servers
+        # The result picture of the summary: taken off while the details are open
+        # (their embed does not show it) and attached again with the summary.
+        self.card = card
         self.summary = summary
         self.issues = issues
         self.current_page = 0
@@ -567,7 +574,8 @@ class RedemptionResultsView(OwnedView):
     async def details_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.expanded = not self.expanded
         self.refresh()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        attachments = [] if self.expanded else card_files(self.card, gift_card_renderer.CARD_FILENAME)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self, attachments=attachments)
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -744,11 +752,57 @@ class GiftCodeHandler:
         logger.warning("Gift code polling will retry after %s because of networking error: %s", self._poll_backoff_delta, error)
 
     def register_commands(self):
-        """Register all gift code commands with the bot."""
+        """Register the gift-code commands: ``/gift ...`` for everyone, ``/giftadmin ...`` for managers.
 
-        @self._bot.tree.command(name="redeem", description="Redeem a gift code for this server's enabled roster")
-        @app_commands.guild_only()
-        @manager_only_command
+        Discord hides a command from members per top-level command, not per subcommand,
+        so the manager actions live in a group of their own.
+        """
+        gift = app_commands.Group(
+            name="gift",
+            description="Gift codes: active codes, your accounts and this server's roster",
+            guild_only=True,
+        )
+        admin = app_commands.Group(
+            name="giftadmin",
+            description="Managers: redeem a code, import an alliance, post the gift-code panel",
+            guild_only=True,
+            default_permissions=discord.Permissions(manage_guild=True),
+        )
+
+        @gift.command(name="codes", description="List the gift codes that work right now")
+        async def list_giftcodes(interaction: discord.Interaction):
+            """List available gift codes from the API."""
+            await self._handle_list_gift_codes_slash(interaction)
+
+        @gift.command(name="add", description="Add Governor IDs to this server's gift-code roster")
+        @app_commands.describe(player_ids="The player ID(s) to add, comma-separated")
+        async def add_player(interaction: discord.Interaction, player_ids: str):
+            """Add players to this server's gift-code roster."""
+            await self._handle_add_player_slash(interaction, player_ids)
+
+        @gift.command(name="remove", description="Remove a player from this server's gift-code roster")
+        @app_commands.describe(player_id="The player ID to remove")
+        async def remove_player(interaction: discord.Interaction, player_id: str):
+            """Remove a player from this server's roster."""
+            await self._handle_remove_player_slash(interaction, player_id)
+
+        @gift.command(name="accounts", description="Your accounts on this server's gift-code list")
+        async def my_accounts(interaction: discord.Interaction):
+            """Show the caller's own roster entries and their latest results."""
+            await self._handle_my_accounts(interaction)
+
+        @gift.command(name="submit", description="Send in a gift code the bot has not found yet")
+        @app_commands.describe(code="The gift code, exactly as published")
+        async def submit_code(interaction: discord.Interaction, code: str):
+            """Validate a member-submitted code and queue it for everyone."""
+            await self._handle_submit_code(interaction, code)
+
+        @gift.command(name="roster", description="Browse and manage this server's gift-code roster")
+        async def list_players(interaction: discord.Interaction):
+            """List this server's roster."""
+            await self._handle_list_players_slash(interaction)
+
+        @admin.command(name="redeem", description="Redeem a gift code for this server's enabled roster")
         @app_commands.describe(
             gift_code="The gift code to redeem (e.g., KINGSHOTXMAS)",
             all_servers="Bot operators only: redeem for every server's players",
@@ -757,16 +811,7 @@ class GiftCodeHandler:
             """Redeem a gift code for this server's roster."""
             await self._handle_redeem_gift_code_slash(interaction, gift_code, all_servers=all_servers)
 
-        @self._bot.tree.command(name="addplayer", description="Add Governor IDs to this server's gift-code roster")
-        @app_commands.guild_only()
-        @app_commands.describe(player_ids="The player ID(s) to add, comma-separated")
-        async def add_player(interaction: discord.Interaction, player_ids: str):
-            """Add players to this server's gift-code roster."""
-            await self._handle_add_player_slash(interaction, player_ids)
-
-        @self._bot.tree.command(name="addalliance", description="Import an alliance into this server's gift-code roster")
-        @app_commands.guild_only()
-        @manager_only_command
+        @admin.command(name="import", description="Import an alliance into this server's gift-code roster")
         @app_commands.describe(
             kid="Kingdom ID",
             alliance="Top-15 alliance by power (may take a moment to load)",
@@ -796,49 +841,13 @@ class GiftCodeHandler:
             """Accept a positive kingdom ID while warming its alliance cache."""
             return await self._get_kid_autocomplete_choices(interaction, current)
 
-        @self._bot.tree.command(name="removeplayer", description="Remove a player from this server's gift-code roster")
-        @app_commands.guild_only()
-        @app_commands.describe(player_id="The player ID to remove")
-        async def remove_player(interaction: discord.Interaction, player_id: str):
-            """Remove a player from this server's roster."""
-            await self._handle_remove_player_slash(interaction, player_id)
-
-        @self._bot.tree.command(name="listplayers", description="Browse and manage this server's gift-code roster")
-        @app_commands.guild_only()
-        async def list_players(interaction: discord.Interaction):
-            """List this server's roster."""
-            await self._handle_list_players_slash(interaction)
-
-        @self._bot.tree.command(name="playerlist", description="Alias for /listplayers")
-        @app_commands.guild_only()
-        async def player_list_alias(interaction: discord.Interaction):
-            """Alias command for listing this server's roster."""
-            await self._handle_list_players_slash(interaction)
-
-        @self._bot.tree.command(name="giftcodes", description="List available gift codes")
-        async def list_giftcodes(interaction: discord.Interaction):
-            """List available gift codes from the API."""
-            await self._handle_list_gift_codes_slash(interaction)
-
-        @self._bot.tree.command(name="myaccounts", description="Your accounts on this server's gift-code list")
-        @app_commands.guild_only()
-        async def my_accounts(interaction: discord.Interaction):
-            """Show the caller's own roster entries and their latest results."""
-            await self._handle_my_accounts(interaction)
-
-        @self._bot.tree.command(name="submitcode", description="Send in a gift code the bot has not found yet")
-        @app_commands.guild_only()
-        @app_commands.describe(code="The gift code, exactly as published")
-        async def submit_code(interaction: discord.Interaction, code: str):
-            """Validate a member-submitted code and queue it for everyone."""
-            await self._handle_submit_code(interaction, code)
-
-        @self._bot.tree.command(name="giftpanel", description="Post the gift-code panel with buttons in this channel")
-        @app_commands.guild_only()
-        @manager_only_command
+        @admin.command(name="panel", description="Post the gift-code panel with buttons in this channel")
         async def gift_panel(interaction: discord.Interaction):
             """Post the permanent gift-code panel."""
             await self._handle_gift_panel(interaction)
+
+        self._bot.tree.add_command(gift)
+        self._bot.tree.add_command(admin)
 
     def register_persistent_views(self) -> None:
         """Make the buttons of gift-code panels posted earlier work again (call once, on ready)."""
@@ -1015,7 +1024,8 @@ class GiftCodeHandler:
                     if str(player.player_id) in recorded
                 ]
                 await self._announce_auto_redemption(
-                    code, results, final=True, note="The code expired before the remaining players could be retried."
+                    code, results, final=True, players=targets,
+                    note="The code expired before the remaining players could be retried.",
                 )
         except Exception:
             logger.exception("Could not finalize the announcements of expired code '%s'", code)
@@ -1133,7 +1143,9 @@ class GiftCodeHandler:
                     unreached,
                     self.AUTO_RETRY_AFTER_TRANSIENT_SECONDS,
                 )
-                await self._announce_auto_redemption(code, results, final=False, expires_at=expires_at)
+                await self._announce_auto_redemption(
+                    code, results, final=False, expires_at=expires_at, players=targets
+                )
                 return False
             if outage_pass and not globally_rejected:
                 logger.error(
@@ -1152,7 +1164,7 @@ class GiftCodeHandler:
             # Announce before marking the code completed: if the bot stops in between,
             # the code is still pending, so the next start (which skips every recorded
             # player) writes the final summary instead of leaving "Redeeming…" forever.
-            await self._announce_auto_redemption(code, results, final=True, expires_at=expires_at)
+            await self._announce_auto_redemption(code, results, final=True, expires_at=expires_at, players=targets)
             await self._gift_code_service.mark_gift_code_completed(code_row.id)
             self._auto_retry_after.pop(job.key, None)
             self._auto_transient_passes.pop(job.key, None)
@@ -1250,8 +1262,8 @@ class GiftCodeHandler:
             name="How to fix",
             value=(
                 "Check the Governor ID in game (a kingdom transfer or a typo are the usual causes). "
-                "Replace a wrong ID with `/removeplayer` and `/addplayer`, or switch the account back on "
-                "in `/listplayers` once it works."
+                "Replace a wrong ID with `/gift remove` and `/gift add`, or switch the account back on "
+                "in `/gift roster` once it works."
             ),
             inline=False,
         )
@@ -1305,6 +1317,60 @@ class GiftCodeHandler:
             if expires_at > datetime.now(timezone.utc):
                 value += f" · expires <t:{int(expires_at.timestamp())}:R>"
         return value
+
+    @staticmethod
+    def _auto_card_style(results: list[dict[str, Any]], *, final: bool) -> tuple[str, Any]:
+        """Title and accent color of the result card, matching the embed's headline."""
+        if any(is_global_code_rejection(result) for result in results):
+            return "Gift code partly redeemed", AMBER
+        if not final:
+            retrying = sum(1 for result in results if is_retryable_result(result))
+            return (f"Redeeming · retrying {retrying}" if retrying else "Redeeming…"), BLUE
+        if not has_success(results):
+            return "No new rewards", MUTED
+        return "Gift code redeemed", GOOD
+
+    async def _render_auto_card(
+        self,
+        gift_code: str,
+        results: list[dict[str, Any]],
+        kingdoms: dict[str, Any] | None,
+        *,
+        final: bool,
+        expires_at: Any = None,
+    ) -> bytes | None:
+        """The result card as PNG bytes, or None when it cannot be drawn (the text summary stays)."""
+        if not results:
+            return None
+        try:
+            title, accent = self._auto_card_style(results, final=final)
+            stats = gift_card_renderer.build_redemption_stats(gift_code, results, kingdoms)
+            return await asyncio.to_thread(
+                gift_card_renderer.render_redemption_card,
+                stats,
+                title=title,
+                accent=accent,
+                expires_at=expires_at if isinstance(expires_at, datetime) else None,
+            )
+        except Exception:
+            logger.warning("Could not draw the result card of gift code '%s'", gift_code, exc_info=True)
+            return None
+
+    async def _render_manual_card(
+        self, channel: Any, gift_code: str, results: List[Dict], headline: str, color: Any
+    ) -> bytes | None:
+        """The result card of a manual run, or None (text counts) when it cannot be attached or drawn."""
+        if not results or not bot_can_attach(channel):
+            return None
+        accent = {EmbedColors.SUCCESS: GOOD, EmbedColors.WARNING: AMBER, EmbedColors.ERROR: RED}.get(color, MUTED)
+        try:
+            stats = gift_card_renderer.build_redemption_stats(gift_code, results)
+            return await asyncio.to_thread(
+                gift_card_renderer.render_redemption_card, stats, title=headline.capitalize(), accent=accent
+            )
+        except Exception:
+            logger.warning("Could not draw the result card of gift code '%s'", gift_code, exc_info=True)
+            return None
 
     def _build_auto_redemption_embed(
         self,
@@ -1413,7 +1479,7 @@ class GiftCodeHandler:
     def _legacy_announcement_channels(self, guild_settings: Sequence[Any]) -> list[tuple[int, Any]]:
         """``AUTO_REDEEM_CHANNELS`` that are not also a server's own gift-code channel.
 
-        A channel that a server picked in ``/configure`` gets that server's summary;
+        A channel that a server picked in ``/settings`` gets that server's summary;
         posting the global one there too would make the two overwrite each other.
         """
         configured = {int(settings.gift_code_channel_id) for settings in guild_settings}
@@ -1479,6 +1545,7 @@ class GiftCodeHandler:
         final: bool = True,
         expires_at: Any = None,
         note: str | None = None,
+        players: Sequence[Any] | None = None,
     ) -> None:
         """Global summary for legacy channels, per-server summaries for configured servers.
 
@@ -1487,7 +1554,13 @@ class GiftCodeHandler:
         pass that leaves the code pending (``final=False``) posts the summary right
         away; later passes of the same code edit that message instead of posting
         another one. Message IDs are stored, so this also holds across restarts.
+
+        ``players`` (the run's targets) supply the stored kingdom of each account for
+        the result card's breakdown.
         """
+        kingdoms = {
+            str(player.player_id): getattr(player, "kingdom", None) for player in players or ()
+        }
         try:
             await self._send_auto_redemption_announcement(
                 gift_code=gift_code,
@@ -1496,12 +1569,13 @@ class GiftCodeHandler:
                 final=final,
                 expires_at=expires_at,
                 note=note,
+                kingdoms=kingdoms,
             )
         except Exception:
             logger.exception("Could not post the global gift-code announcement for '%s'", gift_code)
         try:
             await self._announce_to_guild_channels(
-                gift_code, results, final=final, expires_at=expires_at, note=note
+                gift_code, results, final=final, expires_at=expires_at, note=note, kingdoms=kingdoms
             )
         except Exception:
             logger.exception("Could not post per-server gift-code announcements for '%s'", gift_code)
@@ -1536,20 +1610,41 @@ class GiftCodeHandler:
         return posted
 
     async def _post_or_update_announcement(
-        self, gift_code: str, channel_id: int, channel: Any, embed: discord.Embed
+        self, gift_code: str, channel_id: int, channel: Any, embed: discord.Embed, card: bytes | None = None
     ) -> str:
-        """Edit this code's earlier summary in the channel, or post one; returns what happened."""
+        """Edit this code's earlier summary in the channel, or post one; returns what happened.
+
+        ``card`` is the result picture: it replaces the text "Results" field where the
+        bot may attach files. Without one, a picture left by an earlier summary is removed.
+        """
+        if card is not None and not bot_can_attach(channel):
+            card = None
+        if card is not None:
+            embed = embed.copy()
+            for index, embed_field in enumerate(embed.fields):
+                if embed_field.name == "Results":
+                    embed.remove_field(index)
+                    break
+            embed.set_image(url=f"attachment://{gift_card_renderer.CARD_FILENAME}")
+
+        def attachments() -> list[discord.File]:
+            # A File can be sent once, so each attempt gets its own.
+            if card is None:
+                return []
+            return [discord.File(BytesIO(card), filename=gift_card_renderer.CARD_FILENAME)]
+
         posted = await self._load_announcements(gift_code)
         previous = posted.get(channel_id)
         if previous is not None:
             try:
-                await previous.edit(embed=embed)
+                await previous.edit(embed=embed, attachments=attachments())
                 return "updated"
             except discord.HTTPException:
                 # The first summary was deleted (or cannot be edited any more): post the
                 # update as a new message rather than losing it.
                 posted.pop(channel_id, None)
-        message = await channel.send(embed=embed)
+        files = attachments()
+        message = await (channel.send(embed=embed, files=files) if files else channel.send(embed=embed))
         posted[channel_id] = message
         message_id = getattr(message, "id", None)
         saver = getattr(self._gift_code_service, "save_announcement", None)
@@ -1569,6 +1664,7 @@ class GiftCodeHandler:
         final: bool = True,
         expires_at: Any = None,
         note: str | None = None,
+        kingdoms: dict[str, Any] | None = None,
     ) -> None:
         """Post the global summary to the legacy ``AUTO_REDEEM_CHANNELS``."""
         channel_ids = getattr(self._config, "auto_redeem_channels", None) or set()
@@ -1581,11 +1677,19 @@ class GiftCodeHandler:
         embed = self._build_auto_redemption_embed(
             gift_code, total_players, results, final=final, expires_at=expires_at, note=note
         )
-        for channel_id, channel in self._legacy_announcement_channels(await self._guild_gift_settings()):
-            if not has_success(results) and channel_id not in existing:
-                continue
+        channels = [
+            (channel_id, channel)
+            for channel_id, channel in self._legacy_announcement_channels(await self._guild_gift_settings())
+            if has_success(results) or channel_id in existing
+        ]
+        card = (
+            await self._render_auto_card(gift_code, results, kingdoms, final=final, expires_at=expires_at)
+            if channels
+            else None
+        )
+        for channel_id, channel in channels:
             try:
-                action = await self._post_or_update_announcement(gift_code, channel_id, channel, embed)
+                action = await self._post_or_update_announcement(gift_code, channel_id, channel, embed, card)
                 logger.info("Announced gift code %s in channel %s (%s)", gift_code, channel_id, action)
             except Exception as e:
                 logger.error("Failed to send gift code announcement to channel %s: %s", channel_id, e)
@@ -1598,6 +1702,7 @@ class GiftCodeHandler:
         final: bool = True,
         expires_at: Any = None,
         note: str | None = None,
+        kingdoms: dict[str, Any] | None = None,
     ) -> None:
         """Post each configured server a summary of its own roster's results."""
         settings_list = await self._guild_gift_settings()
@@ -1623,15 +1728,16 @@ class GiftCodeHandler:
                 gift_code, len(subset), subset, scope="this server's roster", final=final, expires_at=expires_at,
                 note=note,
             )
+            card = await self._render_auto_card(gift_code, subset, kingdoms, final=final, expires_at=expires_at)
             try:
                 action = await self._post_or_update_announcement(
-                    gift_code, settings.gift_code_channel_id, channel, embed
+                    gift_code, settings.gift_code_channel_id, channel, embed, card
                 )
                 logger.info("Announced gift code %s to guild %s (%s)", gift_code, settings.guild_id, action)
             except Exception as e:
                 logger.error("Failed to announce gift code %s to guild %s: %s", gift_code, settings.guild_id, e)
 
-    # ------------------------------------------------------------ /giftcodes
+    # ------------------------------------------------------------ /gift codes
 
     async def _handle_list_gift_codes_slash(self, interaction: discord.Interaction, *, ephemeral: bool = False):
         """Handle listing available gift codes (privately when opened from the panel)."""
@@ -1701,7 +1807,7 @@ class GiftCodeHandler:
         guild_id = interaction_guild_id(interaction)
         channel = getattr(interaction, "channel", None)
         if guild_id is None or channel is None or not hasattr(channel, "send"):
-            await send_denied(interaction, "Use /giftpanel in a server text channel.")
+            await send_denied(interaction, "Use /giftadmin panel in a server text channel.")
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
@@ -1727,10 +1833,10 @@ class GiftCodeHandler:
                     await service.update_for_guild(guild_id, gift_code_channel_id=int(channel.id))
                     note += (
                         f"\nGift-code announcements will be posted in <#{channel.id}> as well "
-                        "(no channel was set). Change it in `/configure`."
+                        "(no channel was set). Change it in `/settings`."
                     )
         except Exception:
-            logger.warning("Could not set the gift-code channel of guild %s from /giftpanel", guild_id, exc_info=True)
+            logger.warning("Could not set the gift-code channel of guild %s from /giftadmin panel", guild_id, exc_info=True)
         await interaction.followup.send(
             embed=self._build_status_embed(title="✅ Gift-Code Panel Posted", description=note, color=EmbedColors.SUCCESS),
             ephemeral=True,
@@ -1761,7 +1867,7 @@ class GiftCodeHandler:
                 title="🎁 My Accounts",
                 description=(
                     "You have not added an account in this server yet. Press **Add my ID** on the gift-code "
-                    "panel or run `/addplayer` with your Governor ID, and new codes will be redeemed for you "
+                    "panel or run `/gift add` with your Governor ID, and new codes will be redeemed for you "
                     "automatically."
                 ),
                 color=EmbedColors.INFO,
@@ -1804,9 +1910,9 @@ class GiftCodeHandler:
                 value="\n".join(lines)[:EMBED_FIELD_LIMIT],
                 inline=False,
             )
-        footer = "Paused account? Check the Governor ID, then switch it back on in /listplayers."
+        footer = "Paused account? Check the Governor ID, then switch it back on in /gift roster."
         if len(entries) > len(shown):
-            footer = f"Showing {len(shown)} of {len(entries)} accounts; /listplayers has the rest. " + footer
+            footer = f"Showing {len(shown)} of {len(entries)} accounts; /gift roster has the rest. " + footer
         embed.set_footer(text=footer)
         return embed
 
@@ -1873,7 +1979,7 @@ class GiftCodeHandler:
                     f"`{safe_code}` is "
                     + ("being redeemed for everyone on the list right now." if pending
                        else "already redeemed for everyone on the list.")
-                    + " Press **My accounts** (or run `/myaccounts`) to see your result.",
+                    + " Press **My accounts** (or run `/gift accounts`) to see your result.",
                     EmbedColors.INFO,
                 )
                 return
@@ -1899,7 +2005,7 @@ class GiftCodeHandler:
             if not targets:
                 await reply(
                     "ℹ️ Nobody to Redeem For",
-                    "No account is on a gift-code list yet. Add yours with `/addplayer` first.",
+                    "No account is on a gift-code list yet. Add yours with `/gift add` first.",
                     EmbedColors.INFO,
                 )
                 return
@@ -1947,7 +2053,7 @@ class GiftCodeHandler:
                 await reply(
                     "⚠️ Could Not Check the Code",
                     f"The test account could not use `{safe_code}` ({message}), so the code is not confirmed. "
-                    "A server manager can run `/redeem` with it.",
+                    "A server manager can run `/giftadmin redeem` with it.",
                     EmbedColors.WARNING,
                 )
                 return
@@ -1971,7 +2077,7 @@ class GiftCodeHandler:
             logger.exception("Could not process the submitted gift code '%s'", gift_code)
             await reply("❌ Could Not Check the Code", "Something went wrong. Try again in a minute.", EmbedColors.ERROR)
 
-    # ---------------------------------------------------------------- /redeem
+    # ---------------------------------------------------------------- /giftadmin redeem
 
     def _job_busy_embed(self, job: RedemptionJob, guild_id: int | None) -> discord.Embed:
         if job.kind == JOB_AUTO:
@@ -2009,7 +2115,7 @@ class GiftCodeHandler:
             await interaction.response.defer(thinking=True, ephemeral=True)
         except discord.NotFound:
             logger.warning(
-                "Could not acknowledge /redeem interaction before it expired "
+                "Could not acknowledge /giftadmin redeem interaction before it expired "
                 "(interaction_id=%s, user_id=%s, created_at=%s)",
                 interaction.id,
                 interaction.user.id,
@@ -2021,7 +2127,7 @@ class GiftCodeHandler:
             # Shutdown already stopped the job guard; a job started now would be killed
             # mid-run with its progress card stuck "in progress".
             await interaction.followup.send(
-                "The bot is restarting. Run /redeem again in a minute.", ephemeral=True
+                "The bot is restarting. Run /giftadmin redeem again in a minute.", ephemeral=True
             )
             return
 
@@ -2033,7 +2139,7 @@ class GiftCodeHandler:
 
         guild_id = interaction_guild_id(interaction)
         if guild_id is None and not all_servers:
-            await send_denied(interaction, "Use /redeem in a server: it redeems that server's roster.")
+            await send_denied(interaction, "Use /giftadmin redeem in a server: it redeems that server's roster.")
             return
 
         user_info = f"{interaction.user.name} (ID: {interaction.user.id})"
@@ -2048,7 +2154,7 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="❌ Channel Unavailable",
                     description=(
-                        "The bot cannot post the job's progress here. Run /redeem in a text channel where it has "
+                        "The bot cannot post the job's progress here. Run /giftadmin redeem in a text channel where it has "
                         "**View Channel**, **Send Messages** and **Embed Links**."
                     ),
                     color=EmbedColors.ERROR,
@@ -2102,7 +2208,7 @@ class GiftCodeHandler:
                         title="📭 No Enabled Players",
                         description=(
                             "This server's roster has no enabled players. Add Governor IDs with "
-                            "`/addplayer`, or enable players in `/listplayers`."
+                            "`/gift add`, or enable players in `/gift roster`."
                         ),
                         color=EmbedColors.WARNING,
                     ),
@@ -2114,7 +2220,7 @@ class GiftCodeHandler:
                 # Shutdown began during the awaits above. Its job guard stop already ran,
                 # so a job started now would outlive the closed API client and database.
                 await interaction.followup.send(
-                    "The bot is restarting. Run /redeem again in a minute.", ephemeral=True
+                    "The bot is restarting. Run /giftadmin redeem again in a minute.", ephemeral=True
                 )
                 return
 
@@ -2280,7 +2386,7 @@ class GiftCodeHandler:
                 title="❌ Redemption Job Failed",
                 description=(
                     f"The redemption job for `{gift_code}` stopped unexpectedly. Results so far are saved; "
-                    "run `/redeem` again to continue — players who already have the code are skipped."
+                    "run `/giftadmin redeem` again to continue — players who already have the code are skipped."
                 ),
                 color=EmbedColors.ERROR,
             )
@@ -2311,7 +2417,7 @@ class GiftCodeHandler:
                         title="⏸️ Redemption Stopped",
                         description=(
                             f"The redemption job for `{gift_code}` stopped because the bot is restarting. "
-                            "Results so far are saved; run `/redeem` again to finish."
+                            "Results so far are saved; run `/giftadmin redeem` again to finish."
                         ),
                         color=EmbedColors.WARNING,
                     ),
@@ -2433,10 +2539,15 @@ class GiftCodeHandler:
         else:
             title, color, headline = "❌ All Gift Code Redemptions Failed", EmbedColors.ERROR, "redemption failed"
         processed = f"{len(results)}/{total}" if total is not None else str(len(results))
+        card = await self._render_manual_card(channel, gift_code, results, headline, color)
         embed = discord.Embed(
             title=title, color=color,
-            description=f"**Gift code:** `{gift_code}`\n**Processed:** {processed} players\n\n" + format_status_counts(results),
+            description=f"**Gift code:** `{gift_code}`\n**Processed:** {processed} players"
+            # The counts are on the result card when there is one.
+            + ("" if card else "\n\n" + format_status_counts(results)),
         )
+        if card:
+            embed.set_image(url=f"attachment://{gift_card_renderer.CARD_FILENAME}")
         if stopped:
             not_started = (total or len(results)) - len(results)
             if job.stop_reason == STOP_SHUTDOWN:
@@ -2446,7 +2557,7 @@ class GiftCodeHandler:
             embed.add_field(
                 name="Stopped early",
                 value=(
-                    f"{note} {not_started} player(s) were not processed. Run `/redeem` again to finish; "
+                    f"{note} {not_started} player(s) were not processed. Run `/giftadmin redeem` again to finish; "
                     "players who already have the code are skipped."
                 )[:1024],
                 inline=False,
@@ -2459,16 +2570,22 @@ class GiftCodeHandler:
                 embed, issues, requester_user_id,
                 access_policy=self._access, timeout=self.RESULT_DETAILS_TIMEOUT_SECONDS,
                 all_servers=bool(job is not None and job.all_servers),
+                card=card,
             )
             if issues else None
         )
         if message is not None:
             try:
-                await message.edit(embed=embed, view=view)
+                await message.edit(
+                    embed=embed, view=view, attachments=card_files(card, gift_card_renderer.CARD_FILENAME)
+                )
             except discord.HTTPException:
                 message = None
         if message is None:
-            message = await channel.send(embed=embed, view=view)
+            files = card_files(card, gift_card_renderer.CARD_FILENAME)
+            message = await (
+                channel.send(embed=embed, view=view, files=files) if files else channel.send(embed=embed, view=view)
+            )
         if view is not None:
             view.message = message
         await self._send_completion_ping(channel, requester_user_id, gift_code, headline, results, message)
@@ -3130,7 +3247,7 @@ class GiftCodeHandler:
                 return value
         return None
 
-    # ------------------------------------------------------------ /addplayer
+    # ------------------------------------------------------------ /gift add
 
     @staticmethod
     def _profile_from_lookup(player_id: str, player_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -3152,14 +3269,14 @@ class GiftCodeHandler:
             )
         return (
             f"This server's roster is full ({self._max_players_per_guild} players). "
-            "Remove players with `/removeplayer` to make room."
+            "Remove players with `/gift remove` to make room."
         )
 
     async def _handle_add_player_slash(self, interaction: discord.Interaction, player_ids: str):
         """Add Governor IDs to this server's roster within the server and personal caps."""
         guild_id = interaction_guild_id(interaction)
         if guild_id is None:
-            await send_denied(interaction, "Use /addplayer in a server: each server keeps its own gift-code roster.")
+            await send_denied(interaction, "Use /gift add in a server: each server keeps its own gift-code roster.")
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
 
@@ -3332,7 +3449,7 @@ class GiftCodeHandler:
         add_list("Ignored", ignored_ids, f"Add at most {MAX_IDS_PER_ADDPLAYER} IDs per command.")
         return embed
 
-    # ----------------------------------------------------------- /addalliance
+    # ----------------------------------------------------------- /giftadmin import
 
     async def _handle_add_alliance_choice_slash(
         self,
@@ -3371,7 +3488,7 @@ class GiftCodeHandler:
                 embed=self._build_status_embed(
                     title="⏳ Alliances Still Loading",
                     description=(
-                        f"The alliance list for kingdom `{kid}` was still loading. Run `/addalliance` again in a "
+                        f"The alliance list for kingdom `{kid}` was still loading. Run `/giftadmin import` again in a "
                         "few seconds and choose from the list, or type the exact 3-character tag."
                     ),
                     color=EmbedColors.WARNING,
@@ -3484,7 +3601,7 @@ class GiftCodeHandler:
             await interaction.followup.send(
                 embed=self._build_status_embed(
                     title="❌ Server Required",
-                    description="Run `/addalliance` in the server whose roster should receive the players.",
+                    description="Run `/giftadmin import` in the server whose roster should receive the players.",
                     color=EmbedColors.ERROR,
                 )
             )
@@ -3693,7 +3810,7 @@ class GiftCodeHandler:
                 description = (
                     f"The roster for **{safe_name}** in kingdom `{kid}` contains internal IDs, "
                     "but no connected source supplied Governor IDs. Ask a bot operator to enable "
-                    "the alliance roster source, or use `/addplayer` with Governor IDs."
+                    "the alliance roster source, or use `/gift add` with Governor IDs."
                 )
             else:
                 title, color = "⚠️ No Alliance Members Added", EmbedColors.WARNING
@@ -3768,13 +3885,13 @@ class GiftCodeHandler:
                 )
             )
 
-    # ---------------------------------------------------------- /removeplayer
+    # ---------------------------------------------------------- /gift remove
 
     async def _handle_remove_player_slash(self, interaction: discord.Interaction, player_id: str):
         """Ask for confirmation, then remove a player from this server's roster only."""
         guild_id = interaction_guild_id(interaction)
         if guild_id is None:
-            await send_denied(interaction, "Use /removeplayer in the server whose roster lists the player.")
+            await send_denied(interaction, "Use /gift remove in the server whose roster lists the player.")
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         player_id = str(player_id or "").strip()
@@ -3787,7 +3904,7 @@ class GiftCodeHandler:
                         title="❌ Player Not Found",
                         description=(
                             f"`{discord.utils.escape_markdown(player_id[:40])}` is not in this server's roster. "
-                            "Check the ID in `/listplayers`."
+                            "Check the ID in `/gift roster`."
                         ),
                         color=EmbedColors.ERROR,
                     ),
@@ -3854,13 +3971,13 @@ class GiftCodeHandler:
             )
         await interaction.edit_original_response(embed=embed, view=None)
 
-    # ----------------------------------------------------------- /listplayers
+    # ----------------------------------------------------------- /gift roster
 
     async def _handle_list_players_slash(self, interaction: discord.Interaction):
         """Show this server's roster with per-server enabled flags and actions."""
         guild_id = interaction_guild_id(interaction)
         if guild_id is None:
-            await send_denied(interaction, "Use /listplayers in a server: each server keeps its own roster.")
+            await send_denied(interaction, "Use /gift roster in a server: each server keeps its own roster.")
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
 
@@ -3870,9 +3987,9 @@ class GiftCodeHandler:
             can_manage = await self._access.can_manage(interaction)
 
             if not roster and not is_operator:
-                hint = "Add Governor IDs with `/addplayer`"
+                hint = "Add Governor IDs with `/gift add`"
                 if can_manage:
-                    hint += " or import an alliance with `/addalliance`"
+                    hint += " or import an alliance with `/giftadmin import`"
                 await interaction.followup.send(
                     embed=self._build_status_embed(
                         title="📋 No Players Yet",
@@ -3933,7 +4050,7 @@ class GiftCodeHandler:
             ) > 0
         if not changed:
             await interaction.followup.send(
-                "This player is no longer in the roster. Run /listplayers again.", ephemeral=True
+                "This player is no longer in the roster. Run /gift roster again.", ephemeral=True
             )
             return
         entry.enabled = new_state
@@ -4021,7 +4138,7 @@ class GiftCodeHandler:
                 title="✅ Players Disabled",
                 description=(
                     f"Disabled {changed} player(s) in this server's roster. "
-                    "Re-enable them any time in `/listplayers`."
+                    "Re-enable them any time in `/gift roster`."
                 ),
                 color=EmbedColors.SUCCESS,
             ),

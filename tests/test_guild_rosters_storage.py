@@ -146,7 +146,7 @@ async def test_existing_disabled_entry_is_reenabled_only_on_request(db):
 
 @pytest.mark.asyncio
 async def test_new_profiles_are_enabled_even_when_a_lookup_created_them_disabled(db):
-    seed(db, ("777", False))  # e.g. created by a /stats lookup
+    seed(db, ("777", False))  # e.g. created by a /player lookup
     registry = PlayerRegistryService(db)
     await registry.register_players_for_guild(GUILD_A, [profile("777")], added_by_user_id=1, max_total=300)
     assert [p.player_id for p in await registry.get_guild_redeem_targets(GUILD_A)] == ["777"]

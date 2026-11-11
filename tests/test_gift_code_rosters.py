@@ -170,7 +170,7 @@ def field(embed, prefix):
     return next(f for f in embed.fields if f.name.startswith(prefix))
 
 
-# ------------------------------------------------------------------ /addplayer
+# ------------------------------------------------------------------ /gift add
 
 
 @pytest.mark.asyncio
@@ -236,7 +236,7 @@ async def test_addplayer_outside_a_server_is_denied(db):
     assert action.response.sent[0]["ephemeral"] is True
 
 
-# --------------------------------------------------------------- /removeplayer
+# --------------------------------------------------------------- /gift remove
 
 
 @pytest.mark.asyncio
@@ -272,7 +272,7 @@ async def test_remove_requires_owner_or_manager_confirms_and_only_touches_this_s
     assert [e.player_id for e in await handler._player_registry_service.list_guild_roster(OTHER_GUILD)] == ["302"]
 
 
-# ---------------------------------------------------------------- /listplayers
+# ---------------------------------------------------------------- /gift roster
 
 
 @pytest.mark.asyncio
@@ -373,7 +373,7 @@ async def test_roster_health_reports_reach_and_disables_failing_players(db):
     assert member_click.response.sent[0]["embed"].title == "🔒 Not allowed"
 
 
-# --------------------------------------------------------------------- /redeem
+# --------------------------------------------------------------------- /giftadmin redeem
 
 
 @pytest.mark.asyncio
@@ -477,7 +477,7 @@ def pending_codes(db):
 
 
 @pytest.mark.asyncio
-async def test_poll_resumes_pending_codes_completes_expired_ones_and_skips_busy_codes(db, monkeypatch):
+async def test_poll_resumes_pending_codes_completes_expired_ones_and_skips_busy_codes(db, monkeypatch, gift_cards):
     monkeypatch.setattr("discord.TextChannel", Channel)
     legacy, server_a, server_b = Channel(555, guild_id=None), Channel(777, GUILD), Channel(888, OTHER_GUILD)
     handler = make_handler(
@@ -509,10 +509,11 @@ async def test_poll_resumes_pending_codes_completes_expired_ones_and_skips_busy_
     assert sorted(logged) == ["901", "902", "903"]
 
     # Global summary for the legacy channel; per-server summaries only where a player succeeded.
-    assert len(legacy.sent) == 1 and "**✅ Success:** 2" in legacy.sent[0]["embed"].fields[1].value
+    global_card, server_card = gift_cards
+    assert len(legacy.sent) == 1 and global_card.stats.counts["success"] == 2
     assert len(server_a.sent) == 1
     assert "this server's roster" in server_a.sent[0]["embed"].description
-    assert "**👥 Total players:** 2" in server_a.sent[0]["embed"].fields[1].value
+    assert server_card.stats.total == 2
     assert server_b.sent == []  # its only player failed
 
 
@@ -584,7 +585,7 @@ def test_bounded_join_marks_the_rest():
 
 @pytest.mark.asyncio
 async def test_manual_redeem_rechecks_the_guard_after_loading_targets(db, monkeypatch):
-    """The auto poller can claim the code while /redeem awaits the database."""
+    """The auto poller can claim the code while /giftadmin redeem awaits the database."""
     handler = make_handler(db)
     await register(handler, GUILD, MEMBER, "711")
     original_targets = handler._player_registry_service.get_guild_redeem_targets
@@ -642,7 +643,7 @@ async def test_temporary_failures_keep_the_auto_code_pending_and_retry_only_thos
 
 
 @pytest.mark.asyncio
-async def test_retry_pass_edits_the_first_announcement_instead_of_posting_again(db):
+async def test_retry_pass_edits_the_first_announcement_instead_of_posting_again(db, gift_cards):
     outage = {"success": False, "error_code": "API_ERROR", "message": "Service unavailable"}
     responses = {942: outage}
     channel = Channel(channel_id=789, guild_id=GUILD)
@@ -671,7 +672,7 @@ async def test_retry_pass_edits_the_first_announcement_instead_of_posting_again(
     assert len(channel.sent) == 1
     first = channel.sent[0]["embed"]
     assert "retried automatically" in first.description
-    assert "**✅ Success:** 1" in field(first, "Results").value
+    assert gift_cards[0].stats.counts["success"] == 1 and gift_cards[0].title == "Redeeming · retrying 1"
 
     responses.pop(942)
     code_row = (await handler._gift_code_service.list_pending_gift_codes())[0]
@@ -682,5 +683,5 @@ async def test_retry_pass_edits_the_first_announcement_instead_of_posting_again(
     posted.edit.assert_awaited_once()
     final = posted.edit.await_args.kwargs["embed"]
     assert final.description == "Auto-redemption finished for this server's roster."
-    assert "**✅ Success:** 2" in field(final, "Results").value
+    assert gift_cards[-1].stats.counts["success"] == 2 and gift_cards[-1].title == "Gift code redeemed"
     assert handler._auto_announcements == {}

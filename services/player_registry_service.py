@@ -254,7 +254,7 @@ class PlayerRegistryService:
         """Stop redeeming for accounts that keep failing as invalid.
 
         Roster entries are disabled in every server (a manager can re-enable them in
-        ``/listplayers`` once the Governor ID is fixed); unassigned legacy profiles
+        ``/gift roster`` once the Governor ID is fixed); unassigned legacy profiles
         have no roster entry, so their profile flag is cleared instead. Returns
         (roster entries disabled, unassigned profiles disabled).
         """

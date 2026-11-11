@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from handlers.gift_code_handler import GiftCodeHandler
@@ -105,13 +107,15 @@ async def test_auto_redemption_is_not_announced_without_a_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatch):
+async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatch, gift_cards):
     class FakeChannel:
         def __init__(self):
             self.sent_embeds = []
+            self.sent_files = []
 
-        async def send(self, *, embed):
+        async def send(self, *, embed, files=()):
             self.sent_embeds.append(embed)
+            self.sent_files.append(list(files))
 
     channel = FakeChannel()
     handler = make_handler()
@@ -129,8 +133,86 @@ async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatc
     )
 
     assert len(channel.sent_embeds) == 1
-    assert "**✅ Success:** 1" in channel.sent_embeds[0].fields[1].value
-    assert "**🚫 API rejected:** 1" in channel.sent_embeds[0].fields[1].value
+    # The counts are on the attached card, not in a text field.
+    (card,) = gift_cards
+    assert card.stats.counts[handler.STATUS_SUCCESS] == 1
+    assert card.stats.counts[handler.STATUS_API_REJECTED] == 1
+    assert card.title == "Gift code redeemed"
+    embed = channel.sent_embeds[0]
+    assert embed.image.url == "attachment://gift-code.png"
+    assert [field.name for field in embed.fields] == ["Gift Code"]
+    assert [file.filename for file in channel.sent_files[0]] == ["gift-code.png"]
+
+
+@pytest.mark.asyncio
+async def test_manual_result_details_take_the_card_off_and_the_summary_puts_it_back(gift_cards):
+    channel = SimpleNamespace(id=789, sent=[])
+
+    async def send(**kwargs):
+        channel.sent.append(kwargs)
+        return SimpleNamespace(id=1)
+
+    channel.send = send
+    handler = make_handler()
+    results = [
+        {"player_id": "1", "status_category": handler.STATUS_SUCCESS, "kingdom": "795"},
+        {"player_id": "2", "status_category": handler.STATUS_INVALID_ID, "message": "No such player"},
+    ]
+
+    await handler._send_redemption_results_to_channel(
+        channel=channel, requester_user_id=123, gift_code="CODE", results=results
+    )
+
+    (card,) = gift_cards
+    assert card.title == "Redemption finished" and card.stats.counts[handler.STATUS_INVALID_ID] == 1
+    view = channel.sent[0]["view"]
+    click = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock()))
+    await view.details_button.callback(click)
+    opened = click.response.edit_message.call_args.kwargs
+    assert opened["attachments"] == [] and opened["embed"].title.startswith("Redemption · Failure")
+    await view.details_button.callback(click)
+    closed = click.response.edit_message.call_args.kwargs
+    assert [file.filename for file in closed["attachments"]] == ["gift-code.png"]
+    assert closed["embed"].image.url == "attachment://gift-code.png"
+
+
+@pytest.mark.asyncio
+async def test_auto_redemption_summary_stays_text_when_the_card_cannot_be_used(monkeypatch):
+    class FakeChannel:
+        def __init__(self, can_attach=True):
+            self.sent = []
+            self.guild = SimpleNamespace(me=object())
+            self._can_attach = can_attach
+
+        def permissions_for(self, member):
+            return SimpleNamespace(attach_files=self._can_attach)
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    results = [{"status_category": "success"}, {"status_category": "api_rejected"}]
+
+    async def announce(channel):
+        handler = make_handler()
+        handler._config.auto_redeem_channels = {123}
+        handler._bot.get_channel = lambda channel_id: channel if channel_id == 123 else None
+        await handler._send_auto_redemption_announcement(gift_code="CODE", total_players=2, results=results)
+        return channel.sent[0]
+
+    monkeypatch.setattr("handlers.gift_code_handler.discord.TextChannel", FakeChannel)
+    # The bot may not attach files in this channel.
+    sent = await announce(FakeChannel(can_attach=False))
+    assert "files" not in sent and sent["embed"].image.url is None
+    assert "**✅ Success:** 1" in sent["embed"].fields[1].value
+
+    # The card cannot be drawn.
+    def broken(stats, **options):
+        raise RuntimeError("no font")
+
+    monkeypatch.setattr("services.gift_card_renderer.render_redemption_card", broken)
+    sent = await announce(FakeChannel())
+    assert "files" not in sent
+    assert "**👥 Total players:** 2" in sent["embed"].fields[1].value
 
 
 @pytest.mark.asyncio
@@ -165,6 +247,10 @@ async def test_manual_result_is_posted_as_normal_channel_message():
     assert len(channel.sent) == 2
     assert channel.sent[0]["embed"].title == "✅ All Gift Codes Redeemed Successfully!"
     assert "content" not in channel.sent[0]
+    # The counts are on the attached result card.
+    assert channel.sent[0]["embed"].image.url == "attachment://gift-code.png"
+    assert [file.filename for file in channel.sent[0]["files"]] == ["gift-code.png"]
+    assert "Success" not in channel.sent[0]["embed"].description
     # The ping is a separate new message so Discord notifies the requester.
     assert channel.sent[1]["content"].startswith("<@123>")
     assert [user.id for user in channel.sent[1]["allowed_mentions"].users] == [123]

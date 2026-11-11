@@ -17,7 +17,7 @@ Persistence
 
 One job per code
     ``CodeJobGuard`` holds at most one running job per gift code, shared by the
-    automatic run and ``/redeem``, so the same code is never redeemed twice in
+    automatic run and ``/giftadmin redeem``, so the same code is never redeemed twice in
     parallel.
 """
 

@@ -240,7 +240,7 @@ class KingshotCalendarService:
         missing_icon_ttl_seconds: float = 6 * 3600.0,
         max_cached_icons: int = 128,
     ):
-        self._events_url = f"{api_base_url.rstrip('/')}/events"
+        self._events_url = f"{api_base_url.rstrip('/')}/reminders"
         self._cache_ttl_seconds = cache_ttl_seconds
         self._stale_ttl_seconds = stale_ttl_seconds
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)

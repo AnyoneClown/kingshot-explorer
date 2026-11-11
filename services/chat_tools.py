@@ -256,7 +256,7 @@ def make_gift_codes_tool(gift_code_service: Any, *, limit: int = 15) -> ChatTool
                 {"code": _clip(row.get("code"), 40), "expires_at": row.get("expiresAt") or row.get("expires_at")}
                 for row in codes[:limit]
             ],
-            "note": "Players can redeem codes in game; bot admins can use /redeem.",
+            "note": "Players can redeem codes in game; bot admins can use /giftadmin redeem.",
         }
 
     return ChatTool(
@@ -432,7 +432,7 @@ def make_event_calendar_tool(
             kingdom = _int_or_none(_field(settings, "kingdom_id"))
         if kingdom is None or kingdom <= 0:
             raise ToolError(
-                "No kingdom is set for this server. Ask which kingdom, or a server manager can set it in /configure."
+                "No kingdom is set for this server. Ask which kingdom, or a server manager can set it in /settings."
             )
         try:
             calendar = await calendar_service.get_calendar(kingdom)

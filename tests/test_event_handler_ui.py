@@ -146,16 +146,6 @@ async def test_event_cards_paginate_edit_reminder_time_and_cancel_stable_ids():
     assert len(await service.get_events_for_channel(123)) == 24
 
 
-@pytest.mark.asyncio
-async def test_cancel_accepts_full_precision_ids_and_rejects_non_numeric_input():
-    service = SimpleNamespace(cancel_event=AsyncMock(return_value=True))
-    handler = EventHandler(service, Mock(), {7})
-    await handler._handle_cancel_event(interaction(), "9007199254740993")
-    service.cancel_event.assert_awaited_once_with(123, 9007199254740993)
-    await handler._handle_cancel_event(interaction(), "not-an-id")
-    service.cancel_event.assert_awaited_once()
-
-
 def guild_interaction(user_id=8, *, manage_guild=False, channel_id=123):
     item = interaction(user_id, channel_id)
     item.guild_id = 10
@@ -183,9 +173,9 @@ async def test_managers_are_resolved_by_access_policy_and_commands_are_hidden():
 
     bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
     EventHandler(service, bot, {7}).register_commands()
-    assert bot.tree.get_command("schedule").default_permissions.manage_guild
-    assert bot.tree.get_command("cancel").default_permissions.manage_guild
-    assert bot.tree.get_command("events").default_permissions is None
+    assert bot.tree.get_command("remind").default_permissions.manage_guild
+    assert bot.tree.get_command("cancel") is None  # cancelling is a button on the reminder list
+    assert bot.tree.get_command("reminders").default_permissions is None
     await bot.close()
 
 
@@ -237,20 +227,3 @@ async def test_events_list_handles_database_errors_and_posts_public_panel():
     fields = {field.name: field.value for field in sent["embed"].fields}
     assert fields["Pings"] == "@Officers" and "Missing permission" in fields["Last problem"]
     member.delete_original_response.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_cancel_autocomplete_lists_active_channel_events():
-    time = datetime(2099, 1, 1, 12, 0, tzinfo=timezone.utc)
-    service = EventSchedulerService()
-    await service.schedule_event(123, time, ["everyone"], "Bear Trap\nbring heroes")
-    await service.schedule_event(123, time, ["everyone"], "Shield")
-    await service.schedule_event(456, time, ["everyone"], "Other channel")
-    handler = EventHandler(service, Mock(), {7})
-    choices = await handler._cancel_choices(interaction(), "")
-    assert [choice.value for choice in choices] == ["1", "2"]
-    assert choices[0].name == "#1 · 2099-01-01 12:00 UTC · Bear Trap bring heroes"
-    assert [choice.value for choice in await handler._cancel_choices(interaction(), "shi")] == ["2"]
-    assert [choice.value for choice in await handler._cancel_choices(interaction(), "#1")] == ["1"]
-    service.get_events_for_channel = AsyncMock(side_effect=RuntimeError("db down"))
-    assert await handler._cancel_choices(interaction(), "") == []

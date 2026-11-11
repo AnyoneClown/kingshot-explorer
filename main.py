@@ -486,8 +486,8 @@ class TranslatorBot:
         embed = discord.Embed(
             title=f"Thanks for adding {getattr(self.bot.user, 'display_name', None) or 'the bot'}",
             description=(
-                "**Server managers:** run `/giftpanel` in the channel where members should sign up for gift "
-                "codes, and `/configure` for the server's kingdom, the daily event calendar and an "
+                "**Server managers:** run `/giftadmin panel` in the channel where members should sign up for gift "
+                "codes, and `/settings` for the server's kingdom, the daily event calendar and an "
                 "optional bot manager role.\n"
                 "**Everyone:** run `/help` for a tour of gift codes, player lookups, the event calendar, reminders "
                 "and translation (right-click a message → Apps → Translate)."

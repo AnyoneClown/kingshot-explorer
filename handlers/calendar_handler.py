@@ -8,7 +8,7 @@ Each view is shown as pictures (``calendar_card_renderer``) attached to embeds. 
 text builders below are the fallback for when a picture cannot be made or attached:
 the same information as embed fields.
 
-Servers that picked a calendar channel and a kingdom in ``/configure`` get the Today
+Servers that picked a calendar channel and a kingdom in ``/settings`` get the Today
 view posted every day at ``DAILY_POST_TIME``. The buttons under that post are
 persistent: they keep working after restarts and open a private copy of the panel for
 whoever presses them.
@@ -27,7 +27,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from handlers.permissions import AccessPolicy, interaction_guild_id, send_denied
-from handlers.setup_prompts import offer_channel_setup
+from handlers.setup_prompts import bot_can_attach, offer_channel_setup
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 from services import calendar_card_renderer as card_renderer
 from services.kingshot_calendar_service import (
@@ -427,18 +427,6 @@ def attach_cards(embed: discord.Embed, filenames: list[str]) -> list[discord.Emb
     return embeds
 
 
-def bot_can_attach(channel) -> bool:
-    """Whether the bot may upload files in ``channel`` (True when it cannot be checked)."""
-    guild = getattr(channel, "guild", None)
-    me = getattr(guild, "me", None)
-    if me is None or not hasattr(channel, "permissions_for"):
-        return True
-    try:
-        return bool(channel.permissions_for(me).attach_files)
-    except Exception:
-        return True
-
-
 def calendar_error_message(error: Exception, kingdom: int) -> str:
     """A sentence a member can act on."""
     if isinstance(error, KingdomNotTrackedError):
@@ -703,7 +691,7 @@ class CalendarHandler:
             kingdom = getattr(await self._settings(guild_id), "kingdom_id", None)
         if kingdom is None:
             hint = (
-                "A server manager can set this server's kingdom in `/configure`, "
+                "A server manager can set this server's kingdom in `/settings`, "
                 "then `/calendar` works without a number."
                 if guild_id is not None
                 else ""

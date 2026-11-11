@@ -13,7 +13,7 @@ class PlayerLookupUnavailable(RuntimeError):
     """
 
 
-# Name used by the /stats UID fallback; both names refer to the same exception.
+# Name used by the /player UID fallback; both names refer to the same exception.
 PlayerInfoUnavailableError = PlayerLookupUnavailable
 
 
@@ -35,7 +35,7 @@ class PlayerInfoService(IPlayerInfoService):
 
     The original gift-code API is reserved for redemptions (it is rate limited to
     30 requests/minute), so lookups go through ``/v1/players/by-fid/{fid}``. The raw
-    profile is returned under ``_profile`` so /stats needs no second profile call.
+    profile is returned under ``_profile`` so /player needs no second profile call.
     """
 
     def __init__(self, kingshot_data_service=None):

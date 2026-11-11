@@ -222,11 +222,21 @@ def test_scout_single_summary_navigation_and_unavailable_data():
         service.get_player_by_fid.assert_not_awaited()
         view = interaction.followup.send.call_args.kwargs["view"]
         assert len(view.entries) == 15
-        assert len(view.build_summary().description) < 4096
+        # The ranking is a picture card attached to the summary.
+        sent = interaction.followup.send.call_args.kwargs
+        assert [file.filename for file in sent["files"]] == ["leaderboard.png"]
+        assert sent["embed"].image.url == "attachment://leaderboard.png"
+        assert sent["embed"].description == "**Mystic Trial leaderboard**"
+        first_row = view.leaderboard_rows()[0]
+        assert (first_row.rank, first_row.name, first_row.text, first_row.value) == (1, "Player 0", "0", 0.0)
         assert view.previous_button.disabled and not view.next_button.disabled
         assert view.summary_button.disabled
-        assert "**#1 Player 0** · 0" in view.build_summary().description
         assert "public message" in view.build_summary().footer.text
+        # Without a card the ranking is text.
+        card, view.summary_card = view.summary_card, None
+        assert "**#1 Player 0** · 0" in view.build_summary().description
+        assert len(view.build_summary().description) < 4096
+        view.summary_card = card
         assert not any(option.default for option in view.player_select.options)
         await _select(view, interaction, "0")
         first = interaction.edit_original_response.call_args.kwargs
@@ -241,7 +251,10 @@ def test_scout_single_summary_navigation_and_unavailable_data():
         assert second["embed"].fields[-1].value == "Loadout unavailable"
         assert view.current_player == 1
         await view.summary_button.callback(interaction)
-        assert interaction.response.edit_message.call_args.kwargs["attachments"] == []
+        # Back on the summary the leaderboard card replaces the player card.
+        back = interaction.response.edit_message.call_args.kwargs
+        assert [file.filename for file in back["attachments"]] == ["leaderboard.png"]
+        assert back["embed"].image.url == "attachment://leaderboard.png"
         await _select(view, interaction, "14")
         assert view.current_player == 14 and view.next_button.disabled
         assert not view.showing_summary
@@ -323,8 +336,9 @@ def test_scout_resolves_identity_for_summary_selector_and_cached_details(source)
         view = interaction.followup.send.call_args.kwargs["view"]
         assert view.entries[0]["player"] == profile
         assert view.entries[0]["rank"] == 1 and view.entries[0]["score"] == 2846
-        assert "**#1 Resolved Player** · 2,846" in view.build_summary().description
-        assert "999,999" not in view.build_summary().description
+        (row,) = view.leaderboard_rows()[:1]
+        assert (row.rank, row.name, row.text) == (1, "Resolved Player", "2,846")
+        assert all(other.text != "999,999" for other in view.leaderboard_rows())
         assert "Resolved Player" in view.player_select.options[0].label
         assert "117248174" in view.player_select.options[0].description
         await _select(view, interaction, "0")
@@ -369,7 +383,7 @@ def test_scout_unavailable_profile_preserves_board_score_and_uid_arena(tmp_path)
         interaction = _scout_interaction()
         await handler._handle_scout_slash(interaction, 830, 5)
         view = interaction.followup.send.call_args.kwargs["view"]
-        assert "2,846" in view.build_summary().description
+        assert view.leaderboard_rows()[0].text == "2,846"
         assert "Unavailable" in view.player_select.options[0].description
         await _select(view, interaction, "0")
         sent = interaction.edit_original_response.call_args.kwargs
@@ -499,7 +513,8 @@ def test_scout_options_use_ranges_and_reject_bad_values_privately():
     handler = PlayerInfoHandler(object(), bot, object(), SimpleNamespace())
     handler.register_commands()
     command = bot.tree.get_command("scout")
-    kingdom = command.get_parameter("kingdom_number")
+    kingdom = command.get_parameter("kingdom")
+    assert bot.tree.get_command("player") is not None and bot.tree.get_command("stats") is None
     limit = command.get_parameter("limit")
     assert (kingdom.min_value, kingdom.max_value) == (1, 99999)
     assert (limit.min_value, limit.max_value, limit.default) == (1, 15, 5)

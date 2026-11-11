@@ -51,7 +51,7 @@ class BotConfig:
     # Discord user IDs that the bot ignores (slash commands, translation, chat).
     banned_players: set = None
     # Legacy global announcement channels for gift-code summaries. Servers can set
-    # their own channel in /configure; these remain as a fallback for operators.
+    # their own channel in /settings; these remain as a fallback for operators.
     auto_redeem_channels: set = None
     # Gift-code roster limits per Discord server.
     max_players_per_guild: int = 300
