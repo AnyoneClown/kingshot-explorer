@@ -5,14 +5,24 @@ This project has a reusable Kingshot RAG feature backed by CockroachDB and NVIDI
 ## Current Models
 
 - Embedding provider base URL: `https://integrate.api.nvidia.com/v1`
-- Embedding model: `nvidia/llama-nemotron-embed-1b-v2`
+- Embedding model: `nvidia/nemotron-3.5-embed-1b`
 - Chat model: `nvidia/nemotron-3.5-super-vl-120b-a12b`
 - Embedding dimension: `2048`
 
-Important: `nvidia/llama-nemotron-embed-1b-v2` is an asymmetric embedding model. NVIDIA requires `input_type`:
+Important: `nvidia/nemotron-3.5-embed-1b` is an asymmetric embedding model. NVIDIA requires `input_type`:
 
 - stored knowledge chunks: `extra_body={"input_type": "passage"}`
 - user search queries: `extra_body={"input_type": "query"}`
+
+Vectors from different embedding models are not comparable. After changing the model, re-embed every
+`kingshot_chunks` row with the new one (content, metadata and entities stay as they are).
+
+History: the previous model `nvidia/llama-nemotron-embed-1b-v2` reached end of life on NVIDIA on
+2026-08-25 and returned `410 Gone`, so every knowledge search, `/kingshot_ask` and `/kingshot_upsert`
+failed until 2026-11-11. That day the model was switched to `nvidia/nemotron-3.5-embed-1b` (same 2048
+dimensions, same `input_type`) and all 320 chunks were re-embedded in one transaction. Verified with
+in-memory search (each of five hero queries, one in Ukrainian, ranked the right hero first at distance
+0.37–0.52) and with the bot's real direct-mention tool loop, which now finds and cites hero data.
 
 The service sends `dimensions=2048`, matching the model's native output and the current DB schema.
 

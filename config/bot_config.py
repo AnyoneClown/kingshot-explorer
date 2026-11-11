@@ -37,7 +37,7 @@ class BotConfig:
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     nvidia_chat_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
-    nvidia_embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2"
+    nvidia_embedding_model: str = "nvidia/nemotron-3.5-embed-1b"
     enable_voice_replies: bool = False
     nvidia_tts_server: str = "grpc.nvcf.nvidia.com:443"
     nvidia_tts_use_ssl: bool = True
@@ -183,7 +183,7 @@ class BotConfig:
             ),
             nvidia_embedding_model=os.getenv(
                 "NVIDIA_EMBEDDING_MODEL",
-                "nvidia/llama-nemotron-embed-1b-v2",
+                "nvidia/nemotron-3.5-embed-1b",
             ),
             enable_voice_replies=parse_bool(os.getenv("ENABLE_VOICE_REPLIES"), False),
             nvidia_tts_server=os.getenv("NVIDIA_TTS_SERVER", "grpc.nvcf.nvidia.com:443"),

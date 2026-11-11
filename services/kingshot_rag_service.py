@@ -61,7 +61,7 @@ class KingshotRAGService:
         db_manager: DatabaseManager,
         client: AsyncOpenAI,
         *,
-        embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2",
+        embedding_model: str = "nvidia/nemotron-3.5-embed-1b",
         chat_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b",
         max_answer_chars: int = 1800,
         max_distance: float = DEFAULT_MAX_DISTANCE,

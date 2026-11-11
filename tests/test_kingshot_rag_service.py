@@ -89,7 +89,7 @@ def test_embed_text_uses_bge_m3_and_validates_response():
     result = asyncio.run(service.embed_text(" bear trap "))
 
     assert len(result) == 2048
-    assert client.embeddings.calls[0]["model"] == "nvidia/llama-nemotron-embed-1b-v2"
+    assert client.embeddings.calls[0]["model"] == "nvidia/nemotron-3.5-embed-1b"
     assert client.embeddings.calls[0]["input"] == "bear trap"
     assert client.embeddings.calls[0]["dimensions"] == 2048
     assert client.embeddings.calls[0]["extra_body"] == {"input_type": "passage"}

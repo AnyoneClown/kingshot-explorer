@@ -168,7 +168,7 @@ async def upload_entities(args: argparse.Namespace) -> int:
     database_url = args.database_url or os.getenv("COCKROACHDB_URL")
     api_key = args.api_key or os.getenv("NVIDIA_API_KEY")
     base_url = args.base_url or os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    embedding_model = args.embedding_model or os.getenv("NVIDIA_EMBEDDING_MODEL", "nvidia/llama-nemotron-embed-1b-v2")
+    embedding_model = args.embedding_model or os.getenv("NVIDIA_EMBEDDING_MODEL", "nvidia/nemotron-3.5-embed-1b")
     chat_model = args.chat_model or os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b")
 
     entities = load_entities(args.input)
