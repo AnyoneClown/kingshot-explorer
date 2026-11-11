@@ -13,8 +13,10 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 - Auto-translation and manual translation features that keep mentions, emoji, links and
   line breaks intact, skip text that needs no translation, and cache repeated messages.
   Right-click a message → **Apps → Translate** shows a private translation in the
-  reader's own Discord language.
-- NVIDIA NIM powered translation plus contextual chat replies. Mentioning the bot can
+  reader's own Discord language. Forwarded messages are translated from the forwarded
+  text.
+- NVIDIA NIM powered translation plus contextual chat replies. Mentioning the bot (or
+  its own role, which Discord's autocomplete also offers) can
   answer questions from this server's data (alliance power, reminders, active gift codes,
   a Governor ID lookup, the Kingshot knowledge base) through read-only tools.
 - Event scheduling with a self-healing background scheduler, role pings and delivery tracking.
@@ -98,7 +100,10 @@ rejected, Invalid ID) using one label map everywhere.
 
 - Python 3.11 through 3.13
 - A Discord bot token
-- CockroachDB (or compatible PostgreSQL setup used by current models/migrations)
+- CockroachDB (or compatible PostgreSQL setup used by current models/migrations).
+  asyncpg connections time out after 15 s when connecting and 60 s per statement
+  (`db/session.py`), so a connection left half-open by a network blip fails one
+  operation instead of stalling a background loop for minutes.
 
 ## Setup
 

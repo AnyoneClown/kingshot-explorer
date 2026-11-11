@@ -246,6 +246,10 @@ class AlliancePowerService:
             try:
                 if await self._ensure_snapshot(kingdom_id, alliance_id):
                     captured.append((kingdom_id, alliance_id))
+            except ValueError:
+                # _ensure_snapshot already logged the cause.
+                logger.warning("No complete power snapshot for kingdom %s alliance %s yet; retrying next hour",
+                               kingdom_id, alliance_id)
             except Exception:
                 logger.warning("Could not capture power for kingdom %s alliance %s; retrying next hour",
                                kingdom_id, alliance_id, exc_info=True)
@@ -287,8 +291,10 @@ class AlliancePowerService:
             try:
                 values = await self._fetch_snapshot(kingdom_id, alliance_id)
             except Exception as error:
-                logger.warning("Incomplete power snapshot for kingdom %s alliance %s", kingdom_id, alliance_id,
-                               exc_info=True)
+                # Known outcomes (profiles still incomplete, time budget spent) need no traceback.
+                expected = isinstance(error, (ValueError, TimeoutError))
+                logger.warning("Incomplete power snapshot for kingdom %s alliance %s: %s", kingdom_id, alliance_id,
+                               str(error) or type(error).__name__, exc_info=not expected)
                 raise ValueError("Could not collect complete member power data. Try again later; existing history is preserved.") from error
             captured_at = self._now().astimezone(timezone.utc)
             async with self._db.session() as session:
@@ -298,6 +304,9 @@ class AlliancePowerService:
                 ).on_conflict_do_nothing(
                     index_elements=["kingdom_id", "alliance_id", "snapshot_date"],
                 ).returning(AlliancePowerSnapshot.snapshot_date))).scalar_one_or_none()
+            if inserted is not None:
+                logger.info("Saved power snapshot %s for kingdom %s alliance %s (%s members)",
+                            inserted, kingdom_id, alliance_id, len(values["members"]))
             return inserted is not None
 
     @staticmethod
@@ -305,7 +314,13 @@ class AlliancePowerService:
         data = result.get("data") if isinstance(result, dict) else None
         if (not isinstance(result, dict) or not result.get("success") or result.get("partial")
                 or not isinstance(data, dict) or data.get("error") or data.get("partial")):
-            raise ValueError("Incomplete KingShot API response")
+            # Name the cause (e.g. "NETWORK_ERROR: Timed out ...") so fallbacks log it.
+            detail = None
+            if isinstance(result, dict) and not result.get("success"):
+                detail = ": ".join(str(part) for part in (result.get("error_code"), result.get("error_message")) if part)
+            elif isinstance(data, dict) and data.get("error"):
+                detail = str(data["error"])
+            raise ValueError(f"Incomplete KingShot API response ({detail})" if detail else "Incomplete KingShot API response")
         return data
 
     def _roster(self, payload: dict, alliance_id: int) -> tuple[dict, list, list[int]]:
@@ -336,9 +351,13 @@ class AlliancePowerService:
                     "Full roster for kingdom %s alliance %s had no member power; skipping /full for %s h",
                     kingdom_id, alliance_id, self.FULL_ROSTER_SKIP_SECONDS // 3600,
                 )
+            except (ValueError, TimeoutError) as error:
+                # Expected (slow /full for big alliances, gateway errors): one line, no traceback.
+                logger.info("Full roster unavailable for kingdom %s alliance %s (%s); using member profiles",
+                            kingdom_id, alliance_id, str(error) or type(error).__name__)
             except Exception:
-                logger.info("Full roster unavailable for kingdom %s alliance %s; using member profiles",
-                            kingdom_id, alliance_id, exc_info=True)
+                logger.warning("Full roster failed unexpectedly for kingdom %s alliance %s; using member profiles",
+                               kingdom_id, alliance_id, exc_info=True)
         return self._roster(self._payload(await self._api.get_alliance(alliance_id, kingdom_id)), alliance_id)
 
     @staticmethod

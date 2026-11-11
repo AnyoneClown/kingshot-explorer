@@ -389,6 +389,8 @@ class RegisteredPlayerRepository:
         uid_map = {str(player.player_uid): player for player in existing_players if player.player_uid}
 
         upserted_players: list[RegisteredPlayer] = []
+        # Profiles already used by an earlier row of this batch (by object identity).
+        claimed: set[int] = set()
         created_count = 0
         updated_count = 0
 
@@ -399,6 +401,20 @@ class RegisteredPlayerRepository:
             player = player_id_map.get(player_id)
             if player is None and normalized_uid:
                 player = uid_map.get(normalized_uid)
+                if player is not None and id(player) in claimed:
+                    # Two Governor IDs with one uid in the same batch (upstream rosters
+                    # occasionally repeat a uid). Renaming the earlier row's profile would
+                    # leave that row's roster entry without a profile (FK violation) and
+                    # fail the whole import, so this row gets its own profile, uid-less.
+                    logger.warning(
+                        "Uid %s is listed for both %s and %s; keeping it on %s",
+                        normalized_uid,
+                        player.player_id,
+                        player_id,
+                        player.player_id,
+                    )
+                    player = None
+                    player_uid = normalized_uid = None
                 if player is not None and player.player_id != player_id:
                     logger.info("Updating uid-cached player %s to canonical fid %s", player.player_id, player_id)
                     player_id_map.pop(player.player_id, None)
@@ -433,6 +449,7 @@ class RegisteredPlayerRepository:
                 )
                 updated_count += 1
 
+            claimed.add(id(player))
             upserted_players.append(player)
 
         await self._session.flush()

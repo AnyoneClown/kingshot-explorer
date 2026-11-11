@@ -414,7 +414,11 @@ class PlayerRegistryService:
                 profile_deleted = await RegisteredPlayerRepository(db_session).remove(entry.player_id)
             return RemovalOutcome(removed=True, profile_deleted=profile_deleted, entry=entry)
 
-        return await self._run(operation, session=session)
+        # SERIALIZABLE: under READ COMMITTED two servers removing the same player both
+        # still see the other's entry and keep the profile (an orphan that is then
+        # auto-redeemed as "unassigned legacy"), and a removal racing an add in another
+        # server could delete the profile, cascading away the entry just added.
+        return await self._run(operation, session=session, isolation_level="SERIALIZABLE")
 
     async def set_guild_players_enabled(
         self, guild_id: int, player_ids: list[str], enabled: bool, session: Optional[Any] = None
@@ -444,4 +448,11 @@ class PlayerRegistryService:
             await db_session.flush()
             return len(selected), len(unassigned) - len(selected)
 
-        return await self._run(operation, session=session, retry_on_integrity_error=True)
+        # The cap is counted, then filled: SERIALIZABLE like register_players_for_guild,
+        # so a concurrent import cannot push the roster past max_total.
+        return await self._run(
+            operation,
+            session=session,
+            retry_on_integrity_error=True,
+            isolation_level="SERIALIZABLE",
+        )

@@ -185,13 +185,20 @@ class GuildConfigurationService:
             await session.flush()
             return GuildSettings.from_model(model)
 
-        self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+        generation = self._generations.get(guild_id, 0) + 1
+        self._generations[guild_id] = generation
         self.invalidate(guild_id)
         try:
             settings = await self._run(operation, retry_on_integrity_error=True)
         finally:
+            # Another update of this guild ran meanwhile: under READ COMMITTED our row
+            # can miss the column it changed, so no result of the two is safe to cache.
+            overlapped = self._generations.get(guild_id, 0) != generation
             # Again after the write: reads that began during it carry the old row.
             self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+        if overlapped:
+            self.invalidate(guild_id)
+            return settings
         return self._remember(settings)
 
     async def set_use_voice_replies_for_guild(self, guild_id: int, use_voice_replies: bool) -> GuildSettings:

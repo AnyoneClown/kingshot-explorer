@@ -20,6 +20,10 @@ T = TypeVar("T")
 # client to retry the whole transaction.
 _RETRYABLE_SQLSTATES = {"40001"}
 _TRANSACTION_ISOLATION_LEVELS = {"SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED"}
+# Generous next to the bot's queries (small rows, at most a few thousand), short next to a
+# dead TCP connection.
+DB_CONNECT_TIMEOUT_SECONDS = 15
+DB_COMMAND_TIMEOUT_SECONDS = 60
 
 
 def is_retryable_db_error(error: BaseException) -> bool:
@@ -49,6 +53,15 @@ class DatabaseManager:
         """
         self.database_url = database_url
 
+        # asyncpg waits up to 60 s to connect and has no statement timeout, so a connection
+        # left half-open by a Wi-Fi or CockroachDB Cloud blip could stall a query (and the
+        # scheduler or gift-code loop awaiting it) until the kernel gives up, ~15 minutes.
+        connect_args = (
+            {"timeout": DB_CONNECT_TIMEOUT_SECONDS, "command_timeout": DB_COMMAND_TIMEOUT_SECONDS}
+            if "+asyncpg" in database_url.split("://", 1)[0]
+            else {}
+        )
+
         # Create async engine for CockroachDB with asyncpg
         self.engine = create_async_engine(
             database_url,
@@ -57,6 +70,7 @@ class DatabaseManager:
             max_overflow=10,
             pool_pre_ping=True,  # Verify connections before using
             pool_recycle=3600,  # Recycle connections after 1 hour
+            connect_args=connect_args,
         )
 
         # Create session factory

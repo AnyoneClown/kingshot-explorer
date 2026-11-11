@@ -8,7 +8,10 @@ direct mentions and the yes/no gate for random replies.
 
 ## Failure handling
 
-Direct mentions and replies to the bot normally allow two generation attempts:
+A direct trigger is a mention of the bot user, a mention of the bot's own managed role
+(Discord's `@` autocomplete offers both under the same name), or a reply to one of the
+bot's messages. Direct mentions and replies to the bot normally allow two generation
+attempts:
 
 1. Use the configured model settings, including thinking mode
    (`extra_body={"chat_template_kwargs": {"enable_thinking": true}}`).

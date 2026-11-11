@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any, Dict
 
 import discord
@@ -135,14 +136,21 @@ class KVKHandler:
         # Same budget as the /kvk_prep cooldown: 2 dossiers per 60 s per user.
         self._dossier_button_cooldown = app_commands.Cooldown(2, 60.0)
         self._dossier_button_cooldowns: dict[int, app_commands.Cooldown] = {}
+        logger.info("KVKHandler initialized")
 
     def _dossier_button_retry_after(self, user_id: int) -> float | None:
+        now = time.time()
+        # Forget users whose window has reset, or the map grows with every user who
+        # ever pressed the button.
+        for stale in [
+            key for key, cooldown in self._dossier_button_cooldowns.items() if cooldown.get_tokens(now) >= cooldown.rate
+        ]:
+            del self._dossier_button_cooldowns[stale]
         cooldown = self._dossier_button_cooldowns.get(user_id)
         if cooldown is None:
             cooldown = self._dossier_button_cooldown.copy()
             self._dossier_button_cooldowns[user_id] = cooldown
-        return cooldown.update_rate_limit()
-        logger.info("KVKHandler initialized")
+        return cooldown.update_rate_limit(now)
 
     @property
     def has_dossier(self) -> bool:

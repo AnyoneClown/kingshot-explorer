@@ -286,12 +286,19 @@ class PlayerListPaginationView(OwnedView):
         discord.SelectOption(label="Disabled", value="disabled"),
     ])
     async def status_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.status = select.values[0]
-        if self.status == "unassigned" and self.unassigned is None:
+        status = select.values[0]
+        deferred = status == "unassigned" and self.unassigned is None
+        if deferred:
+            # Up to 2000 rows from the database: acknowledge within the 3-second deadline first.
+            await interaction.response.defer()
             self.unassigned = await self.handler._player_registry_service.list_unassigned_players()
+        self.status = status
         self.current_page = 0
         self.refresh()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        if deferred:
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=2)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1252,8 +1259,15 @@ class GiftCodeHandler:
 
     async def _notify_disabled_accounts(self, failing: Sequence[Any], guilds_by_player: dict[str, set[int]]) -> None:
         """Tell each server's gift-code channel about its paused accounts, and DM the operators."""
+        all_settings: Sequence[Any] = ()
         if self._guild_configuration_service is not None:
-            for settings in await self._guild_configuration_service.list_all():
+            try:
+                all_settings = await self._guild_configuration_service.list_all()
+            except Exception:
+                # The accounts are paused already: the operators must still hear about it.
+                logger.exception("Could not load server settings to report paused accounts")
+        if all_settings:
+            for settings in all_settings:
                 channel = self._guild_gift_channel(settings)
                 mine = [
                     player for player in failing
@@ -1896,6 +1910,10 @@ class GiftCodeHandler:
                 (player for player in targets if str(player.player_id) == own_id), targets[0]
             )
 
+            if self._closing:
+                # Shutdown began during the awaits above; a probe now would use closed clients.
+                await reply("⏳ Restarting", "The bot is restarting. Try again in a minute.", EmbedColors.WARNING)
+                return
             job = RedemptionJob(gift_code=gift_code, kind=JOB_PROBE, guild_id=guild_id, requester_id=interaction.user.id)
             existing = self._jobs.claim(job)
             if existing is not None:
@@ -2089,6 +2107,14 @@ class GiftCodeHandler:
                         color=EmbedColors.WARNING,
                     ),
                     ephemeral=True,
+                )
+                return
+
+            if self._closing:
+                # Shutdown began during the awaits above. Its job guard stop already ran,
+                # so a job started now would outlive the closed API client and database.
+                await interaction.followup.send(
+                    "The bot is restarting. Run /redeem again in a minute.", ephemeral=True
                 )
                 return
 
@@ -2933,7 +2959,9 @@ class GiftCodeHandler:
     ) -> Optional[Dict[str, Any]]:
         """Resolve a hidden autocomplete ID or an exact manually entered tag."""
         value = selection.strip()
-        if value.isdigit():
+        # Three characters are always a typed tag (tags such as "777" are digits too);
+        # alliance IDs from the autocomplete list are much longer.
+        if value.isdigit() and len(value) != 3:
             if int(value) <= 0:
                 return None
             matches = [alliance for alliance in alliances if alliance["aid"] == value]
@@ -3806,6 +3834,8 @@ class GiftCodeHandler:
         ):
             return
         view.stop()
+        # Acknowledge before the database write (Discord's 3-second deadline).
+        await interaction.response.defer()
         outcome = await self._player_registry_service.remove_player_from_guild(view.guild_id, entry.player_id)
         if not outcome.removed:
             embed = self._build_status_embed(
@@ -3822,7 +3852,7 @@ class GiftCodeHandler:
                 "Player %s removed from guild %s by %s (profile_deleted=%s)",
                 entry.player_id, view.guild_id, interaction.user.id, outcome.profile_deleted,
             )
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.edit_original_response(embed=embed, view=None)
 
     # ----------------------------------------------------------- /listplayers
 
@@ -3890,6 +3920,10 @@ class GiftCodeHandler:
         ):
             return
 
+        # Acknowledge before the database write. A write slower than Discord's 3-second
+        # deadline used to fail the click while the change was saved; the button kept
+        # its old label, so clicking it again silently undid the change.
+        await interaction.response.defer()
         new_state = not entry.enabled
         if unassigned:
             changed = await self._player_registry_service.set_profile_enabled(entry.player_id, new_state)
@@ -3898,7 +3932,7 @@ class GiftCodeHandler:
                 view.guild_id, [entry.player_id], new_state
             ) > 0
         if not changed:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "This player is no longer in the roster. Run /listplayers again.", ephemeral=True
             )
             return
@@ -3906,7 +3940,7 @@ class GiftCodeHandler:
         if unassigned:
             entry.profile_enabled = new_state
         view.refresh(keep_selection=True)
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+        await interaction.edit_original_response(embed=view.build_embed(), view=view)
 
     async def _send_roster_health(self, interaction: discord.Interaction, view: PlayerListPaginationView) -> None:
         if not await self._access.require_manager(interaction, action="view roster health"):
@@ -3974,12 +4008,14 @@ class GiftCodeHandler:
     async def _disable_failing_players(self, interaction: discord.Interaction, view: RosterHealthView) -> None:
         if not await self._access.require_manager(interaction, action="disable players"):
             return
+        # Acknowledge before the database write (Discord's 3-second deadline).
+        await interaction.response.defer()
         changed = await self._player_registry_service.set_guild_players_enabled(
             view.guild_id, [player.player_id for player in view.failing], False
         )
         view.disable_button.disabled = True
         view.stop()
-        await interaction.response.edit_message(view=view)
+        await interaction.edit_original_response(view=view)
         await interaction.followup.send(
             embed=self._build_status_embed(
                 title="✅ Players Disabled",

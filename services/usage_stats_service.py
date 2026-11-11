@@ -7,6 +7,7 @@ stored — no user data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -61,6 +62,10 @@ class UsageStatsService:
 
         try:
             await run_db_operation(await self._get_db_manager(), operation, retry_on_integrity_error=True)
+        except asyncio.CancelledError:
+            # Shutdown cancels the periodic flush; keep the counts for the final flush.
+            self._buffer.update(pending)
+            raise
         except Exception:
             self._buffer.update(pending)
             logger.warning("Could not save command usage counters; keeping them for the next flush", exc_info=True)

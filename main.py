@@ -428,6 +428,10 @@ class TranslatorBot:
         @self.bot.event
         async def on_command_error(ctx, error):
             """Handle command errors."""
+            # Replacing Bot.on_command_error drops discord.py's own skip for commands with a
+            # local error handler (!t, !en): without this check they would get two replies.
+            if ctx.command is not None and ctx.command.has_error_handler():
+                return
             if isinstance(error, commands.CommandNotFound):
                 logger.warning(f"Unknown command attempted by {ctx.author}: {ctx.message.content}")
             elif isinstance(error, commands.MissingRequiredArgument):

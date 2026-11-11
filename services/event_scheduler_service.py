@@ -254,6 +254,9 @@ class EventSchedulerService(IEventSchedulerService):
                         )
                     )
                     .order_by(ScheduledReminder.reminder_time)
+                    # READ COMMITTED: lock the rows this pass may rewrite (missed or
+                    # skipped occurrences) so a concurrent edit is not overwritten.
+                    .with_for_update()
                 )
                 due, missed = [], []
                 for reminder in result.scalars().all():
@@ -332,8 +335,12 @@ class EventSchedulerService(IEventSchedulerService):
         if self._db_manager:
 
             async def record(session) -> bool:
+                # FOR UPDATE: under READ COMMITTED an edit or cancel committed between
+                # this check and the write below would otherwise be overwritten.
                 reminder = (
-                    await session.execute(select(ScheduledReminder).where(ScheduledReminder.id == event.id))
+                    await session.execute(
+                        select(ScheduledReminder).where(ScheduledReminder.id == event.id).with_for_update()
+                    )
                 ).scalar_one_or_none()
                 if (
                     reminder is None

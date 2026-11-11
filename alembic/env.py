@@ -23,7 +23,9 @@ config = context.config
 # Override sqlalchemy.url with environment variable
 database_url = os.getenv("COCKROACHDB_URL")
 if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+    # The value goes through ConfigParser interpolation: a "%" (URL-encoded password
+    # characters such as %40) must be doubled or set_main_option raises ValueError.
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -75,7 +77,7 @@ def run_migrations_online() -> None:
     url = config.get_main_option("sqlalchemy.url")
     if url and url.startswith("cockroachdb+asyncpg://"):
         url = url.replace("cockroachdb+asyncpg://", "cockroachdb://")
-        config.set_main_option("sqlalchemy.url", url)
+        config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
 
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),

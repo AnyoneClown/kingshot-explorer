@@ -1131,7 +1131,9 @@ class GiftRedemptionService:
             return []
         codes = [str(code.code) for code in await self._gift_code_service.get_recent_gift_codes(code_limit)]
         if current_code is not None and current_code not in codes:
-            codes.insert(0, current_code)
+            # "The last ``code_limit`` codes, including the current one": the current
+            # code takes the place of the oldest, it does not widen the window.
+            codes = [current_code, *codes][: max(1, code_limit)]
         rows = await self._gift_code_service.get_redemption_rows(
             codes, [str(player.player_id) for player in players]
         )

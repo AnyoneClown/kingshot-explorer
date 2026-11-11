@@ -75,6 +75,8 @@ ADMIN_COMMANDS = {"redeem", "schedule", "cancel", "configure", "addalliance", "g
 # Discord allows five buttons per row; action buttons fill these rows in order.
 ACTION_ROWS = (1, 2)
 BUTTONS_PER_ROW = 5
+# Remembered manager decisions; every use re-checks first, so old entries are only memory.
+MANAGER_CACHE_SIZE = 1024
 # Friendlier form labels for slash-command parameters.
 FIELD_LABELS = {
     "player_ids": "Player IDs",
@@ -205,7 +207,12 @@ class HelpHandler:
     async def refresh_access(self, interaction: discord.Interaction) -> bool:
         """Re-evaluate (and remember) whether the user may manage the bot here."""
         allowed = interaction.guild is not None and await self._access.can_manage(interaction)
-        self._manager_cache[(interaction.user.id, interaction_guild_id(interaction))] = allowed
+        key = (interaction.user.id, interaction_guild_id(interaction))
+        # Bounded: one entry per user and server would otherwise grow forever.
+        self._manager_cache.pop(key, None)
+        while len(self._manager_cache) >= MANAGER_CACHE_SIZE:
+            self._manager_cache.pop(next(iter(self._manager_cache)))
+        self._manager_cache[key] = allowed
         return allowed
 
     def _is_manager(self, interaction: discord.Interaction) -> bool:
@@ -278,11 +285,16 @@ class HelpHandler:
         if any(parameter.required for parameter in command.parameters):
             await interaction.response.send_modal(CommandInputModal(self, command, label, interaction.user.id))
         else:
-            await self.run_command(interaction, name, {})
+            # Access was just checked: a second lookup could push the response past
+            # Discord's 3-second deadline when the settings database is slow.
+            await self.run_command(interaction, name, {}, refresh=False)
 
-    async def run_command(self, interaction: discord.Interaction, name: str, values: dict) -> None:
+    async def run_command(
+        self, interaction: discord.Interaction, name: str, values: dict, *, refresh: bool = True
+    ) -> None:
         command = self._bot.tree.get_command(name)
-        await self.refresh_access(interaction)
+        if refresh:
+            await self.refresh_access(interaction)
         if command is None or not self._allowed(interaction, name):
             await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
             return

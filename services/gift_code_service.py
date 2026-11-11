@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
@@ -407,25 +408,44 @@ class GiftCodeService(IGiftCodeService):
 
                     data = await response.json()
 
-                    if data.get("status") != "success":
-                        logger.error("kingshot.net API returned non-success status: %s", data.get("status"))
+                    if not isinstance(data, dict) or data.get("status") != "success":
+                        status = data.get("status") if isinstance(data, dict) else type(data).__name__
+                        logger.error("kingshot.net API returned non-success status: %s", status)
                         return {
                             "success": False,
-                            "message": data.get("message", "API Error"),
+                            "message": (data.get("message") if isinstance(data, dict) else None) or "API Error",
                         }
 
-                    codes = data.get("data", {}).get("giftCodes", [])
+                    payload = data.get("data")
+                    codes = payload.get("giftCodes") if isinstance(payload, dict) else None
+                    if not isinstance(codes, list):
+                        codes = []
                     logger.debug("Successfully fetched %s gift codes from kingshot.net", len(codes))
 
                     return {
                         "success": True,
                         "data": codes,
                     }
+        except asyncio.TimeoutError:
+            # ClientTimeout(total=...) raises a bare TimeoutError, not an aiohttp.ClientError.
+            # The polling loop retries every minute, so this is a warning, not a crash.
+            logger.warning("Timed out fetching gift codes from kingshot.net")
+            return {
+                "success": False,
+                "message": "Gift code API timed out",
+            }
         except aiohttp.ClientError as e:
             logger.error("Failed to fetch gift codes from kingshot.net: %s", e)
             return {
                 "success": False,
                 "message": f"Gift code API network error: {e}",
+            }
+        except ValueError as e:
+            # Not JSON (for example an HTML error page served with status 200).
+            logger.error("kingshot.net returned an unreadable gift code list: %s", e)
+            return {
+                "success": False,
+                "message": "Gift code API returned an invalid response",
             }
         except Exception as e:
             logger.error("Unexpected error fetching gift codes from kingshot.net: %s", e, exc_info=True)

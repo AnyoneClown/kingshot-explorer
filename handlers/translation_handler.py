@@ -102,6 +102,11 @@ class TranslationHandler:
             """Translates a replied-to message into a specified language."""
             await self._handle_translate_to_language(ctx, target_language)
 
+        @translate_command.error
+        async def translate_command_error(ctx, error):
+            """Handles errors for the !t command (e.g. a missing language)."""
+            await self._handle_command_error(ctx, error)
+
         @self._bot.command(name="en")
         async def en_command(ctx):
             """Translates a replied-to message into English."""
@@ -170,6 +175,19 @@ class TranslationHandler:
         )
 
     @staticmethod
+    def _message_text(message) -> str:
+        """Message text; a forwarded message has empty content and keeps it in its snapshot."""
+        content = getattr(message, "content", None) or ""
+        if content.strip():
+            return content
+        snapshots = getattr(message, "message_snapshots", None)
+        for snapshot in snapshots if isinstance(snapshots, (list, tuple)) else ():
+            snapshot_content = getattr(snapshot, "content", None)
+            if isinstance(snapshot_content, str) and snapshot_content.strip():
+                return snapshot_content
+        return content
+
+    @staticmethod
     def _unavailable_embed() -> discord.Embed:
         return build_status_embed(
             title="Translation Unavailable",
@@ -199,7 +217,7 @@ class TranslationHandler:
             )
             return None
 
-        text_to_translate = original_message.content
+        text_to_translate = self._message_text(original_message)
         if not text_to_translate:
             await ctx.reply(
                 embed=build_status_embed(
@@ -219,7 +237,7 @@ class TranslationHandler:
     async def _handle_translate_message_menu(self, interaction: discord.Interaction, message: discord.Message):
         """Translate one message into the caller's Discord language, visible only to them."""
         language = language_for_locale(getattr(interaction, "locale", None))
-        text = getattr(message, "content", None) or ""
+        text = self._message_text(message)
         if not text.strip() or not has_translatable_text(text):
             await interaction.response.send_message(embed=self._nothing_to_translate_embed(), ephemeral=True)
             return
@@ -428,6 +446,15 @@ class TranslationHandler:
                     title="Missing Role",
                     description="You need the `Translator` role to use this command.",
                     color=EmbedColors.ERROR,
+                )
+            )
+        elif isinstance(error, commands.MissingRequiredArgument):
+            prefix = getattr(ctx, "clean_prefix", None) or "!"
+            await ctx.reply(
+                embed=build_status_embed(
+                    title="Language Required",
+                    description=f"Reply to a message with `{prefix}t <language>`, for example `{prefix}t spanish`.",
+                    color=EmbedColors.WARNING,
                 )
             )
         else:
@@ -854,10 +881,18 @@ class TranslationHandler:
             return False
 
         bot_id = getattr(bot_user, "id", None)
-        return any(
+        if any(
             mention == bot_user or getattr(mention, "id", None) == bot_id
             for mention in getattr(message, "mentions", ())
-        )
+        ):
+            return True
+        # Typing "@<bot name>" also offers the bot's own managed role; picking it still
+        # addresses the bot, so it must not fall through to the random-reply path.
+        role_ids = getattr(message, "raw_role_mentions", None) or ()
+        if not role_ids:
+            return False
+        self_role = getattr(getattr(message, "guild", None), "self_role", None)
+        return self_role is not None and getattr(self_role, "id", None) in role_ids
 
     def _message_is_from_bot(self, message: object) -> bool:
         bot_user = self._bot.user

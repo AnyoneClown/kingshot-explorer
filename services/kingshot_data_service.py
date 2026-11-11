@@ -567,7 +567,8 @@ class KingshotDataService:
             # reused keep-alive connection), which is as retryable as a network error.
             except httpx.TransportError as exc:
                 if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
-                    logger.error("Timed out calling %s (not retried): %s", path, exc)
+                    # Only slow, server-paced calls opt out of timeout retries; callers fall back.
+                    logger.warning("Timed out calling %s (not retried): %s", path, exc)
                     return {
                         "success": False,
                         "status_code": None,

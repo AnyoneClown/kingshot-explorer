@@ -258,7 +258,8 @@ async def test_remove_requires_owner_or_manager_confirms_and_only_touches_this_s
 
     click = interaction(MEMBER)
     await prompt["view"].confirm_button.callback(click)
-    result = click.response.edits[0]
+    assert click.response.deferred == {}  # acknowledged before the database write
+    result = click.edit_original_response.call_args.kwargs
     assert result["embed"].title == "✅ Player Removed" and result["view"] is None
     assert "profile was deleted" in result["embed"].description
 
@@ -266,7 +267,7 @@ async def test_remove_requires_owner_or_manager_confirms_and_only_touches_this_s
     await handler._handle_remove_player_slash(manager, "302")
     click = interaction(MANAGER, manage=True)
     await manager.followup.sent[0]["view"].confirm_button.callback(click)
-    assert "profile was deleted" not in click.response.edits[0]["embed"].description
+    assert "profile was deleted" not in click.edit_original_response.call_args.kwargs["embed"].description
     assert await handler._player_registry_service.list_guild_roster(GUILD) == []
     assert [e.player_id for e in await handler._player_registry_service.list_guild_roster(OTHER_GUILD)] == ["302"]
 

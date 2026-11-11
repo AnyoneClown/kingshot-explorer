@@ -62,3 +62,37 @@ async def test_unknown_isolation_level_is_rejected_before_connecting():
     with pytest.raises(ValueError):
         await manager.run_in_transaction(operation, isolation_level="SERIALIZABLE; DROP TABLE users")
     assert events == []
+
+
+class _ConnectCaptured(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    ["cockroachdb+asyncpg://user:pass@localhost:26257/db", "postgresql+asyncpg://user:pass@localhost/db"],
+)
+async def test_asyncpg_connections_get_connect_and_statement_timeouts(monkeypatch, url):
+    import asyncpg
+
+    from db.session import DB_COMMAND_TIMEOUT_SECONDS, DB_CONNECT_TIMEOUT_SECONDS
+
+    captured = {}
+
+    async def fake_connect(*args, **kwargs):
+        captured.update(kwargs)
+        raise _ConnectCaptured()
+
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+    manager = DatabaseManager(url)
+    try:
+        with pytest.raises(_ConnectCaptured):
+            async with manager.engine.connect():
+                pass
+    finally:
+        await manager.engine.dispose()
+
+    # A half-open connection must fail the statement, not stall its caller for ~15 minutes.
+    assert captured["timeout"] == DB_CONNECT_TIMEOUT_SECONDS
+    assert captured["command_timeout"] == DB_COMMAND_TIMEOUT_SECONDS
