@@ -12,7 +12,9 @@ from discord.ext import commands, tasks
 
 from handlers.confirm_view import ConfirmView
 from handlers.permissions import AccessPolicy, manager_only_command
-from handlers.ui import EmbedColors, OwnedView, build_status_embed, edit_panel_message
+from handlers.ui import EmbedColors, OwnedView, build_status_embed, card_files, edit_panel_message, render_card
+from services import reminder_card_renderer
+from services.reminder_card_renderer import ReminderRow
 from services.event_scheduler_service import (
     DEFAULT_GRACE_PERIOD,
     IEventSchedulerService,
@@ -342,7 +344,39 @@ class EventListView(OwnedView):
             for index, event in enumerate(self.events[start : start + 25], start)
         ]
 
-    def embed(self) -> discord.Embed:
+    def card_rows(self) -> list[ReminderRow]:
+        """Every reminder of the channel as a row of the dashboard card."""
+        return [
+            ReminderRow(
+                reminder_id=event.id,
+                when=event.event_time,
+                message=event.message,
+                repeat_every_days=event.repeat_every_days,
+                targets=format_targets(event.role_names),
+                has_problem=bool(event.last_error),
+            )
+            for event in self.events
+        ]
+
+    async def build_message(self) -> tuple[discord.Embed, list[discord.File]]:
+        """The selected reminder's embed with the dashboard card of all reminders.
+
+        The card is drawn again for every selection (it highlights the selected
+        reminder); without one the embed stands on its own.
+        """
+        card = await render_card(
+            reminder_card_renderer.render_reminders_card,
+            self.card_rows(),
+            datetime.now(timezone.utc),
+            selected=self.index,
+        )
+        embed = self.embed(pictures=bool(card))
+        if card:
+            embed.set_image(url=f"attachment://{reminder_card_renderer.CARD_FILENAME}")
+        return embed, card_files(card, reminder_card_renderer.CARD_FILENAME)
+
+    def embed(self, *, pictures: bool = False) -> discord.Embed:
+        """Details of the selected reminder. With ``pictures`` the short facts share one row."""
         event = self.events[self.index]
         embed = build_status_embed(
             title=f"Scheduled event #{event.id}",
@@ -351,14 +385,14 @@ class EventListView(OwnedView):
         embed.add_field(
             name="Next reminder",
             value=self.handler._format_discord_timestamp(event.event_time),
-            inline=False,
+            inline=pictures,
         )
         embed.add_field(
             name="Repeat",
             value=self.handler._format_repeat(event.repeat_every_days),
-            inline=False,
+            inline=pictures,
         )
-        embed.add_field(name="Pings", value=format_targets(event.role_names)[:1024], inline=False)
+        embed.add_field(name="Pings", value=format_targets(event.role_names)[:1024], inline=pictures)
         if event.last_sent_at is not None:
             embed.add_field(
                 name="Last sent",
@@ -384,9 +418,11 @@ class EventListView(OwnedView):
 
     async def _render(self, interaction: discord.Interaction):
         self._refresh_controls()
+        embed, files = await self.build_message()
         await interaction.response.edit_message(
-            embed=self.embed(),
+            embed=embed,
             view=self,
+            attachments=files,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -512,10 +548,11 @@ class EventListView(OwnedView):
             if self.events:
                 self.index = min(self.index, len(self.events) - 1)
                 self._refresh_controls()
-                embed = self.embed()
+                embed, files = await self.build_message()
                 embed.description = f"Event #{event_id} cancelled. {len(self.events)} active reminder(s) remain."
                 await edit_panel_message(
-                    self.message, embed=embed, view=self, allowed_mentions=discord.AllowedMentions.none()
+                    self.message, embed=embed, view=self, attachments=files,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             else:
                 self.stop()
@@ -527,6 +564,7 @@ class EventListView(OwnedView):
                         color=EmbedColors.SUCCESS,
                     ),
                     view=None,
+                    attachments=[],
                 )
         except discord.HTTPException:
             logger.debug("Could not refresh the events panel", exc_info=True)
@@ -845,12 +883,14 @@ class EventHandler:
             events,
             await self._access.can_manage(interaction),
         )
+        embed, files = await view.build_message()
         await interaction.edit_original_response(content="Events ready.")
         view.message = await interaction.followup.send(
-            embed=view.embed(),
+            embed=embed,
             view=view,
             wait=True,
             ephemeral=False,
+            files=files,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         try:

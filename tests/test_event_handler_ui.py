@@ -226,4 +226,51 @@ async def test_events_list_handles_database_errors_and_posts_public_panel():
     assert sent["view"].cancel.disabled  # Members can browse but not manage.
     fields = {field.name: field.value for field in sent["embed"].fields}
     assert fields["Pings"] == "@Officers" and "Missing permission" in fields["Last problem"]
+    # The dashboard card of the channel's reminders is attached to the list.
+    assert sent["embed"].image.url == "attachment://reminders.png"
+    assert [file.filename for file in sent["files"]] == ["reminders.png"]
+    assert sent["files"][0].fp.read(8) == b"\x89PNG\r\n\x1a\n"
+    (row,) = sent["view"].card_rows()
+    assert (row.reminder_id, row.title, row.targets, row.has_problem) == (12, "Bear Trap", "@Officers", True)
     member.delete_original_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reminder_dashboard_follows_the_selection_and_falls_back_to_text(monkeypatch):
+    time = datetime(2099, 1, 1, 12, 0, tzinfo=timezone.utc)
+    events = [
+        SimpleNamespace(
+            id=index, event_time=time + timedelta(days=index), role_names=[], message=f"Reminder {index}",
+            repeat_every_days=7 if index == 2 else None, last_sent_at=None, last_error=None,
+        )
+        for index in (1, 2, 3)
+    ]
+    selections = []
+
+    def fake_render(rows, now, *, selected=0):
+        selections.append((len(rows), selected))
+        return b"\x89PNG\r\n\x1a\n card"
+
+    monkeypatch.setattr("services.reminder_card_renderer.render_reminders_card", fake_render)
+    view = EventListView(EventHandler(EventSchedulerService(), Mock(), {7}), 7, 123, events, True)
+
+    click = interaction()
+    await view.next.callback(click)
+    edited = click.response.edit_message.call_args.kwargs
+    # Every selection redraws the card with that reminder highlighted and replaces the attachment.
+    assert selections == [(3, 1)]
+    assert [file.filename for file in edited["attachments"]] == ["reminders.png"]
+    assert edited["embed"].title == "Scheduled event #2" and edited["embed"].image.url == "attachment://reminders.png"
+    # With a card the short facts share one row.
+    assert [field.inline for field in edited["embed"].fields[:3]] == [True, True, True]
+
+    def broken(rows, now, *, selected=0):
+        raise RuntimeError("no font")
+
+    monkeypatch.setattr("services.reminder_card_renderer.render_reminders_card", broken)
+    click = interaction()
+    await view.next.callback(click)
+    edited = click.response.edit_message.call_args.kwargs
+    assert edited["attachments"] == [] and edited["embed"].image.url is None
+    assert edited["embed"].title == "Scheduled event #3"
+    assert [field.inline for field in edited["embed"].fields[:3]] == [False, False, False]

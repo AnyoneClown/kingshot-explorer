@@ -12,7 +12,8 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
   gift-code channel, daily event calendar, bot manager role) and per-server gift-code
   rosters.
 - Picture cards instead of walls of text: the event calendar, gift-code results, KvK
-  history, KvK comparison, the prep dossier's rankings and the scout leaderboard are drawn
+  history, KvK comparison, the prep dossier's rankings, the scout leaderboard and the
+  reminders dashboard are drawn
   as images in one shared style (`services/card_drawing.py`) and attached to their embeds.
   When a card cannot be drawn or attached, the same information is posted as text.
 - Kingdom event calendar from kingshot.net as picture cards with the event artwork:
@@ -355,7 +356,10 @@ docker compose up -d translator-bot-local
   timezone such as `Europe/Kyiv`, the message, reminder lead time, and optional repeat
   interval. Slash-command arguments remain available, with `time_zone` defaulting to
   `UTC`. Both routes show a private preview; nothing is saved until **Save reminder**.
-- `/reminders` provides **Edit reminder**, **Cancel event** (with confirmation), and
+- `/reminders` shows a dashboard card of the channel's reminders (the selected one with
+  its countdown, a strip of the next seven days with a mark per reminder, and the list;
+  redrawn when another reminder is selected) above the selected reminder's details.
+  It provides **Edit reminder**, **Cancel event** (with confirmation), and
   **Create event** controls for server managers, and shows each reminder's pings, last
   delivery and last problem. Each card shows the reminder's stable ID. Editing changes the
   stored reminder time directly. Recurring reminders keep the same UTC time; local time may change with

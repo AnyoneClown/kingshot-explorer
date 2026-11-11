@@ -158,12 +158,21 @@ def can_draw(text: str, font: ImageFont.FreeTypeFont) -> bool:
 
 
 def ellipsize(text: str, font: ImageFont.FreeTypeFont, max_width: float) -> str:
+    """Cut ``text`` to ``max_width`` pixels, marking the cut with an ellipsis.
+
+    The longest prefix that fits is found by bisection, so a reminder with a
+    2,000-character message costs a dozen measurements, not two thousand.
+    """
     if text_width(text, font) <= max_width:
         return text
-    cut = text
-    while cut and text_width(cut.rstrip() + "…", font) > max_width:
-        cut = cut[:-1]
-    return cut.rstrip() + "…" if cut else ""
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if text_width(text[:middle].rstrip() + "…", font) <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip() + "…" if low else ""
 
 
 def format_duration(delta: timedelta) -> str:

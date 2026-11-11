@@ -82,8 +82,9 @@ Tabs (`handlers/calendar_handler.py`). Each is an embed with the KvK and transfe
 `services/calendar_card_renderer.py` draws the cards with Pillow, styled after the calendar on
 kingshot.net (its dark theme colors and its heading font, Space Grotesk). The canvas, fonts and
 colors live in `services/card_drawing.py`, shared with the other cards the bot draws: gift-code
-results (`gift_card_renderer.py`), KvK history and comparison (`kvk_card_renderer.py`), and the
-scout leaderboard and prep-dossier rankings (`ranking_card_renderer.py`).
+results (`gift_card_renderer.py`), KvK history and comparison (`kvk_card_renderer.py`), the
+scout leaderboard and prep-dossier rankings (`ranking_card_renderer.py`), and the reminders
+dashboard (`reminder_card_renderer.py`).
 
 - **One card per embed.** Discord fits an embed image into a small box (about 400 × 300
   points, not confirmed against a current client). One tall picture with everything on it is
