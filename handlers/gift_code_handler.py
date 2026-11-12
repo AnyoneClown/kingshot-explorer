@@ -1315,14 +1315,24 @@ class GiftCodeHandler:
             return None
 
     async def _render_manual_card(
-        self, channel: Any, gift_code: str, results: List[Dict], headline: str, color: Any
+        self,
+        channel: Any,
+        gift_code: str,
+        results: List[Dict],
+        headline: str,
+        color: Any,
+        kingdoms: dict[str, Any] | None = None,
     ) -> bytes | None:
-        """The result card of a manual run, or None (text counts) when it cannot be attached or drawn."""
+        """The result card of a manual run, or None (text counts) when it cannot be attached or drawn.
+
+        ``kingdoms`` (stored kingdom by Governor ID) gives the card its "By kingdom"
+        section: most results carry no kingdom of their own.
+        """
         if not results or not bot_can_attach(channel):
             return None
         accent = {EmbedColors.SUCCESS: GOOD, EmbedColors.WARNING: AMBER, EmbedColors.ERROR: RED}.get(color, MUTED)
         try:
-            stats = gift_card_renderer.build_redemption_stats(gift_code, results)
+            stats = gift_card_renderer.build_redemption_stats(gift_code, results, kingdoms)
             return await asyncio.to_thread(
                 gift_card_renderer.render_redemption_card, stats, title=headline.capitalize(), accent=accent
             )
@@ -2322,6 +2332,7 @@ class GiftCodeHandler:
                 message=message,
                 total=total,
                 job=job,
+                players=registered_players,
             )
         except asyncio.CancelledError:
             await self._mark_progress_interrupted(message, gift_code)
@@ -2458,8 +2469,13 @@ class GiftCodeHandler:
         *,
         total: int | None = None,
         job: RedemptionJob | None = None,
+        players: Sequence[Any] | None = None,
     ) -> None:
-        """Replace the progress card with a compact summary, then ping the requester."""
+        """Replace the progress card with a compact summary, then ping the requester.
+
+        ``players`` (the run's targets) supply the stored kingdom of each account for
+        the result card's breakdown by kingdom.
+        """
         counts = count_statuses(results)
         success_count = counts[STATUS_SUCCESS]
         already_count = counts[STATUS_ALREADY_REDEEMED]
@@ -2485,7 +2501,9 @@ class GiftCodeHandler:
         else:
             title, color, headline = "❌ All Gift Code Redemptions Failed", EmbedColors.ERROR, "redemption failed"
         processed = f"{len(results)}/{total}" if total is not None else str(len(results))
-        card = await self._render_manual_card(channel, gift_code, results, headline, color)
+        card = await self._render_manual_card(
+            channel, gift_code, results, headline, color, self._kingdoms_of(players)
+        )
         embed = discord.Embed(
             title=title, color=color,
             description=f"**Gift code:** `{gift_code}`\n**Processed:** {processed} players"

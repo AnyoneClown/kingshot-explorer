@@ -177,6 +177,42 @@ async def test_manual_result_details_take_the_card_off_and_the_summary_puts_it_b
 
 
 @pytest.mark.asyncio
+async def test_manual_result_card_breaks_the_run_down_by_the_accounts_stored_kingdoms(gift_cards):
+    channel = SimpleNamespace(sent=[])
+
+    async def send(**kwargs):
+        channel.sent.append(kwargs)
+        return SimpleNamespace(id=1)
+
+    channel.send = send
+    handler = make_handler()
+    # An account that already had the code is answered without a kingdom lookup, so its
+    # result names no kingdom: the card has to take it from the list.
+    results = [
+        {"player_id": "1", "status_category": handler.STATUS_SUCCESS},
+        {"player_id": "2", "status_category": handler.STATUS_ALREADY_REDEEMED},
+        {"player_id": "3", "status_category": handler.STATUS_ALREADY_REDEEMED},
+        {"player_id": "4", "status_category": handler.STATUS_SUCCESS, "kingdom": "777"},
+    ]
+    players = [
+        SimpleNamespace(player_id="1", kingdom="830"),
+        SimpleNamespace(player_id="2", kingdom="830"),
+        SimpleNamespace(player_id="3", kingdom="795"),
+        # Transferred since it was stored: the kingdom resolved while redeeming wins.
+        SimpleNamespace(player_id="4", kingdom="795"),
+    ]
+
+    await handler._send_redemption_results_to_channel(
+        channel=channel, requester_user_id=123, gift_code="CODE", results=results, players=players
+    )
+
+    (card,) = gift_cards
+    assert [(row.kingdom, sum(row.counts.values())) for row in card.stats.kingdoms] == [
+        ("830", 2), ("777", 1), ("795", 1),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auto_redemption_summary_stays_text_when_the_card_cannot_be_used(monkeypatch):
     class FakeChannel:
         def __init__(self, can_attach=True):
