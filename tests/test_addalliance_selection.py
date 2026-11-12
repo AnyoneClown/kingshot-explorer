@@ -817,5 +817,9 @@ def test_addalliance_command_is_hidden_from_members_by_default():
     assert sorted(command.name for command in gift.commands) == [
         "accounts", "add", "codes", "remove", "roster", "submit",
     ]
+    # One list for all servers: a manual redeem has no per-server scope to widen.
     redeem_params = [parameter.name for parameter in admin.get_command("redeem").parameters]
-    assert redeem_params == ["gift_code", "all_servers"]
+    assert redeem_params == ["gift_code"]
+    # The roster is this server's kingdom unless an operator names another one.
+    roster_params = [(parameter.name, parameter.required) for parameter in gift.get_command("roster").parameters]
+    assert roster_params == [("kingdom", False)]

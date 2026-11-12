@@ -6,7 +6,7 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Iterator, Optional, Sequence, Set
 
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
@@ -15,7 +15,6 @@ from db.models import (
     GiftCodeAnnouncement,
     GiftCodeRedemption,
     GuildConfiguration,
-    GuildPlayerRegistration,
     RegisteredPlayer,
     TranslationLog,
     User,
@@ -439,50 +438,60 @@ class RegisteredPlayerRepository:
         )
         return upserted_players
 
-    @staticmethod
-    def _has_registration():
-        return exists().where(GuildPlayerRegistration.player_id == RegisteredPlayer.player_id)
-
-    @staticmethod
-    def _has_enabled_registration():
-        return exists().where(
-            GuildPlayerRegistration.player_id == RegisteredPlayer.player_id,
-            GuildPlayerRegistration.enabled.is_(True),
-        )
-
     async def list_auto_redeem_targets(self) -> list[RegisteredPlayer]:
-        """Profiles the global auto-redeem run covers, each once.
+        """Every enabled profile: the accounts a gift code is redeemed for."""
+        result = await self._session.execute(
+            select(RegisteredPlayer).where(RegisteredPlayer.enabled.is_(True)).order_by(RegisteredPlayer.player_id)
+        )
+        return list(result.scalars().all())
 
-        A profile qualifies when its global flag is enabled and it is enabled in at
-        least one server roster. Legacy profiles without any server registration
-        (created before per-server rosters) stay included for backward compatibility.
-        """
-        query = (
+    async def get_many(self, player_ids: Sequence[str]) -> dict[str, RegisteredPlayer]:
+        players: dict[str, RegisteredPlayer] = {}
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                select(RegisteredPlayer).where(RegisteredPlayer.player_id.in_(chunk))
+            )
+            players.update({str(player.player_id): player for player in result.scalars().all()})
+        return players
+
+    async def list_by_kingdom(self, kingdom: str) -> list[RegisteredPlayer]:
+        """The roster of a kingdom: every profile stored with that kingdom."""
+        result = await self._session.execute(
             select(RegisteredPlayer)
-            .where(RegisteredPlayer.enabled.is_(True))
-            .where(or_(self._has_enabled_registration(), ~self._has_registration()))
+            .where(RegisteredPlayer.kingdom == str(kingdom))
             .order_by(RegisteredPlayer.player_id)
         )
-        result = await self._session.execute(query)
         return list(result.scalars().all())
 
-    async def list_unassigned(self, *, enabled_only: bool = False, limit: int | None = None) -> list[RegisteredPlayer]:
-        """Legacy profiles that are not registered to any server."""
-        query = select(RegisteredPlayer).where(~self._has_registration())
-        if enabled_only:
-            query = query.where(RegisteredPlayer.enabled.is_(True))
-        query = query.order_by(RegisteredPlayer.enabled.desc(), RegisteredPlayer.player_id)
-        if limit is not None:
-            query = query.limit(limit)
-        result = await self._session.execute(query)
+    async def list_owned(self, added_by_user_id: int) -> list[RegisteredPlayer]:
+        """The profiles one Discord user added."""
+        result = await self._session.execute(
+            select(RegisteredPlayer)
+            .where(RegisteredPlayer.added_by_user_id == added_by_user_id)
+            .order_by(RegisteredPlayer.player_id)
+        )
         return list(result.scalars().all())
 
-    async def count_unassigned(self, *, enabled_only: bool = False) -> int:
-        query = select(func.count()).select_from(RegisteredPlayer).where(~self._has_registration())
-        if enabled_only:
-            query = query.where(RegisteredPlayer.enabled.is_(True))
-        result = await self._session.execute(query)
+    async def count_owned(self, added_by_user_id: int) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(RegisteredPlayer)
+            .where(RegisteredPlayer.added_by_user_id == added_by_user_id)
+        )
         return int(result.scalar_one())
+
+    async def set_enabled_many(self, player_ids: Sequence[str], enabled: bool) -> int:
+        """Switch these profiles on or off; returns how many changed."""
+        changed = 0
+        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
+            result = await self._session.execute(
+                update(RegisteredPlayer)
+                .where(RegisteredPlayer.player_id.in_(chunk))
+                .where(RegisteredPlayer.enabled.is_(not enabled))
+                .values(enabled=enabled)
+            )
+            changed += int(result.rowcount or 0)
+        return changed
 
     async def set_enabled(self, player_id: str, enabled: bool) -> bool:
         player = await self._get(player_id)
@@ -613,157 +622,6 @@ class RegisteredPlayerRepository:
         await self._session.flush()
         logger.debug("Bulk-refreshed metadata for %s registered players", synced_count)
         return synced_count
-
-
-class GuildPlayerRegistrationRepository:
-    """Per-server gift-code rosters on top of the shared player profiles."""
-
-    def __init__(self, session: AsyncSession):
-        self._session = session
-
-    async def get(self, guild_id: int, player_id: str) -> Optional[GuildPlayerRegistration]:
-        result = await self._session.execute(
-            select(GuildPlayerRegistration)
-            .where(GuildPlayerRegistration.guild_id == guild_id)
-            .where(GuildPlayerRegistration.player_id == str(player_id))
-        )
-        return result.scalar_one_or_none()
-
-    async def get_many(self, guild_id: int, player_ids: Sequence[str]) -> dict[str, GuildPlayerRegistration]:
-        registrations: dict[str, GuildPlayerRegistration] = {}
-        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
-            result = await self._session.execute(
-                select(GuildPlayerRegistration)
-                .where(GuildPlayerRegistration.guild_id == guild_id)
-                .where(GuildPlayerRegistration.player_id.in_(chunk))
-            )
-            registrations.update({row.player_id: row for row in result.scalars().all()})
-        return registrations
-
-    async def get_with_profile(
-        self, guild_id: int, player_id: str
-    ) -> Optional[tuple[GuildPlayerRegistration, RegisteredPlayer]]:
-        result = await self._session.execute(
-            select(GuildPlayerRegistration, RegisteredPlayer)
-            .join(RegisteredPlayer, RegisteredPlayer.player_id == GuildPlayerRegistration.player_id)
-            .where(GuildPlayerRegistration.guild_id == guild_id)
-            .where(GuildPlayerRegistration.player_id == str(player_id))
-        )
-        row = result.first()
-        return (row[0], row[1]) if row is not None else None
-
-    async def list_roster(self, guild_id: int) -> list[tuple[GuildPlayerRegistration, RegisteredPlayer]]:
-        result = await self._session.execute(
-            select(GuildPlayerRegistration, RegisteredPlayer)
-            .join(RegisteredPlayer, RegisteredPlayer.player_id == GuildPlayerRegistration.player_id)
-            .where(GuildPlayerRegistration.guild_id == guild_id)
-            .order_by(RegisteredPlayer.player_id)
-        )
-        return [(registration, player) for registration, player in result.all()]
-
-    async def count(self, guild_id: int, *, added_by_user_id: int | None = None) -> int:
-        query = (
-            select(func.count())
-            .select_from(GuildPlayerRegistration)
-            .where(GuildPlayerRegistration.guild_id == guild_id)
-        )
-        if added_by_user_id is not None:
-            query = query.where(GuildPlayerRegistration.added_by_user_id == added_by_user_id)
-        result = await self._session.execute(query)
-        return int(result.scalar_one())
-
-    async def count_for_player(self, player_id: str) -> int:
-        result = await self._session.execute(
-            select(func.count())
-            .select_from(GuildPlayerRegistration)
-            .where(GuildPlayerRegistration.player_id == str(player_id))
-        )
-        return int(result.scalar_one())
-
-    def add(self, guild_id: int, player_id: str, added_by_user_id: int, *, enabled: bool = True) -> GuildPlayerRegistration:
-        registration = GuildPlayerRegistration(
-            guild_id=guild_id,
-            player_id=str(player_id),
-            added_by_user_id=added_by_user_id,
-            enabled=enabled,
-        )
-        self._session.add(registration)
-        return registration
-
-    async def delete(self, registration: GuildPlayerRegistration) -> None:
-        await self._session.delete(registration)
-        await self._session.flush()
-
-    async def set_enabled(self, guild_id: int, player_ids: Sequence[str], enabled: bool) -> int:
-        changed = 0
-        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
-            result = await self._session.execute(
-                update(GuildPlayerRegistration)
-                .where(GuildPlayerRegistration.guild_id == guild_id)
-                .where(GuildPlayerRegistration.player_id.in_(chunk))
-                .values(enabled=enabled)
-            )
-            changed += int(result.rowcount or 0)
-        return changed
-
-    async def list_enabled_targets(self, guild_id: int) -> list[RegisteredPlayer]:
-        """Profiles enabled both in this server's roster and globally."""
-        result = await self._session.execute(
-            select(RegisteredPlayer)
-            .join(GuildPlayerRegistration, GuildPlayerRegistration.player_id == RegisteredPlayer.player_id)
-            .where(GuildPlayerRegistration.guild_id == guild_id)
-            .where(GuildPlayerRegistration.enabled.is_(True))
-            .where(RegisteredPlayer.enabled.is_(True))
-            .order_by(RegisteredPlayer.player_id)
-        )
-        return list(result.scalars().all())
-
-    async def list_enabled_owners(self) -> list[tuple[str, int, int]]:
-        """``(player_id, guild_id, added_by_user_id)`` of every enabled roster entry."""
-        result = await self._session.execute(
-            select(
-                GuildPlayerRegistration.player_id,
-                GuildPlayerRegistration.guild_id,
-                GuildPlayerRegistration.added_by_user_id,
-            ).where(GuildPlayerRegistration.enabled.is_(True))
-        )
-        return [(str(player_id), int(guild_id), int(owner_id)) for player_id, guild_id, owner_id in result.all()]
-
-    async def list_owned(self, guild_id: int, added_by_user_id: int) -> list[tuple[GuildPlayerRegistration, RegisteredPlayer]]:
-        """One member's entries in a server roster."""
-        result = await self._session.execute(
-            select(GuildPlayerRegistration, RegisteredPlayer)
-            .join(RegisteredPlayer, RegisteredPlayer.player_id == GuildPlayerRegistration.player_id)
-            .where(GuildPlayerRegistration.guild_id == guild_id)
-            .where(GuildPlayerRegistration.added_by_user_id == added_by_user_id)
-            .order_by(RegisteredPlayer.player_id)
-        )
-        return [(registration, player) for registration, player in result.all()]
-
-    async def disable_everywhere(self, player_ids: Sequence[str]) -> int:
-        """Disable these players' entries in every server roster; returns rows changed."""
-        changed = 0
-        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
-            result = await self._session.execute(
-                update(GuildPlayerRegistration)
-                .where(GuildPlayerRegistration.player_id.in_(chunk))
-                .where(GuildPlayerRegistration.enabled.is_(True))
-                .values(enabled=False)
-            )
-            changed += int(result.rowcount or 0)
-        return changed
-
-    async def enabled_guilds_by_player(self, player_ids: Sequence[str]) -> dict[str, set[int]]:
-        guilds: dict[str, set[int]] = {}
-        for chunk in _chunks(_unique(str(player_id) for player_id in player_ids)):
-            result = await self._session.execute(
-                select(GuildPlayerRegistration.player_id, GuildPlayerRegistration.guild_id)
-                .where(GuildPlayerRegistration.player_id.in_(chunk))
-                .where(GuildPlayerRegistration.enabled.is_(True))
-            )
-            for player_id, guild_id in result.all():
-                guilds.setdefault(str(player_id), set()).add(int(guild_id))
-        return guilds
 
 
 class GiftCodeRepository:

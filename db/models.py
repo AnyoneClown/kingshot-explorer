@@ -101,7 +101,12 @@ class TranslationLog(Base):
 
 
 class RegisteredPlayer(Base):
-    """Unified player profile table for all known players."""
+    """One game account on the gift-code list, shared by every server.
+
+    ``enabled`` decides whether codes are redeemed for the account, ``added_by_user_id``
+    who may manage it, and ``kingdom`` which servers list it in their roster: a server
+    shows the players of the kingdom chosen in its settings.
+    """
 
     __tablename__ = "registered_players"
 
@@ -127,57 +132,11 @@ class RegisteredPlayer(Base):
 
     # Relationships
     added_by: Mapped["User"] = relationship("User", back_populates="registered_players")
-    guild_registrations: Mapped[List["GuildPlayerRegistration"]] = relationship(
-        "GuildPlayerRegistration",
-        back_populates="player",
-        cascade="all, delete-orphan",
-    )
 
     def __repr__(self) -> str:
         return (
             f"<RegisteredPlayer(id={self.id}, player_id={self.player_id}, player_name={self.player_name}, "
             f"player_uid={self.player_uid}, kingdom={self.kingdom}, castle_level={self.castle_level}, "
-            f"enabled={self.enabled})>"
-        )
-
-
-class GuildPlayerRegistration(Base):
-    """Links a shared player profile to a Discord guild's gift-code roster.
-
-    Player profiles in ``registered_players`` are shared across guilds (one in-game
-    account is redeemed once per code). Each guild keeps its own roster entry with
-    its own enabled flag and owner. Profiles without any registration are legacy
-    (pre multi-guild) rows that stay in the global auto-redeem run until a bot
-    admin assigns them to a guild.
-    """
-
-    __tablename__ = "guild_player_registrations"
-    __table_args__ = (
-        PrimaryKeyConstraint("guild_id", "player_id"),
-        Index("ix_guild_player_registrations_player_id", "player_id"),
-    )
-
-    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    player_id: Mapped[str] = mapped_column(
-        String(255),
-        ForeignKey("registered_players.player_id", ondelete="CASCADE", onupdate="CASCADE"),
-        nullable=False,
-    )
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    added_by_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
-
-    player: Mapped["RegisteredPlayer"] = relationship("RegisteredPlayer", back_populates="guild_registrations")
-
-    def __repr__(self) -> str:
-        return (
-            f"<GuildPlayerRegistration(guild_id={self.guild_id}, player_id={self.player_id}, "
             f"enabled={self.enabled})>"
         )
 

@@ -54,7 +54,6 @@ class BotConfig:
     # their own channel in /settings; these remain as a fallback for operators.
     auto_redeem_channels: set = None
     # Gift-code roster limits per Discord server.
-    max_players_per_guild: int = 300
     max_self_registered_players: int = 3
     llm_timeout_seconds: float = 30.0
     # Stored translation text is deleted after this many days (0 keeps it forever).
@@ -85,8 +84,6 @@ class BotConfig:
         # Discord rejects messages over 2000 characters, so a larger value would make
         # long replies fail to send.
         self.max_chat_response_chars = min(self.max_chat_response_chars, 2000)
-        if self.max_players_per_guild < 1:
-            raise ValueError("MAX_PLAYERS_PER_GUILD must be >= 1")
         if self.max_self_registered_players < 0:
             raise ValueError("MAX_SELF_REGISTERED_PLAYERS must be >= 0")
         if self.llm_timeout_seconds <= 0:
@@ -184,7 +181,6 @@ class BotConfig:
             admin_user_ids=admin_user_ids,
             banned_players=banned_players,
             auto_redeem_channels=auto_redeem_channels,
-            max_players_per_guild=_env_int("MAX_PLAYERS_PER_GUILD", 300),
             max_self_registered_players=_env_int("MAX_SELF_REGISTERED_PLAYERS", 3),
             llm_timeout_seconds=_env_float("LLM_TIMEOUT_SECONDS", 30),
             translation_log_retention_days=_env_int("TRANSLATION_LOG_RETENTION_DAYS", 30),

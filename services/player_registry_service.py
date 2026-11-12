@@ -1,11 +1,9 @@
-"""Player registry service for gift code redemption targets.
+"""Player registry service: the gift-code list.
 
-Player profiles (``registered_players``) are shared by every server: one in-game
-account is redeemed once per code no matter how many servers list it. Each
-server's roster lives in ``guild_player_registrations`` with its own enabled flag
-and owner. Profiles without any registration are legacy rows from before
-per-server rosters; enabled legacy profiles keep receiving auto-redemption until a
-bot operator assigns them to a server.
+The list is shared by every server. One row of ``registered_players`` is one game
+account; a gift code is redeemed for every enabled account, whichever server it was
+added from. A server's roster is a view of that list: the accounts of the kingdom
+chosen in the server's settings, whoever added them.
 """
 
 from __future__ import annotations
@@ -16,54 +14,34 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 from db.session import DatabaseManager, get_db
-from repositories.discord_repositories import (
-    GuildPlayerRegistrationRepository,
-    RegisteredPlayerRepository,
-)
+from repositories.discord_repositories import RegisteredPlayerRepository
 from services.transactions import run_db_operation
 
 logger = logging.getLogger(__name__)
 
-# Upper bound for the operator's "Unassigned (legacy)" list.
-MAX_UNASSIGNED_LISTED = 2000
+
+def kingdom_key(kingdom: Any) -> Optional[str]:
+    """A kingdom as profiles store it (``"795"``), or None when there is none."""
+    if kingdom is None or isinstance(kingdom, bool):
+        return None
+    text = str(kingdom).strip()
+    return text or None
 
 
 @dataclass
 class RosterEntry:
-    """One player as seen from a server roster (or the unassigned legacy list)."""
+    """One account of the gift-code list."""
 
     player_id: str
     player_name: Optional[str] = None
     player_uid: Optional[str] = None
     kingdom: Optional[str] = None
     castle_level: Optional[str] = None
-    # Per-server flag for roster entries; the global profile flag for unassigned ones.
     enabled: bool = True
-    # Global profile flag (bot operators can pause a profile everywhere).
-    profile_enabled: bool = True
     added_by_user_id: Optional[int] = None
-    guild_id: Optional[int] = None
-
-    @property
-    def unassigned(self) -> bool:
-        return self.guild_id is None
 
     @classmethod
-    def from_rows(cls, registration, player) -> "RosterEntry":
-        return cls(
-            player_id=str(player.player_id),
-            player_name=player.player_name,
-            player_uid=player.player_uid,
-            kingdom=player.kingdom,
-            castle_level=player.castle_level,
-            enabled=bool(registration.enabled),
-            profile_enabled=bool(player.enabled),
-            added_by_user_id=registration.added_by_user_id,
-            guild_id=registration.guild_id,
-        )
-
-    @classmethod
-    def unassigned_from_profile(cls, player) -> "RosterEntry":
+    def from_profile(cls, player) -> "RosterEntry":
         return cls(
             player_id=str(player.player_id),
             player_name=player.player_name,
@@ -71,48 +49,48 @@ class RosterEntry:
             kingdom=player.kingdom,
             castle_level=player.castle_level,
             enabled=bool(player.enabled),
-            profile_enabled=bool(player.enabled),
             added_by_user_id=player.added_by_user_id,
-            guild_id=None,
         )
 
 
 @dataclass
 class RegistrationOutcome:
-    """Result of adding players to one server roster."""
+    """Result of adding players to the list."""
 
     added: list[str] = field(default_factory=list)
     already_registered: list[str] = field(default_factory=list)
     reenabled: list[str] = field(default_factory=list)
+    # Not added: the member's own limit of self-registered accounts was reached.
     over_limit: list[str] = field(default_factory=list)
-    # "server" when the server cap stopped additions, "personal" for the self-registration cap.
-    limit_kind: Optional[str] = None
-    roster_size: int = 0
 
 
 @dataclass
 class RemovalOutcome:
     removed: bool
-    profile_deleted: bool = False
     entry: Optional[RosterEntry] = None
 
 
-def order_auto_redeem_targets(
-    targets: list, owners: list[tuple[str, int, int]], self_registered_max: int
-) -> list:
-    """Order targets: self-registered accounts, other roster entries, unassigned legacy."""
-    owned_counts: dict[tuple[int, int], int] = {}
-    for _, guild_id, owner_id in owners:
-        owned_counts[(guild_id, owner_id)] = owned_counts.get((guild_id, owner_id), 0) + 1
-    tiers: dict[str, int] = {}
-    for player_id, guild_id, owner_id in owners:
-        tier = 0 if owned_counts[(guild_id, owner_id)] <= self_registered_max else 1
-        tiers[player_id] = min(tier, tiers.get(player_id, tier))
-    return sorted(targets, key=lambda player: (tiers.get(str(player.player_id), 2), str(player.player_id)))
+def order_redeem_targets(targets: list, self_registered_max: int) -> list:
+    """Members' own accounts first, then accounts added in bulk.
+
+    An account counts as self-registered when its owner added at most
+    ``self_registered_max`` of the targets (a manager's alliance import is far above
+    that). A code with a claim limit therefore reaches the people who enrolled
+    themselves before bulk imports.
+    """
+    owned_counts: dict[Any, int] = {}
+    for player in targets:
+        owner = getattr(player, "added_by_user_id", None)
+        owned_counts[owner] = owned_counts.get(owner, 0) + 1
+
+    def tier(player) -> int:
+        return 0 if owned_counts[getattr(player, "added_by_user_id", None)] <= self_registered_max else 1
+
+    return sorted(targets, key=lambda player: (tier(player), str(player.player_id)))
 
 
 class PlayerRegistryService:
-    """Service managing gift-code registered players and per-server rosters."""
+    """Service managing the shared gift-code list and its kingdom rosters."""
 
     def __init__(self, db_manager: DatabaseManager | None = None):
         self._db_manager = db_manager
@@ -163,17 +141,9 @@ class PlayerRegistryService:
             return await RegisteredPlayerRepository(db_session).list_by_uids(player_uids)
 
     async def get_registered_players(self, enabled_only: bool = True, session: Optional[Any] = None) -> List:
-        """Every profile regardless of server (operator/diagnostic use)."""
+        """Every profile of the list (operator/diagnostic use)."""
         async with self._session(session) as db_session:
             return await RegisteredPlayerRepository(db_session).list(enabled_only=enabled_only)
-
-    async def set_profile_enabled(self, player_id: str, enabled: bool, session: Optional[Any] = None) -> bool:
-        """Pause or resume a profile in every server (bot operators only)."""
-
-        async def operation(db_session):
-            return await RegisteredPlayerRepository(db_session).set_enabled(player_id, enabled)
-
-        return await self._run(operation, session=session)
 
     async def sync_player_metadata(
         self,
@@ -202,121 +172,87 @@ class PlayerRegistryService:
     async def get_auto_redeem_targets(
         self, session: Optional[Any] = None, *, self_registered_max: int | None = None
     ) -> list:
-        """Enabled profiles enabled in ≥1 roster, plus enabled unassigned legacy profiles.
+        """Every enabled account: what a gift code is redeemed for, automatically or by hand.
 
         With ``self_registered_max`` the run is ordered so members' own accounts go
-        first: accounts whose owner added at most that many players to a server
-        (self-registration), then the rest of the server rosters (manager imports),
-        then unassigned legacy profiles. A code with a claim limit therefore reaches
-        the people who enrolled themselves before bulk imports.
+        first (see ``order_redeem_targets``).
         """
         async with self._session(session) as db_session:
             targets = await RegisteredPlayerRepository(db_session).list_auto_redeem_targets()
-            if self_registered_max is None or self_registered_max <= 0:
-                return targets
-            owners = await GuildPlayerRegistrationRepository(db_session).list_enabled_owners()
-        return order_auto_redeem_targets(targets, owners, self_registered_max)
-
-    async def get_guild_redeem_targets(self, guild_id: int, session: Optional[Any] = None) -> list:
-        """Profiles enabled in this server's roster (and not paused globally)."""
-        async with self._session(session) as db_session:
-            return await GuildPlayerRegistrationRepository(db_session).list_enabled_targets(guild_id)
-
-    async def get_enabled_guilds_for_players(
-        self, player_ids: list[str], session: Optional[Any] = None
-    ) -> dict[str, set[int]]:
-        async with self._session(session) as db_session:
-            return await GuildPlayerRegistrationRepository(db_session).enabled_guilds_by_player(player_ids)
+        if self_registered_max is None or self_registered_max <= 0:
+            return targets
+        return order_redeem_targets(targets, self_registered_max)
 
     # ------------------------------------------------------------------- rosters
 
-    async def list_guild_roster(self, guild_id: int, session: Optional[Any] = None) -> list[RosterEntry]:
+    async def list_kingdom_roster(self, kingdom: Any, session: Optional[Any] = None) -> list[RosterEntry]:
+        """The accounts of one kingdom, whoever added them."""
+        key = kingdom_key(kingdom)
+        if key is None:
+            return []
         async with self._session(session) as db_session:
-            rows = await GuildPlayerRegistrationRepository(db_session).list_roster(guild_id)
-        return [RosterEntry.from_rows(registration, player) for registration, player in rows]
+            players = await RegisteredPlayerRepository(db_session).list_by_kingdom(key)
+        return [RosterEntry.from_profile(player) for player in players]
 
-    async def list_unassigned_players(self, session: Optional[Any] = None) -> list[RosterEntry]:
+    async def list_owned_entries(self, owner_id: int, session: Optional[Any] = None) -> list[RosterEntry]:
+        """The accounts one member added."""
         async with self._session(session) as db_session:
-            players = await RegisteredPlayerRepository(db_session).list_unassigned(limit=MAX_UNASSIGNED_LISTED)
-        return [RosterEntry.unassigned_from_profile(player) for player in players]
+            players = await RegisteredPlayerRepository(db_session).list_owned(owner_id)
+        return [RosterEntry.from_profile(player) for player in players]
 
-    async def list_owned_entries(
-        self, guild_id: int, owner_id: int, session: Optional[Any] = None
-    ) -> list[RosterEntry]:
-        """The entries one member added to a server's roster."""
+    async def count_owned(self, owner_id: int, session: Optional[Any] = None) -> int:
         async with self._session(session) as db_session:
-            rows = await GuildPlayerRegistrationRepository(db_session).list_owned(guild_id, owner_id)
-        return [RosterEntry.from_rows(registration, player) for registration, player in rows]
+            return await RegisteredPlayerRepository(db_session).count_owned(owner_id)
 
-    async def disable_broken_players(
-        self, player_ids: list[str], session: Optional[Any] = None
-    ) -> tuple[int, int]:
-        """Stop redeeming for accounts that keep failing as invalid.
+    async def get_entry(self, player_id: str, session: Optional[Any] = None) -> Optional[RosterEntry]:
+        async with self._session(session) as db_session:
+            player = await RegisteredPlayerRepository(db_session).get(str(player_id))
+        return RosterEntry.from_profile(player) if player is not None else None
 
-        Roster entries are disabled in every server (a manager can re-enable them in
-        ``/gift roster`` once the Governor ID is fixed); unassigned legacy profiles
-        have no roster entry, so their profile flag is cleared instead. Returns
-        (roster entries disabled, unassigned profiles disabled).
-        """
+    async def get_entries(self, player_ids: list[str], session: Optional[Any] = None) -> dict[str, RosterEntry]:
+        """The listed accounts among ``player_ids``, by Governor ID."""
+        async with self._session(session) as db_session:
+            players = await RegisteredPlayerRepository(db_session).get_many(player_ids)
+        return {player_id: RosterEntry.from_profile(player) for player_id, player in players.items()}
+
+    async def set_players_enabled(
+        self, player_ids: list[str], enabled: bool, session: Optional[Any] = None
+    ) -> int:
+        """Switch redemption on or off for these accounts; returns how many changed."""
         if not player_ids:
-            return 0, 0
+            return 0
 
-        async def operation(db_session) -> tuple[int, int]:
-            registrations = GuildPlayerRegistrationRepository(db_session)
-            players = RegisteredPlayerRepository(db_session)
-            entries = await registrations.disable_everywhere(player_ids)
-            profiles = 0
-            for player_id in player_ids:
-                if await registrations.count_for_player(player_id) == 0:
-                    profiles += int(bool(await players.set_enabled(player_id, False)))
-            return entries, profiles
+        async def operation(db_session) -> int:
+            return await RegisteredPlayerRepository(db_session).set_enabled_many(player_ids, enabled)
 
         return await self._run(operation, session=session)
 
-    async def get_guild_registration(
-        self, guild_id: int, player_id: str, session: Optional[Any] = None
-    ) -> Optional[RosterEntry]:
-        async with self._session(session) as db_session:
-            row = await GuildPlayerRegistrationRepository(db_session).get_with_profile(guild_id, player_id)
-        return RosterEntry.from_rows(*row) if row is not None else None
+    async def disable_broken_players(self, player_ids: list[str], session: Optional[Any] = None) -> int:
+        """Stop redeeming for accounts that keep failing as invalid.
 
-    async def get_guild_registrations(
-        self, guild_id: int, player_ids: list[str], session: Optional[Any] = None
-    ) -> dict[str, Any]:
-        async with self._session(session) as db_session:
-            return await GuildPlayerRegistrationRepository(db_session).get_many(guild_id, player_ids)
+        A manager of the account's kingdom, or its owner, can switch it back on in
+        ``/gift roster`` once the Governor ID is fixed. Returns how many were disabled.
+        """
+        return await self.set_players_enabled(player_ids, False, session=session)
 
-    async def count_guild_registrations(
-        self, guild_id: int, *, owner_id: int | None = None, session: Optional[Any] = None
-    ) -> tuple[int, int]:
-        """Return (players in this roster, players in this roster added by ``owner_id``)."""
-        async with self._session(session) as db_session:
-            repo = GuildPlayerRegistrationRepository(db_session)
-            total = await repo.count(guild_id)
-            owned = await repo.count(guild_id, added_by_user_id=owner_id) if owner_id is not None else 0
-        return total, owned
-
-    async def register_players_for_guild(
+    async def register_players(
         self,
-        guild_id: int,
         profiles: list[dict[str, Any]],
         *,
         added_by_user_id: int,
-        max_total: int,
         max_owned: int | None = None,
         enable_existing: bool = False,
         session: Optional[Any] = None,
     ) -> RegistrationOutcome:
-        """Add players to a server roster within the server cap (and personal cap).
+        """Add accounts to the list, within the member's own limit when there is one.
 
         ``profiles`` rows carry ``player_id`` plus optional ``player_uid``,
-        ``player_name``, ``kingdom`` and ``castle_level``. Shared profiles are
-        created or refreshed; players already in this roster are left as they are
-        (``enable_existing`` re-enables disabled ones). The caps are counted and the
-        rows inserted in one SERIALIZABLE transaction: two concurrent imports that read
-        the same count conflict, and the retried one sees the other's rows, so they
-        cannot overshoot the caps together. A caller-supplied ``session`` keeps its
-        own isolation level.
+        ``player_name``, ``kingdom`` and ``castle_level``. Accounts already on the list
+        keep their owner and are refreshed (``enable_existing`` switches disabled ones
+        back on). ``max_owned`` caps how many accounts ``added_by_user_id`` may own; it
+        is counted and the rows inserted in one SERIALIZABLE transaction, so two
+        concurrent additions cannot overshoot it together. A caller-supplied
+        ``session`` keeps its own isolation level.
         """
         unique_profiles: dict[str, dict[str, Any]] = {}
         for profile in profiles:
@@ -325,37 +261,27 @@ class PlayerRegistryService:
                 unique_profiles[player_id] = {**profile, "player_id": player_id}
 
         async def operation(db_session) -> RegistrationOutcome:
-            registrations = GuildPlayerRegistrationRepository(db_session)
             players = RegisteredPlayerRepository(db_session)
             outcome = RegistrationOutcome()
-            existing = await registrations.get_many(guild_id, list(unique_profiles))
-            total = await registrations.count(guild_id)
-            capacity = max_total - total
-            limit_kind = "server"
+            existing = await players.get_many(list(unique_profiles))
+            capacity: int | None = None
             if max_owned is not None:
-                owned = await registrations.count(guild_id, added_by_user_id=added_by_user_id)
-                if max_owned - owned < capacity:
-                    capacity, limit_kind = max_owned - owned, "personal"
-            capacity = max(0, capacity)
+                capacity = max(0, max_owned - await players.count_owned(added_by_user_id))
 
             accepted: list[dict[str, Any]] = []
             refresh_only: list[dict[str, Any]] = []
             for player_id, profile in unique_profiles.items():
-                registration = existing.get(player_id)
-                if registration is not None:
+                listed = existing.get(player_id)
+                if listed is not None:
                     outcome.already_registered.append(player_id)
-                    if enable_existing and not registration.enabled:
-                        registration.enabled = True
+                    if enable_existing and not listed.enabled:
                         outcome.reenabled.append(player_id)
                     refresh_only.append(profile)
                     continue
-                if len(accepted) >= capacity:
+                if capacity is not None and len(accepted) >= capacity:
                     outcome.over_limit.append(player_id)
                     continue
                 accepted.append(profile)
-
-            if outcome.over_limit:
-                outcome.limit_kind = limit_kind
 
             rows = [
                 {**profile, "added_by_user_id": added_by_user_id, "enabled": True}
@@ -370,11 +296,8 @@ class PlayerRegistryService:
             ]
             if rows:
                 await players.add_or_update_many(rows, overwrite_owner=False)
-            for profile in accepted:
-                registrations.add(guild_id, profile["player_id"], added_by_user_id)
-                outcome.added.append(profile["player_id"])
+            outcome.added = [profile["player_id"] for profile in accepted]
             await db_session.flush()
-            outcome.roster_size = total + len(outcome.added)
             return outcome
 
         outcome = await self._run(
@@ -384,75 +307,23 @@ class PlayerRegistryService:
             isolation_level="SERIALIZABLE",
         )
         logger.info(
-            "Guild %s roster: %s added, %s already registered, %s over the %s limit (by user %s)",
-            guild_id,
+            "Gift-code list: %s added, %s already listed, %s over the personal limit (by user %s)",
             len(outcome.added),
             len(outcome.already_registered),
             len(outcome.over_limit),
-            outcome.limit_kind or "roster",
             added_by_user_id,
         )
         return outcome
 
-    async def remove_player_from_guild(
-        self, guild_id: int, player_id: str, session: Optional[Any] = None
-    ) -> RemovalOutcome:
-        """Remove one roster entry; delete the shared profile when no roster lists it."""
+    async def remove_player(self, player_id: str, session: Optional[Any] = None) -> RemovalOutcome:
+        """Take one account off the list."""
 
         async def operation(db_session) -> RemovalOutcome:
-            registrations = GuildPlayerRegistrationRepository(db_session)
-            row = await registrations.get_with_profile(guild_id, player_id)
-            if row is None:
+            players = RegisteredPlayerRepository(db_session)
+            player = await players.get(str(player_id))
+            if player is None:
                 return RemovalOutcome(removed=False)
-            registration, profile = row
-            entry = RosterEntry.from_rows(registration, profile)
-            await registrations.delete(registration)
-            profile_deleted = False
-            if await registrations.count_for_player(entry.player_id) == 0:
-                # Without this the profile would become an "unassigned legacy" player
-                # and keep receiving auto-redemption.
-                profile_deleted = await RegisteredPlayerRepository(db_session).remove(entry.player_id)
-            return RemovalOutcome(removed=True, profile_deleted=profile_deleted, entry=entry)
-
-        # SERIALIZABLE: under READ COMMITTED two servers removing the same player both
-        # still see the other's entry and keep the profile (an orphan that is then
-        # auto-redeemed as "unassigned legacy"), and a removal racing an add in another
-        # server could delete the profile, cascading away the entry just added.
-        return await self._run(operation, session=session, isolation_level="SERIALIZABLE")
-
-    async def set_guild_players_enabled(
-        self, guild_id: int, player_ids: list[str], enabled: bool, session: Optional[Any] = None
-    ) -> int:
-        async def operation(db_session) -> int:
-            return await GuildPlayerRegistrationRepository(db_session).set_enabled(guild_id, player_ids, enabled)
+            entry = RosterEntry.from_profile(player)
+            return RemovalOutcome(removed=await players.remove(entry.player_id), entry=entry)
 
         return await self._run(operation, session=session)
-
-    async def assign_unassigned_to_guild(
-        self, guild_id: int, *, max_total: int, session: Optional[Any] = None
-    ) -> tuple[int, int]:
-        """Register enabled legacy profiles to a server, within the server cap.
-
-        Original owners are kept, so they can still manage their entries. Returns
-        (assigned, enabled legacy profiles still unassigned).
-        """
-
-        async def operation(db_session) -> tuple[int, int]:
-            registrations = GuildPlayerRegistrationRepository(db_session)
-            players = RegisteredPlayerRepository(db_session)
-            unassigned = await players.list_unassigned(enabled_only=True)
-            capacity = max(0, max_total - await registrations.count(guild_id))
-            selected = unassigned[:capacity]
-            for player in selected:
-                registrations.add(guild_id, player.player_id, player.added_by_user_id)
-            await db_session.flush()
-            return len(selected), len(unassigned) - len(selected)
-
-        # The cap is counted, then filled: SERIALIZABLE like register_players_for_guild,
-        # so a concurrent import cannot push the roster past max_total.
-        return await self._run(
-            operation,
-            session=session,
-            retry_on_integrity_error=True,
-            isolation_level="SERIALIZABLE",
-        )

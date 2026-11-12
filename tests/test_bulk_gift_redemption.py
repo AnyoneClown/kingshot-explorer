@@ -283,8 +283,7 @@ async def test_manual_redeem_starts_background_job_and_rejects_duplicate(monkeyp
             del kwargs
 
     class FakeRegistry:
-        async def get_guild_redeem_targets(self, guild_id):
-            assert guild_id == 456
+        async def get_auto_redeem_targets(self):
             return [SimpleNamespace(player_id="222", kingdom="830", enabled=True)]
 
     def make_interaction():

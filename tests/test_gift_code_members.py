@@ -9,10 +9,10 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from db.models import GiftCode, GiftCodeRedemption, GuildPlayerRegistration, RegisteredPlayer
+from db.models import GiftCode, GiftCodeRedemption, RegisteredPlayer
 from handlers.gift_panel import GiftPanelView, build_panel_embed
-from services.gift_redemption_service import find_broken_players, is_retryable_result
-from services.player_registry_service import order_auto_redeem_targets
+from services.gift_redemption_service import FailingPlayer, find_broken_players, is_retryable_result
+from services.player_registry_service import order_redeem_targets
 from tests.test_gift_code_rosters import (
     BOT_ID,
     GUILD,
@@ -33,6 +33,9 @@ from tests.test_gift_code_rosters import (
 
 OUTAGE = {"success": False, "error_code": "API_ERROR", "message": "Service unavailable"}
 MISMATCH = {"success": False, "error_code": "KINGDOM_MISMATCH", "message": "The kingdom does not match this player."}
+# ``register`` stores accounts with kingdom 830; a server follows the kingdom in its settings.
+KINGDOM, OTHER_KINGDOM = 830, 795
+THIRD_GUILD = 3003
 
 
 @pytest.fixture(autouse=True)
@@ -47,19 +50,33 @@ def no_retry_delays(handler):
     return handler
 
 
+def server(guild_id, channel_id, kingdom):
+    """A server's settings row: its gift-code channel and the kingdom it follows (None: the whole list)."""
+    return SimpleNamespace(guild_id=guild_id, gift_code_channel_id=channel_id, kingdom_id=kingdom)
+
+
+def add_account(db, player_id, owner):  # noqa: F811
+    """Put an account of the other kingdom on the shared list."""
+    with Session(db.engine) as session, session.begin():
+        session.add(RegisteredPlayer(
+            player_id=player_id, player_name=f"Gov {player_id}", kingdom=str(OTHER_KINGDOM),
+            enabled=True, added_by_user_id=owner,
+        ))
+
+
 # ----------------------------------------------------------------- run order
 
 
-def test_self_registered_accounts_are_redeemed_before_imports_and_legacy_profiles():
-    players = [SimpleNamespace(player_id=pid) for pid in ("100", "200", "300", "400", "500")]
-    owners = [
-        ("300", GUILD, MEMBER),          # one account of their own: self-registered
-        ("200", GUILD, MANAGER), ("400", GUILD, MANAGER), ("500", GUILD, MANAGER),  # a manager's import
-        ("500", OTHER_GUILD, OTHER_MEMBER),  # also someone's own account elsewhere
-    ]
-    ordered = order_auto_redeem_targets(players, owners, self_registered_max=2)
-    # Own accounts (300, 500), then the import (200, 400), then the unassigned profile (100).
-    assert [player.player_id for player in ordered] == ["300", "500", "200", "400", "100"]
+def test_self_registered_accounts_are_redeemed_before_bulk_imports():
+    owners = {
+        "300": MEMBER,                                   # one account of their own: self-registered
+        "200": MANAGER, "400": MANAGER, "500": MANAGER,  # a manager's import
+        "100": OTHER_MEMBER, "600": OTHER_MEMBER,        # two of their own: still within the limit
+    }
+    players = [SimpleNamespace(player_id=pid, added_by_user_id=owner) for pid, owner in sorted(owners.items())]
+    ordered = order_redeem_targets(players, self_registered_max=2)
+    # Own accounts (100, 300, 600), then the import (200, 400, 500).
+    assert [player.player_id for player in ordered] == ["100", "300", "600", "200", "400", "500"]
 
 
 @pytest.mark.asyncio
@@ -104,42 +121,82 @@ def test_broken_players_need_repeated_failures_including_the_current_code():
 @pytest.mark.asyncio
 async def test_accounts_failing_on_three_codes_are_paused_and_reported(db):  # noqa: F811
     channel = Channel(channel_id=777, guild_id=GUILD)
+    whole_list = Channel(channel_id=888, guild_id=OTHER_GUILD)
+    elsewhere = Channel(channel_id=999, guild_id=THIRD_GUILD)
     operator_dm = SimpleNamespace(send=AsyncMock())
     handler = no_retry_delays(make_handler(
         db,
         responses={951: MISMATCH, 953: MISMATCH},
-        guild_settings=[SimpleNamespace(guild_id=GUILD, gift_code_channel_id=777)],
-        channels={777: channel},
+        guild_settings=[
+            server(GUILD, 777, KINGDOM),
+            server(OTHER_GUILD, 888, None),  # no kingdom chosen: follows the whole list
+            server(THIRD_GUILD, 999, 111),   # a kingdom without accounts
+        ],
+        channels={777: channel, 888: whole_list, 999: elsewhere},
     ))
     handler._bot.get_user = lambda user_id: operator_dm if user_id == OPERATOR else None
     await register(handler, GUILD, MEMBER, "951", "952")
-    with Session(db.engine) as session, session.begin():
-        session.add(RegisteredPlayer(player_id="953", kingdom="830", enabled=True, added_by_user_id=MEMBER))  # legacy
+    add_account(db, "953", OTHER_MEMBER)
 
     for index, code in enumerate(("ONE", "TWO", "THREE"), start=1):
         add_code(db, index, code)
         code_row = next(row for row in await handler._gift_code_service.list_pending_gift_codes() if row.code == code)
         assert await handler._run_auto_redemption(code_row) is True
         with Session(db.engine) as session:
-            flags = {
-                "roster": session.scalar(select(GuildPlayerRegistration.enabled).where(
-                    GuildPlayerRegistration.player_id == "951")),
-                "legacy": session.scalar(select(RegisteredPlayer.enabled).where(RegisteredPlayer.player_id == "953")),
-                "healthy": session.scalar(select(GuildPlayerRegistration.enabled).where(
-                    GuildPlayerRegistration.player_id == "952")),
-            }
-        # Two failures are not enough; the third code pauses both broken accounts.
-        assert flags == {"roster": index < 3, "legacy": index < 3, "healthy": True}
+            flags = dict(session.execute(select(RegisteredPlayer.player_id, RegisteredPlayer.enabled)).all())
+        # Two failures are not enough; the third code pauses both broken accounts, whichever kingdom.
+        assert flags == {"951": index < 3, "953": index < 3, "952": True}
 
     report = channel.sent[-1]["embed"]
     assert report.title == "⏸️ Paused 1 Account(s) That Keep Failing"
     assert "`951`" in report.description and "kingdom does not match (3 codes)" in report.description
-    assert "953" not in report.description  # not on this server's list
+    assert "These accounts (kingdom 830)" in report.description
+    assert "953" not in report.description  # an account of another kingdom
+    everything = whole_list.sent[-1]["embed"]
+    assert everything.title == "⏸️ Paused 2 Account(s) That Keep Failing"
+    assert "`951`" in everything.description and "`953`" in everything.description
+    assert elsewhere.sent == []
     operator_report = operator_dm.send.await_args.kwargs["embed"]
     assert "`951`" in operator_report.description and "`953`" in operator_report.description
+    assert "(every kingdom)" in operator_report.description
     # Paused accounts are no longer redeemed for.
     targets = await handler._player_registry_service.get_auto_redeem_targets()
     assert [player.player_id for player in targets] == ["952"]
+
+
+@pytest.mark.asyncio
+async def test_paused_account_notices_are_split_by_the_kingdom_each_server_follows(db):  # noqa: F811
+    channels = {
+        777: Channel(777, GUILD), 888: Channel(888, OTHER_GUILD), 999: Channel(999, THIRD_GUILD),
+    }
+    operator_dm = SimpleNamespace(send=AsyncMock())
+    handler = make_handler(
+        db,
+        guild_settings=[
+            server(GUILD, 777, KINGDOM),
+            server(OTHER_GUILD, 888, str(OTHER_KINGDOM)),
+            server(THIRD_GUILD, 999, None),
+            server(4004, 1111, KINGDOM),  # its channel is gone: skipped, the others still hear
+        ],
+        channels=channels,
+    )
+    handler._bot.get_user = lambda user_id: operator_dm if user_id == OPERATOR else None
+    failing = [FailingPlayer(pid, f"Gov {pid}", 3, "KINGDOM_MISMATCH") for pid in ("1", "2", "3")]
+
+    # Kingdoms come as the profiles store them (text), as numbers, or not at all.
+    await handler._notify_disabled_accounts(failing, {"1": "830", "2": OTHER_KINGDOM, "3": None})
+
+    def reported(channel_id):
+        (message,) = channels[channel_id].sent
+        return [pid for pid in ("1", "2", "3") if f"`{pid}`" in message["embed"].description]
+
+    assert reported(777) == ["1"]
+    assert reported(888) == ["2"]
+    # An account without a stored kingdom only reaches the servers that follow the whole list.
+    assert reported(999) == ["1", "2", "3"]
+    assert "(every registered player)" in channels[999].sent[0]["embed"].description
+    operator_report = operator_dm.send.await_args.kwargs["embed"]
+    assert operator_report.title == "⏸️ Paused 3 Account(s) That Keep Failing"
 
 
 # --------------------------------------------------- outages and retry rules
@@ -199,7 +256,6 @@ async def test_an_outage_that_starts_mid_run_ends_the_pass_early(db):  # noqa: F
     player_ids = list(range(981, 993))  # 12 players
     responses = {player_id: OUTAGE for player_id in player_ids[1:]}  # only the probe works
     handler = no_retry_delays(make_handler(db, responses=responses))
-    handler._config.max_players_per_guild = 50
     await register(handler, GUILD, MANAGER, *(str(player_id) for player_id in player_ids))
     add_code(db, 1, "STORM")
     code_row = (await handler._gift_code_service.list_pending_gift_codes())[0]
@@ -226,13 +282,15 @@ async def test_long_runs_announce_the_code_while_redeeming_and_then_edit_the_sum
     channel.send = send
     handler = make_handler(
         db,
-        guild_settings=[SimpleNamespace(guild_id=GUILD, gift_code_channel_id=777)],
+        guild_settings=[server(GUILD, 777, KINGDOM)],
         channels={777: channel},
     )
     handler.LIVE_ANNOUNCE_MIN_REMAINING_SECONDS = 2.0  # at least one player still to go
     handler.LIVE_ANNOUNCE_INTERVAL_SECONDS = 3600.0
     await register(handler, GUILD, MEMBER, "801", "802")
     await register(handler, GUILD, MANAGER, "803", "804")
+    # Redeemed in the same run, but not this server's kingdom: not in its counts.
+    add_account(db, "805", OTHER_MEMBER)
     add_code(db, 1, "LIVE", expires_in_days=2)
     code_row = (await handler._gift_code_service.list_pending_gift_codes())[0]
 
@@ -242,7 +300,7 @@ async def test_long_runs_announce_the_code_while_redeeming_and_then_edit_the_sum
     assert len(channel.sent) == 1
     live = channel.sent[0]["embed"]
     assert live.title == "🎁 New Gift Code — Redeeming…"
-    assert "**1/4** players processed" in live.description
+    assert "Redeeming for kingdom 830: **1/4** players processed" in live.description
     assert field(live, "Gift Code").value.startswith("`LIVE` · expires <t:")
     assert "Governor ID" in field(live, "Don't want to wait?").value
     # The live message has no picture; the summary replaces the text results with the card.
@@ -252,7 +310,9 @@ async def test_long_runs_announce_the_code_while_redeeming_and_then_edit_the_sum
     assert final.title == "🎁 New Gift Code Redeemed!" and final.image.url == "attachment://gift-code.png"
     assert [file.filename for file in edited["attachments"]] == ["gift-code.png"]
     assert gift_cards[-1].stats.counts["success"] == 4 and gift_cards[-1].title == "Gift code redeemed"
+    assert gift_cards[-1].stats.total == 4
     assert await handler._gift_code_service.get_announcements("LIVE") == {777: 4242}
+    assert len(handler._gift_code_service.calls) == 5
 
 
 @pytest.mark.asyncio
@@ -260,10 +320,11 @@ async def test_a_restart_edits_the_stored_announcement_instead_of_posting_again(
     partial = SimpleNamespace(edit=AsyncMock())
     channel = Channel(channel_id=777, guild_id=GUILD)
     channel.get_partial_message = lambda message_id: partial if message_id == 4242 else None
+    other_kingdom = Channel(channel_id=888, guild_id=OTHER_GUILD)
     handler = make_handler(
         db,
-        guild_settings=[SimpleNamespace(guild_id=GUILD, gift_code_channel_id=777)],
-        channels={777: channel},
+        guild_settings=[server(GUILD, 777, KINGDOM), server(OTHER_GUILD, 888, OTHER_KINGDOM)],
+        channels={777: channel, 888: other_kingdom},
     )
     await register(handler, GUILD, MEMBER, "811")
     # A previous process posted the first summary and stored its message ID.
@@ -275,6 +336,11 @@ async def test_a_restart_edits_the_stored_announcement_instead_of_posting_again(
 
     assert channel.sent == []
     partial.edit.assert_awaited_once()
+    # Called without the run's targets: the account's kingdom is read from the list, so
+    # the summary still counts it for its kingdom's server, and only there.
+    edited = partial.edit.await_args.kwargs["embed"]
+    assert edited.title == "🎁 New Gift Code Redeemed!" and "finished for kingdom 830" in edited.description
+    assert other_kingdom.sent == []
     assert handler._auto_announcements == {} and handler._announcements_loaded == set()
 
 
@@ -284,21 +350,21 @@ async def test_a_server_channel_that_is_also_a_legacy_channel_gets_only_the_serv
     channel = Channel(channel_id=777, guild_id=GUILD)
     handler = make_handler(
         db,
-        guild_settings=[SimpleNamespace(guild_id=GUILD, gift_code_channel_id=777)],
+        guild_settings=[server(GUILD, 777, KINGDOM)],
         auto_channels={777},
         channels={777: channel},
     )
     await register(handler, GUILD, MEMBER, "821")
-    with Session(db.engine) as session, session.begin():
-        session.add(RegisteredPlayer(player_id="822", kingdom="830", enabled=True, added_by_user_id=MEMBER))
+    add_account(db, "822", MEMBER)
     add_code(db, 1, "SHARED")
     code_row = (await handler._gift_code_service.list_pending_gift_codes())[0]
 
     assert await handler._run_auto_redemption(code_row) is True
 
     assert len(channel.sent) == 1
-    assert "this server's roster" in channel.sent[0]["embed"].description
-    assert gift_cards[-1].stats.total == 1
+    assert "finished for kingdom 830" in channel.sent[0]["embed"].description
+    # One card, of the server's kingdom: the summary of all 2 accounts was not drawn for this channel.
+    assert [card.stats.total for card in gift_cards] == [1]
 
 
 # ------------------------------------------------------------- submit a code
@@ -310,7 +376,8 @@ async def test_a_member_submitted_code_is_checked_with_their_account_and_queued(
     started = []
     handler._ensure_pending_worker = lambda: started.append(True)
     await register(handler, GUILD, MANAGER, "701")
-    await register(handler, GUILD, MEMBER, "702")
+    # Their account plays in another kingdom than this server follows; it is theirs all the same.
+    add_account(db, "702", MEMBER)
 
     action = interaction(MEMBER)
     await handler._handle_submit_code(action, "  FOUND2026 ")
@@ -396,11 +463,12 @@ async def test_rejected_unverifiable_and_rate_limited_submissions_are_not_queued
 
 
 @pytest.mark.asyncio
-async def test_my_accounts_lists_own_entries_with_recent_results(db):  # noqa: F811
+async def test_my_accounts_lists_own_accounts_of_every_kingdom_with_recent_results(db):  # noqa: F811
     handler = make_handler(db)
-    await register(handler, GUILD, MEMBER, "601", "602")
+    await register(handler, GUILD, MEMBER, "601")
+    add_account(db, "602", MEMBER)  # their second account plays in another kingdom
     await register(handler, GUILD, MANAGER, "603")
-    await handler._player_registry_service.set_guild_players_enabled(GUILD, ["602"], False)
+    assert await handler._player_registry_service.set_players_enabled(["602"], False) == 1
     add_code(db, 1, "OLD", status="completed")
     add_code(db, 2, "NEW", status="completed")
     with Session(db.engine) as session, session.begin():
@@ -415,14 +483,21 @@ async def test_my_accounts_lists_own_entries_with_recent_results(db):  # noqa: F
     action = interaction(MEMBER)
     await handler._handle_my_accounts(action)
 
+    assert action.response.deferred["ephemeral"] is True
     assert action.followup.sent[0]["ephemeral"] is True
     embed = action.followup.sent[0]["embed"]
-    assert "2 account(s)" in embed.description and [f.name for f in embed.fields] == ["Gov 601", "Gov 602"]
+    assert "2 account(s) on the gift-code list" in embed.description
+    assert [f.name for f in embed.fields] == ["Gov 601", "Gov 602"]
     first, second = embed.fields
     assert "`601` · Kingdom 830 · ✅ receiving codes" in first.value
     assert "`NEW` ✅ redeemed" in first.value and "`OLD` ☑️ already claimed" in first.value
-    assert "⏸️ paused" in second.value
+    assert "`602` · Kingdom 795 · ⏸️ paused" in second.value
     assert "`NEW` — no result yet" in second.value and "`OLD` ❌ kingdom does not match" in second.value
+
+    # The list is shared: the same accounts show wherever the member asks.
+    elsewhere = interaction(MEMBER, guild_id=OTHER_GUILD)
+    await handler._handle_my_accounts(elsewhere)
+    assert elsewhere.followup.sent[0]["embed"].to_dict() == embed.to_dict()
 
     newcomer = interaction(OTHER_MEMBER)
     await handler._handle_my_accounts(newcomer)
@@ -550,32 +625,32 @@ def test_an_interrupted_pass_never_reads_as_finished():
     from handlers.gift_code_handler import GiftCodeHandler
 
     handler = GiftCodeHandler(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace(admin_user_ids=set()))
-    untouched = handler._build_auto_redemption_embed("CODE", 0, [], scope="this server's roster", final=False)
+    untouched = handler._build_auto_redemption_embed("CODE", 0, [], scope="kingdom 830", final=False)
     assert untouched.title == "🎁 New Gift Code — Redeeming…"
     assert "interrupted" in untouched.description and "finished" not in untouched.description.split("when it")[0]
     partly = handler._build_auto_redemption_embed(
-        "CODE", 1, [{"status_category": "success"}], scope="this server's roster", final=False
+        "CODE", 1, [{"status_category": "success"}], scope="kingdom 830", final=False
     )
     assert partly.title == "🎁 New Gift Code Redeemed!" and "continues automatically" in partly.description
-    done = handler._build_auto_redemption_embed("CODE", 0, [], scope="this server's roster", final=True)
+    done = handler._build_auto_redemption_embed("CODE", 0, [], scope="kingdom 830", final=True)
     assert done.title == "ℹ️ Gift Code Finished Without New Rewards"
 
 
 @pytest.mark.asyncio
-async def test_details_of_an_all_servers_run_are_for_the_requester_and_operators(db):  # noqa: F811
+async def test_details_of_a_run_are_for_the_requester_managers_and_operators(db):  # noqa: F811
     from handlers.gift_code_handler import RedemptionResultsView
 
     handler = make_handler(db)
     embed = discord.Embed(title="Summary")
     issues = [{"player_id": "1", "status_category": "invalid_id", "message": "x"}]
-    local = RedemptionResultsView(embed, issues, MEMBER, access_policy=handler._access, timeout=60)
-    everywhere = RedemptionResultsView(
-        embed, issues, OPERATOR, access_policy=handler._access, timeout=60, all_servers=True
-    )
-    assert await local.interaction_check(interaction(MANAGER, manage=True))
-    assert not await local.interaction_check(interaction(OTHER_MEMBER))
-    assert not await everywhere.interaction_check(interaction(MANAGER, manage=True))
-    assert await everywhere.interaction_check(interaction(OPERATOR))
+    # Every run covers the whole list now, so there is one rule for all of them.
+    view = RedemptionResultsView(embed, issues, MEMBER, access_policy=handler._access, timeout=60)
+    assert await view.interaction_check(interaction(MEMBER))
+    assert await view.interaction_check(interaction(MANAGER, manage=True))
+    assert await view.interaction_check(interaction(OPERATOR))
+    stranger = interaction(OTHER_MEMBER)
+    assert not await view.interaction_check(stranger)
+    assert stranger.response.sent[0]["ephemeral"] is True
 
 
 def test_submission_budgets_are_per_member_and_per_server():

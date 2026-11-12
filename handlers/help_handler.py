@@ -36,7 +36,8 @@ GROUPS = {
         "Add your Governor ID with /gift add to receive new codes automatically, check your "
         "accounts with /gift accounts, and send in a code the bot has not found yet with /gift submit. "
         "Server managers can post a sign-up panel with buttons, import alliances and redeem a code "
-        "for this server's roster with /giftadmin.",
+        "for everyone on the list with /giftadmin. The list is shared by all servers; /gift roster "
+        "shows the players of this server's kingdom.",
         (
             ("gift codes", "Available codes", "/gift codes"),
             ("gift add", "Add players", "/gift add player_ids:123456,654321"),

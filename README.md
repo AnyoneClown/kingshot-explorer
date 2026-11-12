@@ -9,8 +9,8 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
   ID, check their accounts, copy active codes and send in codes the bot has not found
   yet, without knowing any command.
 - Multi-server ready: per-server settings in `/settings` (the server's kingdom, the
-  gift-code channel, daily event calendar, bot manager role) and per-server gift-code
-  rosters.
+  gift-code channel, daily event calendar, bot manager role) and one gift-code list
+  shared by all servers, shown to each server as the roster of its kingdom.
 - Picture cards instead of walls of text: the event calendar, gift-code results, KvK
   history, KvK comparison, the prep dossier's rankings, the scout leaderboard, the
   `/leaderboard` rankings and the
@@ -49,15 +49,19 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 
 Gift code support includes:
 
-- Per-server rosters. Player profiles are shared (one in-game account is redeemed once
-  per code), and each server keeps its own roster entry with its own enabled flag and
-  owner (`guild_player_registrations`). Members can enroll up to
-  `MAX_SELF_REGISTERED_PLAYERS` (3) accounts of their own; server managers can fill the
-  roster up to `MAX_PLAYERS_PER_GUILD` (300) and import alliances.
-- Enabling/disabling roster entries from `/gift roster` (owners for their own entries,
-  managers for all), plus a manager **Roster health** report: how many of the server's
-  players recent codes reached, and players whose redemptions keep failing permanently,
-  with a one-click **Disable these**.
+- One gift-code list for all servers (`registered_players`). An account is listed once,
+  with one enabled flag and the Discord user who added it, and a code is redeemed for
+  every enabled account whichever server it was added from. Members can enroll up to
+  `MAX_SELF_REGISTERED_PLAYERS` (3) accounts of their own; server managers can add any
+  number and import alliances.
+- Kingdom rosters. `/gift roster` shows a server the accounts of the kingdom chosen in
+  its `/settings`, whoever added them and from whichever server; two servers of the same
+  kingdom see the same roster. A server without a kingdom is asked to set one. Bot
+  operators can open any kingdom with `/gift roster kingdom:<n>`.
+- Who may remove or enable/disable an account: the user who added it, the managers of a
+  server set to the account's kingdom, and bot operators. Managers also get a **Roster
+  health** report for their kingdom: how many of its players recent codes reached, and
+  players whose redemptions keep failing permanently, with a one-click **Disable these**.
 - Polling the upstream gift code source every minute (with back-off on network errors).
   Discovery runs independently of redemption, so a new code is recorded even while
   another code is being redeemed. Members can also send in a code with `/gift submit`
@@ -72,13 +76,11 @@ Gift code support includes:
   `services/gift_card_renderer.py` with the same drawing code as the calendar cards
   (`services/card_drawing.py`).
 - Members' own accounts go first: a run redeems self-registered accounts (owners with
-  at most `MAX_SELF_REGISTERED_PLAYERS` entries in a server), then the rest of the
-  server rosters, then unassigned legacy profiles. The gift-code server allows about 30
-  requests a minute, so 1,000 accounts take roughly 40 minutes.
-- Auto-redeeming new codes for every enabled profile that is enabled in at least one
-  server roster. Profiles created before per-server rosters ("unassigned legacy") keep
-  being redeemed until a bot operator assigns them to a server (**Assign unassigned
-  here** in `/gift roster`). Removing a server's last roster entry deletes the profile.
+  at most `MAX_SELF_REGISTERED_PLAYERS` accounts on the list), then the accounts added
+  in bulk. The gift-code server allows about 30 requests a minute, so 1,000 accounts
+  take roughly 40 minutes.
+- Auto-redeeming new codes for every enabled account on the list. Removing an account
+  takes it off the list for every server.
 - Resumable runs. New codes are stored as `pending`; each player's result is saved as
   soon as it is known, and every poll resumes pending, unexpired codes, skipping players
   already handled. A restart or deploy mid-run therefore continues where it stopped.
@@ -93,14 +95,15 @@ Gift code support includes:
   it has no expiry date. `/giftadmin redeem` is refused while the bot is shutting down.
 - Accounts that keep failing are paused. After a completed run, an account whose
   Governor ID or kingdom was rejected on at least 3 of the last 5 codes (including the
-  current one) and that none of them reached is disabled: its roster entry in every
-  server, or the profile itself when it is unassigned. The server's gift-code channel
-  and the bot operators (by DM) get the list; a manager or the owner re-enables an
-  entry in `/gift roster` after fixing the ID.
+  current one) and that none of them reached is disabled. The gift-code channels of
+  the servers set to its kingdom and the bot operators (by DM) get the list; a manager
+  of that kingdom or the owner re-enables the account in `/gift roster` after fixing the
+  ID.
 - One job per code: automatic and manual runs share a guard, so a code is never
   redeemed twice concurrently; each server can run one manual job at a time.
 - Posting summary embeds when at least one auto-redemption succeeds: each server's
-  summary (its own players only) goes to the gift-code channel set in `/settings`, and
+  summary (the players of its kingdom; every player when the server has no kingdom)
+  goes to the gift-code channel set in `/settings`, and
   the legacy `AUTO_REDEEM_CHANNELS` receive the global summary (a legacy channel that a
   server also chose in `/settings` gets only that server's summary). While at least a
   minute of a run is left, the same message is posted early as "New Gift Code —
@@ -154,7 +157,7 @@ LOG_LEVEL=INFO
 Use `ADMIN_USER_IDS=123,456` instead of `ADMIN_USER_ID` if multiple Discord users should be bot operators.
 
 Optional settings (defaults in parentheses): `BANNED_PLAYERS` (Discord user IDs the bot
-ignores), `MAX_PLAYERS_PER_GUILD` (300), `MAX_SELF_REGISTERED_PLAYERS` (3),
+ignores), `MAX_SELF_REGISTERED_PLAYERS` (3),
 `LLM_TIMEOUT_SECONDS` (30), `CHAT_USER_COOLDOWN_SECONDS` (10),
 `KINGSHOT_RAG_MAX_DISTANCE` (0.7) and `TRANSLATION_LOG_RETENTION_DAYS` (30; `0` keeps
 stored translation text forever). See `.env.local.example`.
@@ -164,12 +167,12 @@ stored translation text forever). See `.env.local.example`.
 The bot uses three access levels, enforced by `handlers/permissions.py`:
 
 - **Bot operators** (`ADMIN_USER_ID` / `ADMIN_USER_IDS`) can do everything, including
-  actions that affect every server: unassigned legacy players and the all-servers
-  redemption job.
+  managing the gift-code roster of any kingdom.
 - **Server managers** manage the bot inside one server: members with **Manage Server**
   or **Administrator**, members with the bot manager role chosen in `/settings`, and
   bot operators. They configure the server, create/edit/cancel reminders, start/stop
-  alliance tracking, import alliances and run redemptions for the server's roster.
+  alliance tracking, import alliances, run redemptions (for everyone on the shared
+  list) and manage the gift-code accounts of the server's kingdom.
 - **Members** use everything else: lookups, reports, translation, AI replies, and
   enrolling a few of their own accounts for gift codes.
 
@@ -244,15 +247,16 @@ The bot registers slash commands through handler modules in handlers/.
 
 Gift code related commands include:
 
-- `/giftadmin redeem gift_code:<code>` (managers) redeems for this server's enabled roster; bot
-  operators can add `all_servers:true` to run the global job.
-- `/gift add player_ids:<ids>` adds Governor IDs to this server's roster (private reply).
+- `/giftadmin redeem gift_code:<code>` (managers) redeems for every enabled account on the
+  shared list; accounts that already have the code are skipped.
+- `/gift add player_ids:<ids>` adds Governor IDs to the shared list (private reply).
 - `/giftadmin import kid:<id> alliance:<choice>` (managers; top 15 by power with names from
   MightPulse's public kingdom view; AIDs remain the choice values and appear as fallback
   labels when names are unavailable). Governor IDs come from the roster, the local UID
   cache, the optional key-protected MightPulse roster (`MIGHTPULSE_API_KEY`) or player profiles.
-- `/gift remove player_id:<id>` removes an entry from this server's roster after confirmation.
-- `/gift roster` browses this server's roster.
+- `/gift remove player_id:<id>` takes an account off the shared list after confirmation.
+- `/gift roster` browses the accounts of this server's kingdom (operators: `kingdom:<n>`
+  for another kingdom).
 - `/gift codes` lists active codes as copyable lines.
 - `/gift accounts` privately shows the caller's own accounts in this server, whether each
   is receiving codes, and the result of the three latest codes.

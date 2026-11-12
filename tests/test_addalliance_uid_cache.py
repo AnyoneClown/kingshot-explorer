@@ -58,14 +58,23 @@ class FakeRegistryService:
             if str(player_uid) in self.cached_by_uid
         }
 
-    async def register_players_for_guild(self, guild_id, profiles, **kwargs):
-        assert guild_id == 999
-        assert kwargs["added_by_user_id"] == 111
-        assert kwargs["enable_existing"] is True
-        self.registration_kwargs = kwargs
+    async def register_players(self, profiles, **kwargs):
+        # An import has no cap: neither a server's nor the importing manager's own.
+        assert kwargs == {"added_by_user_id": 111, "enable_existing": True}
         self.added_player_batches.append(profiles)
         self.added_players.extend(profiles)
-        return RegistrationOutcome(added=[profile["player_id"] for profile in profiles], roster_size=len(profiles))
+        # The UID cache is the gift-code list itself, so a cached account is already on it.
+        listed = {str(player.player_id): player for player in self.cached_by_uid.values()}
+        outcome = RegistrationOutcome()
+        for profile in profiles:
+            player = listed.get(profile["player_id"])
+            if player is None:
+                outcome.added.append(profile["player_id"])
+                continue
+            outcome.already_registered.append(profile["player_id"])
+            if not player.enabled:
+                outcome.reenabled.append(profile["player_id"])
+        return outcome
 
 
 class FakeKingshotDataService:
@@ -102,7 +111,7 @@ def build_handler(registry, kingshot, mightpulse=None):
         gift_code_service=SimpleNamespace(),
         player_info_service=SimpleNamespace(),
         bot=SimpleNamespace(),
-        config=SimpleNamespace(max_players_per_guild=300),
+        config=SimpleNamespace(),
         interaction_tracking_service=FakeTrackingService(),
         player_registry_service=registry,
         kingshot_data_service=kingshot,
@@ -129,7 +138,7 @@ def test_addalliance_uses_cached_uid_without_resolving_profile():
 
     assert kingshot.player_calls == []
     assert kingshot.full_alliance_calls == []
-    # The cached fid is registered into this server's roster without an API lookup.
+    # The cached fid is sent to the gift-code list without an API lookup.
     assert registry.added_players == [
         {
             "player_id": "123456789",
@@ -139,8 +148,12 @@ def test_addalliance_uses_cached_uid_without_resolving_profile():
             "castle_level": "30",
         }
     ]
-    assert registry.registration_kwargs["max_total"] == 300
-    assert "Added 1 Alliance Member" in interaction.followup.sent_embed.title
+    embed = interaction.followup.sent_embed
+    assert embed.title == "ℹ️ Alliance Already on the Gift-Code List"
+    assert "Servers set to kingdom `830` list these players in `/gift roster`" in embed.description
+    assert [(field.name, field.value) for field in embed.fields] == [
+        ("Already on the list (1)", "Kept as they are."),
+    ]
 
 
 def test_addalliance_resolves_uncached_uid_and_stores_uid_mapping():
@@ -174,7 +187,10 @@ def test_addalliance_resolves_uncached_uid_and_stores_uid_mapping():
             "castle_level": "30",
         }
     ]
-    assert "Added 1 Alliance Member" in interaction.followup.sent_embed.title
+    embed = interaction.followup.sent_embed
+    assert "Added 1 Alliance Member" in embed.title
+    assert "Servers set to kingdom `830` list these players in `/gift roster`" in embed.description
+    assert [field.name for field in embed.fields] == ["Added (1)"]
 
 
 def test_addalliance_only_resolves_cache_misses():
@@ -220,9 +236,12 @@ def test_addalliance_only_resolves_cache_misses():
         "kingdom": "830",
         "castle_level": "29",
     }
+    embed = interaction.followup.sent_embed
+    assert "Added 1 Alliance Member" in embed.title
+    assert [field.name for field in embed.fields] == ["Added (1)", "Already on the list (1)"]
 
 
-def test_addalliance_registers_cached_disabled_player_for_this_server():
+def test_addalliance_switches_a_cached_disabled_player_back_on():
     cached_player = SimpleNamespace(
         player_id="123456789",
         player_name="Cached Name",
@@ -251,6 +270,8 @@ def test_addalliance_registers_cached_disabled_player_for_this_server():
             "castle_level": "30",
         }
     ]
+    already = interaction.followup.sent_embed.fields[0]
+    assert (already.name, already.value) == ("Already on the list (1)", "Kept as they are (1 re-enabled).")
 
 
 def test_addalliance_uses_external_governor_ids_only_for_current_roster_uids():

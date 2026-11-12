@@ -327,13 +327,13 @@ def test_empty_environment_values_fall_back_to_defaults(monkeypatch):
 
     for name, value in {
         "DISCORD_TOKEN": "t", "COCKROACHDB_URL": "cockroachdb+asyncpg://u:p@h/db", "NVIDIA_API_KEY": "k",
-        "RANDOM_REPLY_CHANCE": "", "MAX_PLAYERS_PER_GUILD": " ", "COMMAND_PREFIX": "",
+        "RANDOM_REPLY_CHANCE": "", "MAX_SELF_REGISTERED_PLAYERS": " ", "COMMAND_PREFIX": "",
         "MAX_CHAT_RESPONSE_CHARS": "5000",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr("config.bot_config.load_dotenv", lambda: None)
     config = BotConfig.from_env()
-    assert config.random_reply_chance == 0 and config.max_players_per_guild == 300
+    assert config.random_reply_chance == 0 and config.max_self_registered_players == 3
     assert config.command_prefix == "!"
     assert config.max_chat_response_chars == 2000  # Discord's message limit
 

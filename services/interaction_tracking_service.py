@@ -136,11 +136,12 @@ class InteractionTrackingService:
         display_name: Optional[str] = None,
         session: Optional[Any] = None,
     ):
-        """Record a lookup: refresh the user and cache the player's profile.
+        """Record a lookup: refresh the user and, when the player is on the gift-code list, its profile.
 
-        Lookups never add a player to a server's gift-code roster; profiles created
-        here start disabled, so they are not auto-redeemed. There is no lookup log
-        table, so ``guild_id``/``channel_id`` are only used for diagnostics.
+        A lookup never puts a player on the list: every profile row is a listed
+        account (shown in its kingdom's roster, owned by who added it), so a player
+        that is not listed gets no row. There is no lookup log table, so
+        ``guild_id``/``channel_id`` are only used for diagnostics.
         """
         logger.debug(
             "Player lookup by user %s for %s (success=%s, guild=%s, channel=%s)",
@@ -164,7 +165,8 @@ class InteractionTrackingService:
                 player_name=player_name,
                 kingdom=kingdom,
                 castle_level=castle_level,
-                added_by_user_id=user_id,
+                # Without an owner the profile is only refreshed, never created.
+                added_by_user_id=None,
             )
 
         return await self._run(operation, session=session, retry_on_integrity_error=True)

@@ -253,7 +253,6 @@ class RedemptionJob:
     kind: str
     guild_id: int | None = None
     requester_id: int | None = None
-    all_servers: bool = False
     total: int = 0
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     stop_reason: str | None = None
@@ -367,9 +366,9 @@ def summarize_roster_health(
     *,
     min_failures: int = 2,
 ) -> RosterHealthReport:
-    """Summarize recent redemptions for one server roster.
+    """Summarize recent redemptions for one kingdom roster.
 
-    ``codes`` is ``(gift_code, still_pending)`` newest first, ``roster`` the server's
+    ``codes`` is ``(gift_code, still_pending)`` newest first, ``roster`` the kingdom's
     entries (``player_id``, ``player_name``, ``enabled``) and ``rows`` the attempt
     rows (``gift_code``, ``player_id``, ``success``, ``error_code``). A player is
     flagged when its account failed as invalid on at least ``min_failures`` of

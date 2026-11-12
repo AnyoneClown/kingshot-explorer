@@ -19,7 +19,7 @@ PANEL_SUBMIT_ID = "giftpanel:submit"
 
 def build_panel_embed(max_self_registered: int) -> discord.Embed:
     lines = [
-        "New gift codes are redeemed automatically for every account on this server's list. "
+        "New gift codes are redeemed automatically for every account on the list. "
         "Rewards arrive in your in-game mail.",
         "",
         "**Add my ID** — put your Governor ID on the list"
