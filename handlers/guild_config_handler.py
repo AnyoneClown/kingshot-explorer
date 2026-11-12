@@ -210,7 +210,9 @@ class GuildConfigView(OwnedView):
     def _sync_kingdom_button(self, kingdom: int | None) -> None:
         self.kingdom_button.label = f"Kingdom: {kingdom}" if kingdom else "Set kingdom"
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    # Not named ``_refresh``: that is discord.py's own View method, called with the
+    # message's components when a message carrying the view is edited.
+    async def _show(self, interaction: discord.Interaction) -> None:
         await interaction.edit_original_response(embed=await self.build_embed(), view=self)
 
     @discord.ui.button(label="AI Replies", style=discord.ButtonStyle.secondary, row=0)
@@ -223,13 +225,13 @@ class GuildConfigView(OwnedView):
             not guild_config.use_random_replies,
         )
         self._sync_random_replies_button(updated.use_random_replies)
-        await self._refresh(interaction)
+        await self._show(interaction)
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=0)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         del button
         await interaction.response.defer()
-        await self._refresh(interaction)
+        await self._show(interaction)
 
     @discord.ui.button(label="Set kingdom", emoji="🏰", style=discord.ButtonStyle.secondary, row=0)
     async def kingdom_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -261,7 +263,7 @@ class GuildConfigView(OwnedView):
                     "very new kingdoms appear there a little later.",
                     ephemeral=True,
                 )
-                await self._refresh(interaction)
+                await self._show(interaction)
                 return
             except CalendarError:
                 self._warnings.append(
@@ -272,7 +274,7 @@ class GuildConfigView(OwnedView):
             changes["calendar_channel_id"] = pending_channel_id
         await self._guild_config_service.update_for_guild(self._guild_id, **changes)
         await self._post_calendar_now()
-        await self._refresh(interaction)
+        await self._show(interaction)
 
     async def _post_calendar_now(self) -> None:
         """Post today's calendar once the daily post is fully set up, as a visible check."""
@@ -293,7 +295,7 @@ class GuildConfigView(OwnedView):
     async def _update(self, interaction: discord.Interaction, **changes) -> None:
         await interaction.response.defer()
         await self._guild_config_service.update_for_guild(self._guild_id, **changes)
-        await self._refresh(interaction)
+        await self._show(interaction)
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
@@ -328,7 +330,7 @@ class GuildConfigView(OwnedView):
         if role is not None and (getattr(role, "is_default", lambda: False)() or getattr(role, "managed", False)):
             self._warnings.append("Pick a regular role (not @everyone or a bot/integration role).")
             await interaction.response.defer()
-            await self._refresh(interaction)
+            await self._show(interaction)
             return
         await self._update(interaction, manager_role_id=role.id if role is not None else None)
 
@@ -354,7 +356,7 @@ class GuildConfigView(OwnedView):
             self._guild_id, calendar_channel_id=channel_id, calendar_last_posted_on=None
         )
         await self._post_calendar_now()
-        await self._refresh(interaction)
+        await self._show(interaction)
 
 
 class GuildConfigHandler:

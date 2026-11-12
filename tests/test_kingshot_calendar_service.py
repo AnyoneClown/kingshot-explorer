@@ -417,3 +417,10 @@ def test_event_icon_keys_are_validated_and_limited():
 
     assert service.requested[0] == "ok-key"
     assert len(service.requested) == 6
+
+
+def test_the_calendar_is_read_from_the_events_endpoint():
+    # The site has no other calendar endpoint: a wrong path answers 404, which reads
+    # as "kingdom not tracked" for every kingdom.
+    assert KingshotCalendarService()._events_url == "https://kingshot.net/api/events"
+    assert KingshotCalendarService("https://example.test/api/")._events_url == "https://example.test/api/events"

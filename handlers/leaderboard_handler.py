@@ -175,7 +175,9 @@ class LeaderboardView(OwnedView):
             return False
         return True
 
-    async def _refresh(self, interaction: discord.Interaction, *, reload: bool) -> None:
+    # Not named ``_refresh``: discord.py calls ``View._refresh(components)`` on every
+    # edit of the panel's message, and an override with another signature stops the bot.
+    async def _show(self, interaction: discord.Interaction, *, reload: bool) -> None:
         self._loading = True
         try:
             await interaction.response.defer()
@@ -190,22 +192,22 @@ class LeaderboardView(OwnedView):
     @discord.ui.select(placeholder="Pick a board", row=0)
     async def board_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         self.board = BOARDS_BY_TYPE.get(int(select.values[0]), self.board)
-        await self._refresh(interaction, reload=True)
+        await self._show(interaction, reload=True)
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
-        await self._refresh(interaction, reload=False)
+        await self._show(interaction, reload=False)
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(self.page_count - 1, self.page + 1)
-        await self._refresh(interaction, reload=False)
+        await self._show(interaction, reload=False)
 
     @discord.ui.button(label="All kingdoms", style=discord.ButtonStyle.primary, row=1)
     async def scope_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.global_scope = not self.global_scope
-        await self._refresh(interaction, reload=True)
+        await self._show(interaction, reload=True)
 
 
 class LeaderboardHandler:
