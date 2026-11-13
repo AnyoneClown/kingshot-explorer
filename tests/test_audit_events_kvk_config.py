@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 
 from sqlalchemy.dialects import postgresql
 
-from handlers import help_handler
 from handlers.help_handler import HelpHandler
 from handlers.kvk_handler import KVKHandler
 from services.event_scheduler_service import EventSchedulerService, ScheduledEvent
@@ -91,24 +90,6 @@ def test_dossier_button_cooldowns_forget_users_whose_window_reset(monkeypatch):
     assert list(handler._dossier_button_cooldowns) == [1]
 
 
-def test_help_manager_cache_is_bounded(monkeypatch):
-    monkeypatch.setattr(help_handler, "MANAGER_CACHE_SIZE", 3)
-    access = SimpleNamespace(can_manage=AsyncMock(return_value=True), is_super_admin=lambda user_id: False)
-    handler = HelpHandler(SimpleNamespace(), access_policy=access)
-
-    def interaction(user_id):
-        return SimpleNamespace(user=SimpleNamespace(id=user_id), guild=SimpleNamespace(id=10), guild_id=10)
-
-    async def check():
-        for user_id in range(1, 10):
-            assert await handler.refresh_access(interaction(user_id)) is True
-        assert len(handler._manager_cache) == 3
-        # The interaction that just refreshed always finds its own decision.
-        assert handler._is_manager(interaction(9)) is True
-
-    asyncio.run(check())
-
-
 def test_reminder_bookkeeping_locks_rows_it_checks_before_writing():
     """READ COMMITTED: the "still active at the claimed time" check must hold until the write.
 
@@ -138,20 +119,18 @@ def test_reminder_bookkeeping_locks_rows_it_checks_before_writing():
     assert len(compiled) == 2 and all("FOR UPDATE" in sql for sql in compiled), compiled
 
 
-def test_help_buttons_without_a_form_check_access_once():
+def test_help_checks_manager_access_once_per_request():
     """Each manager lookup may take up to 2 s on a slow database; two would miss the 3 s deadline."""
-    bot, calls = make_bot(local=True)
     access = SimpleNamespace(can_manage=AsyncMock(return_value=False), is_super_admin=lambda user_id: False)
-    handler = HelpHandler(bot, access_policy=access)
+    handler = HelpHandler(make_bot(local=True), access_policy=access)
 
     async def check():
-        await handler.open_command(help_interaction(2), name="gift codes", label="Available codes")
-        assert calls == [("gift codes",)]
+        request = help_interaction(2)
+        await handler._handle_help(request)
         assert access.can_manage.await_count == 1
-        # A manager-only action still re-checks (and is refused) on the same path.
-        denied = help_interaction(2)
-        await handler.open_command(denied, name="configure", label="Open settings")
-        assert ("configure",) not in calls
-        assert "not available" in denied.response.send_message.call_args.args[0]
+        sent = request.response.send_message.call_args.kwargs
+        assert sent["ephemeral"] is True
+        # Manager commands are left out for a member.
+        assert all("Server managers" not in field.name for field in sent["embed"].fields)
 
     asyncio.run(check())

@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import discord
 from discord import app_commands
@@ -9,109 +9,35 @@ from discord.ext import commands
 from services import kvk_card_renderer, ranking_card_renderer
 from services.kvk_service import IKVKService
 from services.ranking_card_renderer import RankedRow, VersusSection
-from handlers.ui import EmbedColors, OwnedView, build_status_embed, card_files, render_card, send_ui_error
+from handlers.kingdom_default import PublicReply, defer_for_kingdom
+from handlers.ui import EmbedColors, OwnedView, build_status_embed, card_files, render_card
 
 logger = logging.getLogger(__name__)
 
 MAX_KINGDOM_NUMBER = 99999
-# Public browse panels stay usable for a typical channel discussion.
+# Public panels stay usable for a typical channel discussion.
 BROWSE_PANEL_TIMEOUT_SECONDS = 900
 EMBED_TOTAL_LIMIT = 6000
 EMBED_FIELD_LIMIT = 1024
+# Matches listed as text: what the history card shows, and under a comparison.
+HISTORY_TEXT_MATCHES = kvk_card_renderer.MAX_SEASONS
+HISTORY_TEXT_MATCHES_PER_FIELD = 5
+DIRECT_MATCHES_LISTED = 3
 
 
-class CompareKingdomModal(discord.ui.Modal, title="Compare kingdoms"):
-    opponent = discord.ui.TextInput(label="Other kingdom number", placeholder="For example, 831", max_length=10)
+class KVKCompareView(OwnedView):
+    """The one control under a comparison: the prep dossier of the two kingdoms."""
 
-    def __init__(self, handler, kingdom_number: int, author_id: int):
-        super().__init__(timeout=180)
-        self.handler = handler
-        self.kingdom_number = kingdom_number
-        self.author_id = author_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Open your own kingdom comparison to continue.", ephemeral=True)
-            return False
-        return True
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        await send_ui_error(interaction, error)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            opponent = int(self.opponent.value.strip())
-        except ValueError:
-            await interaction.response.send_message("Enter a positive kingdom number, for example 831.", ephemeral=True)
-            return
-        if opponent <= 0 or opponent == self.kingdom_number:
-            await interaction.response.send_message("Enter a positive kingdom number different from this kingdom.", ephemeral=True)
-            return
-        await self.handler._handle_compare_kvk_slash(interaction, self.kingdom_number, opponent)
-
-
-class KVKHistoryView(OwnedView):
-    """Keep all loaded matches accessible without flooding the channel."""
-
-    def __init__(
-        self,
-        handler,
-        kingdom_number: int,
-        stats: dict,
-        author_id: int,
-        overview=None,
-        opponent: int | None = None,
-        card_filename: str | None = None,
-    ):
+    def __init__(self, handler, kingdom_number: int, opponent: int, author_id: int):
         super().__init__(author_id, timeout=BROWSE_PANEL_TIMEOUT_SECONDS)
         self.handler = handler
         self.kingdom_number = kingdom_number
-        self.stats = stats
-        self.overview = overview
         self.opponent = opponent
-        # Name of the picture card attached to the message. It stays attached while
-        # pages are turned, so every page's embed keeps pointing at it.
-        self.card_filename = card_filename
-        self.current_page = 0
-        lines = [handler._format_history_line(entry)[:200] for entry in stats.get("history", [])]
-        self.pages = [lines[index:index + 5] for index in range(0, len(lines), 5)] or [[]]
-        self.dossier_button: discord.ui.Button | None = None
-        if opponent is not None and handler.has_dossier:
-            self.dossier_button = discord.ui.Button(label="Prep dossier", emoji="🛡️", style=discord.ButtonStyle.success)
-            self.dossier_button.callback = self._open_dossier
-            self.add_item(self.dossier_button)
-        self._update_controls()
 
-    def _update_controls(self):
-        self.previous_button.disabled = self.current_page == 0
-        self.next_button.disabled = self.current_page == len(self.pages) - 1
-
-    def build_embed(self) -> discord.Embed:
-        embed = (
-            self.overview.copy()
-            if self.overview
-            else self.handler._build_history_embed(self.kingdom_number, self.stats, pictures=bool(self.card_filename))
-        )
-        if self.card_filename:
-            embed.set_image(url=f"attachment://{self.card_filename}")
-        embed.title = str(embed.title or "KVK history")[:256]
-        embed.description = str(embed.description or "")[:512]
-        for index, field in enumerate(embed.fields):
-            embed.set_field_at(index, name=field.name, value=str(field.value)[:400], inline=field.inline)
-        embed.add_field(
-            name="Direct Match History" if self.overview else "Match History",
-            value="\n".join(self.pages[self.current_page]) or ("History unavailable." if self.stats.get("matchCount") is None else "No matches available."),
-            inline=False,
-        )
-        footer = f"Page {self.current_page + 1}/{len(self.pages)} · {len(self.stats.get('history', []))} loaded matches · Source: Kingshot KVK"
-        if self.dossier_button is not None:
-            footer += " · Prep dossier posts a new message in this channel"
-        embed.set_footer(text=footer)
-        return embed
-
-    async def _open_dossier(self, interaction: discord.Interaction):
-        # The button bypasses the slash command's cooldown check, so apply the same
-        # per-user limit here (each click posts a new public message).
+    @discord.ui.button(label="Prep dossier", emoji="🛡️", style=discord.ButtonStyle.success)
+    async def dossier_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        del button
+        # Each click posts a new public message, so it has a per-user limit.
         retry_after = self.handler._dossier_button_retry_after(interaction.user.id)
         if retry_after:
             await interaction.response.send_message(
@@ -120,40 +46,33 @@ class KVKHistoryView(OwnedView):
             return
         await self.handler._handle_kvk_prep(interaction, self.kingdom_number, self.opponent)
 
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = max(0, self.current_page - 1)
-        self._update_controls()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = min(len(self.pages) - 1, self.current_page + 1)
-        self._update_controls()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Compare kingdom", style=discord.ButtonStyle.primary)
-    async def compare_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(CompareKingdomModal(self.handler, self.kingdom_number, self.author_id))
-
 
 class KVKHandler:
-    """Handles KVK (Kingdom vs Kingdom) Discord commands."""
+    """Handles the KvK (Kingdom vs Kingdom) Discord command."""
 
-    def __init__(self, kvk_service: IKVKService, bot: commands.Bot, dossier_service: Any = None):
+    def __init__(
+        self,
+        kvk_service: IKVKService,
+        bot: commands.Bot,
+        dossier_service: Any = None,
+        guild_configuration_service: Any = None,
+    ):
         """
         Initialize KVK handler.
 
         Args:
             kvk_service: Service for fetching KVK matches
             bot: Discord bot instance
-            dossier_service: Optional ``KvKDossierService``; enables /kvk prep and
-                the "Prep dossier" button on comparisons.
+            dossier_service: Optional ``KvKDossierService``; enables the "Prep dossier"
+                button on comparisons.
+            guild_configuration_service: Server settings; gives ``/kvk`` the server's
+                kingdom when the command names none.
         """
         self._kvk_service = kvk_service
         self._bot = bot
         self._dossier_service = dossier_service
-        # Same budget as the /kvk prep cooldown: 2 dossiers per 60 s per user.
+        self._guild_configuration_service = guild_configuration_service
+        # 2 dossiers per 60 s per user.
         self._dossier_button_cooldown = app_commands.Cooldown(2, 60.0)
         self._dossier_button_cooldowns: dict[int, app_commands.Cooldown] = {}
         logger.info("KVKHandler initialized")
@@ -177,85 +96,91 @@ class KVKHandler:
         return self._dossier_service is not None
 
     def register_commands(self):
-        """Register the ``/kvk`` group: ``history``, ``compare`` and (with a dossier service) ``prep``."""
-        kvk = app_commands.Group(name="kvk", description="KvK: a kingdom's history, a comparison, a prep dossier")
+        """Register ``/kvk``: one kingdom shows its history, two kingdoms a comparison."""
 
-        @kvk.command(name="history", description="KvK match history of a kingdom")
-        @app_commands.describe(kingdom="The kingdom number (e.g., 830)")
-        async def get_kvk_stats(
-            interaction: discord.Interaction,
-            kingdom: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
-        ):
-            """Get KVK stats for a kingdom."""
-            await self._handle_get_kvk_stats_slash(interaction, kingdom)
-
-        @kvk.command(name="compare", description="Compare the KvK history of two kingdoms")
-        @app_commands.describe(
-            kingdom_a="First kingdom number to compare",
-            kingdom_b="Second kingdom number to compare",
+        @self._bot.tree.command(
+            name="kvk",
+            description="KvK history of a kingdom, or a comparison of two kingdoms",
         )
-        async def compare_kvk_stats(
+        @app_commands.describe(
+            kingdom="Kingdom number. Leave empty to use this server's kingdom",
+            opponent="A second kingdom: compares the two instead of showing the history",
+        )
+        async def kvk(
             interaction: discord.Interaction,
-            kingdom_a: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
-            kingdom_b: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
+            kingdom: Optional[app_commands.Range[int, 1, MAX_KINGDOM_NUMBER]] = None,
+            opponent: Optional[app_commands.Range[int, 1, MAX_KINGDOM_NUMBER]] = None,
         ):
-            """Compare KVK stats for two kingdoms."""
-            await self._handle_compare_kvk_slash(interaction, kingdom_a, kingdom_b)
+            await self._handle_kvk(interaction, kingdom, opponent)
 
-        if self._dossier_service is not None:
-
-            @kvk.command(
-                name="prep",
-                description="KvK prep dossier: castles, kings, top alliances and players for two kingdoms",
-            )
-            @app_commands.describe(
-                kingdom_a="Your kingdom number (e.g., 830)",
-                kingdom_b="Opponent kingdom number (e.g., 831)",
-            )
-            @app_commands.checks.cooldown(2, 60.0, key=lambda interaction: interaction.user.id)
-            async def kvk_prep(
-                interaction: discord.Interaction,
-                kingdom_a: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
-                kingdom_b: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
-            ):
-                """Post a KvK prep dossier for two kingdoms."""
-                await self._handle_kvk_prep(interaction, kingdom_a, kingdom_b)
-
-        self._bot.tree.add_command(kvk)
+    @staticmethod
+    def _kingdom_problem(*kingdoms: int) -> tuple[str, str] | None:
+        """Title and text of what is wrong with the kingdom numbers, or None."""
+        if any(
+            not isinstance(kingdom, int) or isinstance(kingdom, bool) or not 1 <= kingdom <= MAX_KINGDOM_NUMBER
+            for kingdom in kingdoms
+        ):
+            title = "⚠️ Invalid Kingdom Number" if len(kingdoms) == 1 else "⚠️ Invalid Kingdom Numbers"
+            return title, f"Kingdom numbers must be between 1 and {MAX_KINGDOM_NUMBER}."
+        if len(kingdoms) == 2 and kingdoms[0] == kingdoms[1]:
+            return "⚠️ Duplicate Kingdom", "Please provide two different kingdoms."
+        return None
 
     async def _reject_invalid_kingdoms(self, interaction: discord.Interaction, *kingdoms: int) -> bool:
-        """Privately reject bad input before deferring (forms bypass Discord's ranges)."""
-        if any(not isinstance(kingdom, int) or not 1 <= kingdom <= MAX_KINGDOM_NUMBER for kingdom in kingdoms):
-            title = "⚠️ Invalid Kingdom Number" if len(kingdoms) == 1 else "⚠️ Invalid Kingdom Numbers"
-            description = f"Kingdom numbers must be between 1 and {MAX_KINGDOM_NUMBER}."
-        elif len(kingdoms) == 2 and kingdoms[0] == kingdoms[1]:
-            title = "⚠️ Duplicate Kingdom"
-            description = "Please provide two different kingdoms."
-        else:
+        """Privately reject bad input before deferring (Discord's ranges are not the only way in)."""
+        problem = self._kingdom_problem(*kingdoms)
+        if problem is None:
             return False
         await interaction.response.send_message(
-            embed=self._build_status_embed(title=title, description=description, color=EmbedColors.WARNING),
+            embed=self._build_status_embed(title=problem[0], description=problem[1], color=EmbedColors.WARNING),
             ephemeral=True,
         )
         return True
 
-    async def _handle_get_kvk_stats_slash(self, interaction: discord.Interaction, kingdom_number: int):
-        """
-        Handle fetching KVK stats for a kingdom.
+    async def _handle_kvk(
+        self,
+        interaction: discord.Interaction,
+        kingdom: Optional[int] = None,
+        opponent: Optional[int] = None,
+    ) -> None:
+        """``/kvk``: the history of one kingdom, or a comparison when an opponent is named.
 
-        Args:
-            interaction: Discord interaction
-            kingdom_number: The kingdom number to fetch matches for
+        Without a kingdom the server's kingdom is used, also as the first side of a
+        comparison (``/kvk opponent:831``).
         """
-        if await self._reject_invalid_kingdoms(interaction, kingdom_number):
+        given = [number for number in (kingdom, opponent) if number is not None]
+        if given and await self._reject_invalid_kingdoms(interaction, *given):
             return
 
-        await interaction.response.defer(thinking=True)
+        kingdom, reply = await defer_for_kingdom(
+            interaction,
+            kingdom,
+            self._guild_configuration_service,
+            command="kvk",
+            receipt="KvK report ready.",
+        )
+        if reply is None:
+            return
 
-        user_info = f"{interaction.user.name}#{interaction.user.discriminator} (ID: {interaction.user.id})"
-        guild_info = f"{interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
+        if opponent is None:
+            await self._send_history(interaction, reply, kingdom)
+            return
+        # Checked again: the first kingdom may have come from the server's settings.
+        problem = self._kingdom_problem(kingdom, opponent)
+        if problem is not None:
+            if reply.private:
+                description = f"{problem[1]} This server's kingdom is {kingdom}: name another opponent."
+            else:
+                description = problem[1]
+            await reply.fail(
+                self._build_status_embed(title=problem[0], description=description, color=EmbedColors.WARNING)
+            )
+            return
+        await self._send_comparison(interaction, reply, kingdom, opponent)
 
-        logger.info(f"KVK stats requested for kingdom {kingdom_number} by {user_info} in {guild_info}")
+    async def _send_history(self, interaction: discord.Interaction, reply: PublicReply, kingdom_number: int) -> None:
+        """Post a kingdom's KvK history: the card, or the same record as text."""
+        logger.info("KVK history requested for kingdom %s by %s", kingdom_number, interaction.user.id)
 
         try:
             result = await self._kvk_service.get_kingdom_stats(kingdom_number)
@@ -267,50 +192,44 @@ class KVKHandler:
                     color=EmbedColors.ERROR,
                 )
                 embed.set_footer(text="Try again in a moment or verify the kingdom number")
-                await interaction.followup.send(embed=embed)
+                await reply.fail(embed)
                 logger.warning(f"Failed to fetch KVK stats for kingdom {kingdom_number}: {result.get('message')}")
                 return
 
             stats = result.get("data", {})
             card = await render_card(kvk_card_renderer.render_kvk_history_card, kingdom_number, stats)
-            view = KVKHistoryView(
-                self, kingdom_number, stats, interaction.user.id,
-                card_filename=kvk_card_renderer.HISTORY_FILENAME if card else None,
-            )
-            view.message = await interaction.followup.send(
-                embed=view.build_embed(), view=view, wait=True,
-                files=card_files(card, kvk_card_renderer.HISTORY_FILENAME),
-            )
+            embed = self._build_history_embed(kingdom_number, stats, pictures=bool(card))
+            if card:
+                embed.set_image(url=f"attachment://{kvk_card_renderer.HISTORY_FILENAME}")
+            await reply.send(embed=embed, files=card_files(card, kvk_card_renderer.HISTORY_FILENAME))
             logger.info(f"Successfully sent KVK stats for kingdom {kingdom_number}")
 
         except Exception as e:
             logger.error(f"Error fetching KVK stats for kingdom {kingdom_number}: {e}", exc_info=True)
-            await interaction.followup.send(
-                embed=self._build_status_embed(
+            await reply.fail(
+                self._build_status_embed(
                     title="❌ Unexpected Error",
                     description="An error occurred while fetching KVK stats. Please try again later.",
                     color=EmbedColors.ERROR,
                 )
             )
 
-    async def _handle_compare_kvk_slash(self, interaction: discord.Interaction, kingdom_a: int, kingdom_b: int):
-        """Handle comparing KVK stats for two kingdoms."""
-        if await self._reject_invalid_kingdoms(interaction, kingdom_a, kingdom_b):
-            return
-
-        await interaction.response.defer(thinking=True)
-
+    async def _send_comparison(
+        self, interaction: discord.Interaction, reply: PublicReply, kingdom_a: int, kingdom_b: int
+    ) -> None:
+        """Post the comparison of two kingdoms, with the prep dossier as its only button."""
         logger.info(f"KVK comparison requested for kingdoms {kingdom_a} vs {kingdom_b}")
 
         try:
             result = await self._kvk_service.compare_kingdoms(kingdom_a, kingdom_b)
             if not result.get("success"):
-                embed = self._build_status_embed(
-                    title="❌ Comparison Failed",
-                    description="Could not compare the selected kingdoms.",
-                    color=EmbedColors.ERROR,
+                await reply.fail(
+                    self._build_status_embed(
+                        title="❌ Comparison Failed",
+                        description="Could not compare the selected kingdoms.",
+                        color=EmbedColors.ERROR,
+                    )
                 )
-                await interaction.followup.send(embed=embed)
                 return
 
             data = result.get("data", {})
@@ -343,32 +262,50 @@ class KVKHandler:
             )
             if card is None:
                 self._add_compare_text(embed, kingdom_a, kingdom_b, stats_a, stats_b)
+            else:
+                embed.set_image(url=f"attachment://{kvk_card_renderer.COMPARE_FILENAME}")
             embed.add_field(
                 name="Direct Matchups",
-                value=self._build_head_to_head_summary(kingdom_a, kingdom_b, h2h),
+                value=self._build_direct_matchups(kingdom_a, kingdom_b, h2h),
                 inline=False,
             )
-            direct_stats = dict(h2h.get("kingdom_a", {}), history=h2h.get("matches", []))
-            if not h2h.get("available"):
-                direct_stats["matchCount"] = None
-            view = KVKHistoryView(
-                self, kingdom_a, direct_stats, interaction.user.id, overview=embed, opponent=kingdom_b,
-                card_filename=kvk_card_renderer.COMPARE_FILENAME if card else None,
-            )
-            view.message = await interaction.followup.send(
-                embed=view.build_embed(), view=view, wait=True,
-                files=card_files(card, kvk_card_renderer.COMPARE_FILENAME),
-            )
+            footer = "Source: Kingshot KVK"
+            view = None
+            if self.has_dossier:
+                view = KVKCompareView(self, kingdom_a, kingdom_b, interaction.user.id)
+                footer += " · Prep dossier posts a new message in this channel"
+            embed.set_footer(text=footer)
+            sent: Dict[str, Any] = {
+                "embed": self._fit_embed(embed),
+                "files": card_files(card, kvk_card_renderer.COMPARE_FILENAME),
+            }
+            if view is not None:
+                sent.update(view=view, wait=True)
+            message = await reply.send(**sent)
+            if view is not None:
+                view.message = message
             logger.info(f"Successfully compared kingdoms {kingdom_a} and {kingdom_b}")
         except Exception as e:
             logger.error(f"Error comparing kingdoms {kingdom_a} vs {kingdom_b}: {e}", exc_info=True)
-            await interaction.followup.send(
-                embed=self._build_status_embed(
+            await reply.fail(
+                self._build_status_embed(
                     title="❌ Unexpected Error",
                     description="An error occurred while comparing kingdoms. Please try again later.",
                     color=EmbedColors.ERROR,
                 )
             )
+
+    def _build_direct_matchups(self, kingdom_a: int, kingdom_b: int, h2h: Dict[str, Any]) -> str:
+        """The direct record of two kingdoms and their latest meetings, from the first one's side."""
+        summary = self._build_head_to_head_summary(kingdom_a, kingdom_b, h2h)
+        matches = h2h.get("matches") if h2h.get("available") else None
+        if not matches:
+            return summary
+        lines = [summary, f"Latest (K{kingdom_a} view):"]
+        lines.extend(f"• {self._format_compact_match(match)}" for match in matches[:DIRECT_MATCHES_LISTED])
+        if len(matches) > DIRECT_MATCHES_LISTED:
+            lines.append(f"… and {len(matches) - DIRECT_MATCHES_LISTED} earlier")
+        return "\n".join(lines)[:EMBED_FIELD_LIMIT]
 
     def _add_compare_text(
         self, embed: discord.Embed, kingdom_a: int, kingdom_b: int, stats_a: Dict[str, Any], stats_b: Dict[str, Any]
@@ -402,7 +339,7 @@ class KVKHandler:
         embed.add_field(name="Overall Metrics", value="\n".join(comparison_lines), inline=False)
 
     async def _handle_kvk_prep(self, interaction: discord.Interaction, kingdom_a: int, kingdom_b: int):
-        """Post a public KvK prep dossier for two kingdoms."""
+        """The **Prep dossier** button: post a public KvK prep dossier for two kingdoms."""
         if await self._reject_invalid_kingdoms(interaction, kingdom_a, kingdom_b):
             return
         if self._dossier_service is None:
@@ -798,12 +735,18 @@ class KVKHandler:
     def _build_history_embed(
         self, kingdom_number: int, stats: Dict[str, Any], *, pictures: bool = False
     ) -> discord.Embed:
-        """The record of a kingdom. With ``pictures`` the numbers are on the attached card."""
+        """The record of a kingdom.
+
+        With ``pictures`` the numbers and the last seasons are on the attached card;
+        without it they are text fields, with the same last seasons listed.
+        """
+        history = stats.get("history") or []
         embed = discord.Embed(
             title=f"⚔️ KVK History · Kingdom {kingdom_number}",
             description=self._build_latest_match_summary(stats.get("latestMatch")) if stats.get("matchCount") is not None else "Match history unavailable.",
             color=EmbedColors.INFO,
         )
+        embed.set_footer(text=f"{len(history)} matches tracked · Source: Kingshot KVK")
         if pictures:
             return embed
         embed.add_field(name="Castle Record", value=self._record(stats, "wins", "losses"), inline=True)
@@ -822,7 +765,15 @@ class KVKHandler:
             value=f"{self._format_metric('captures', stats.get('castleCaptures'))} / {self._format_metric('held', stats.get('defensesHeld'))}",
             inline=True,
         )
-        return embed
+        # Newest first, as the service returns them.
+        lines = [self._format_history_line(entry)[:200] for entry in history[:HISTORY_TEXT_MATCHES]]
+        for start in range(0, len(lines), HISTORY_TEXT_MATCHES_PER_FIELD):
+            embed.add_field(
+                name="Last Matches" if start == 0 else "Last Matches (continued)",
+                value="\n".join(lines[start:start + HISTORY_TEXT_MATCHES_PER_FIELD]),
+                inline=False,
+            )
+        return self._fit_embed(embed)
 
     @staticmethod
     def _record(stats: Dict[str, Any], wins: str, losses: str) -> str:

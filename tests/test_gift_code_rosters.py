@@ -42,6 +42,11 @@ class FakeGiftCodeService(GiftCodeService):
         self.responses = responses or {}
         self.calls = []
         self.completed = []
+        # Codes the upstream list offers right now.
+        self.active = []
+
+    async def get_available_gift_codes(self):
+        return {"success": True, "data": [{"id": index + 1, "code": code} for index, code in enumerate(self.active)]}
 
     async def redeem_gift_code_remote(self, player_id, gift_code, kingdom_id=None):
         self.calls.append((player_id, gift_code))
@@ -125,7 +130,7 @@ def interaction(user_id, *, guild_id=GUILD, manage=False):
         id=5, created_at=None, user=user, guild_id=guild_id,
         guild=SimpleNamespace(id=guild_id, name="Guild") if guild_id else None,
         response=Response(), followup=Followup(), channel=Channel(),
-        edit_original_response=AsyncMock(),
+        edit_original_response=AsyncMock(), original_response=AsyncMock(),
     )
 
 
@@ -145,8 +150,13 @@ def make_handler(
     channels = channels or {}
     kingdoms = SERVER_KINGDOMS if kingdoms is None else kingdoms
 
+    gift_channels = {settings.guild_id: settings.gift_code_channel_id for settings in guild_settings}
+
     async def get_settings(guild_id):
-        return SimpleNamespace(manager_role_id=None, kingdom_id=kingdoms.get(guild_id))
+        return SimpleNamespace(
+            manager_role_id=None, kingdom_id=kingdoms.get(guild_id),
+            gift_code_channel_id=gift_channels.get(guild_id),
+        )
 
     bot = SimpleNamespace(
         tree=SimpleNamespace(get_command=lambda name: None),
@@ -210,7 +220,14 @@ def field(embed, prefix):
     return next(f for f in embed.fields if f.name.startswith(prefix))
 
 
-# ------------------------------------------------------------------ /gift add
+async def ask_remove(handler, action, player_id):
+    """Press Remove on an account (in "My accounts" or the roster); returns the bot's reply."""
+    entry = await handler._player_registry_service.get_entry(player_id)
+    await handler._request_remove(action, entry)
+    return action.response.sent[0]
+
+
+# ----------------------------------------------------------------- add accounts
 
 
 @pytest.mark.asyncio
@@ -230,7 +247,7 @@ async def test_member_self_registration_cap_and_lookup_results(db):
     over = field(embed, "Not added — limit reached (1)").value
     assert "up to 2 players yourself" in over and "`103`" in over
     assert "`abc`" in field(embed, "Invalid (1)").value
-    assert "roster of servers set to kingdom `830`" in embed.description
+    assert "Managers of servers set to kingdom `830` see them in their roster." in embed.description
     assert "You have added 1/2 players." in embed.description
     # One list for every server: the account is redeemed for, and shows in its kingdom's roster.
     roster = await handler._player_registry_service.list_kingdom_roster(KINGDOM)
@@ -340,7 +357,7 @@ async def test_addplayer_outside_a_server_is_denied(db):
     assert action.response.sent[0]["ephemeral"] is True
 
 
-# --------------------------------------------------------------- /gift remove
+# ------------------------------------------------------------ remove an account
 
 
 @pytest.mark.asyncio
@@ -359,15 +376,10 @@ async def test_remove_is_denied_to_strangers_and_to_managers_of_other_kingdoms(d
         (interaction(MANAGER, guild_id=NO_KINGDOM_GUILD, manage=True), "302"),
     ]
     for action, player_id in refused:
-        await handler._handle_remove_player_slash(action, player_id)
-        reply = action.followup.sent[0]
+        reply = await ask_remove(handler, action, player_id)
         assert reply["embed"].title == "🔒 Not allowed" and reply["ephemeral"] is True
         assert "that server's kingdom" in reply["embed"].description
         assert "view" not in reply
-
-    unknown = interaction(MANAGER, manage=True)
-    await handler._handle_remove_player_slash(unknown, "399")
-    assert unknown.followup.sent[0]["embed"].title == "❌ Player Not Found"
     assert await enabled_ids(handler) == ["301", "302"]
 
 
@@ -378,8 +390,7 @@ async def test_owner_removes_an_account_from_any_server_and_it_leaves_the_shared
 
     # The owner's right follows the account, not the server the command is run in.
     owner = interaction(MEMBER, guild_id=OTHER_GUILD)
-    await handler._handle_remove_player_slash(owner, "311")
-    prompt = owner.followup.sent[0]
+    prompt = await ask_remove(handler, owner, "311")
     assert prompt["ephemeral"] is True and isinstance(prompt["view"], RemovePlayerConfirmView)
     assert "shared by every server" in prompt["embed"].description
     assert await roster_ids(handler, KINGDOM) == ["311", "312"]  # nothing yet
@@ -411,71 +422,70 @@ async def test_kingdom_managers_and_operators_remove_accounts_they_did_not_add(d
     await register(handler, GUILD, MEMBER, "321", "322", "323")
 
     manager = interaction(MANAGER, manage=True)
-    await handler._handle_remove_player_slash(manager, "321")
+    prompt = await ask_remove(handler, manager, "321")
     click = interaction(MANAGER, manage=True)
-    await manager.followup.sent[0]["view"].confirm_button.callback(click)
+    await prompt["view"].confirm_button.callback(click)
     assert click.edit_original_response.call_args.kwargs["embed"].title == "✅ Player Removed"
     assert await enabled_ids(handler) == ["322", "323"]
 
     # An operator needs neither Manage Server nor a server of the account's kingdom.
     operator = interaction(OPERATOR, guild_id=OTHER_GUILD)
-    await handler._handle_remove_player_slash(operator, "322")
+    prompt = await ask_remove(handler, operator, "322")
     click = interaction(OPERATOR, guild_id=OTHER_GUILD)
-    await operator.followup.sent[0]["view"].confirm_button.callback(click)
+    await prompt["view"].confirm_button.callback(click)
     assert click.edit_original_response.call_args.kwargs["embed"].title == "✅ Player Removed"
     assert await enabled_ids(handler) == ["323"]
 
     # The confirm click checks again: the server moved to another kingdom in between.
     manager = interaction(MANAGER, manage=True)
-    await handler._handle_remove_player_slash(manager, "323")
+    prompt = await ask_remove(handler, manager, "323")
     kingdoms[GUILD] = OTHER_KINGDOM
     click = interaction(MANAGER, manage=True)
-    await manager.followup.sent[0]["view"].confirm_button.callback(click)
+    await prompt["view"].confirm_button.callback(click)
     assert click.response.sent[0]["embed"].title == "🔒 Not allowed"
     click.edit_original_response.assert_not_called()
     assert await enabled_ids(handler) == ["323"]
 
 
-# ---------------------------------------------------------------- /gift roster
+# ----------------------------------------------------------- /giftadmin roster
 
 
 @pytest.mark.asyncio
-async def test_roster_toggle_is_limited_to_owners_and_managers(db):
+async def test_roster_is_for_managers_who_switch_any_account_of_their_kingdom(db):
     handler = make_handler(db)
     await register(handler, GUILD, MEMBER, "401")
     await register(handler, GUILD, OTHER_MEMBER, "402")
     await register(handler, OTHER_GUILD, OTHER_MEMBER, "999")
 
-    action = interaction(MEMBER)
-    await handler._handle_list_players_slash(action)
-    view = action.followup.sent[0]["view"]
-    assert isinstance(view, PlayerListPaginationView)
-    assert [e.player_id for e in view.roster] == ["401", "402"]  # this server's kingdom only
-    assert view.health_button not in view.children
-    assert [o.value for o in view.status_select.options] == ["all", "enabled", "disabled"]
-
-    assert view.selected_player.player_id == "401" and not view.toggle_button.disabled
-    await view.toggle_button.callback(interaction(MEMBER))
-    assert view.selected_player.enabled is False and view.toggle_button.label == "Enable"
-    assert await enabled_ids(handler) == ["402", "999"]
-
-    view.player_select._values = ["1"]
-    await view.player_select.callback(interaction(MEMBER))
-    assert view.selected_player.player_id == "402" and view.toggle_button.disabled
-    denied = interaction(MEMBER)
-    await view.toggle_button.callback(denied)
-    assert denied.response.sent[0]["embed"].title == "🔒 Not allowed"
-    assert view.selected_player.enabled is True
-    assert await enabled_ids(handler) == ["402", "999"]
+    # Members manage their own accounts under "My accounts"; the roster is the managers' tool.
+    member = interaction(MEMBER)
+    await handler._handle_list_players_slash(member)
+    assert member.response.sent[0]["embed"].title == "🔒 Not allowed" and member.followup.sent == []
 
     manager = interaction(MANAGER, manage=True)
     await handler._handle_list_players_slash(manager)
-    manager_view = manager.followup.sent[0]["view"]
-    assert manager_view.health_button in manager_view.children
-    assert [e.player_id for e in manager_view.roster] == ["402", "401"]  # enabled first
-    assert manager_view.selected_player.player_id == "402" and not manager_view.toggle_button.disabled
-    await manager_view.toggle_button.callback(interaction(MANAGER, manage=True))
-    assert await enabled_ids(handler) == ["999"]
+    reply = manager.followup.sent[0]
+    view = reply["view"]
+    assert reply["ephemeral"] is True and isinstance(view, PlayerListPaginationView)
+    assert [e.player_id for e in view.roster] == ["401", "402"]  # this server's kingdom only
+    assert view.health_button in view.children and view.remove_button in view.children
+    assert [o.value for o in view.status_select.options] == ["all", "enabled", "disabled"]
+
+    assert view.selected_player.player_id == "401" and not view.toggle_button.disabled
+    await view.toggle_button.callback(interaction(MANAGER, manage=True))
+    assert view.selected_player.enabled is False and view.toggle_button.label == "Enable"
+    assert await enabled_ids(handler) == ["402", "999"]
+
+    # A click by somebody who may not manage the account changes nothing.
+    denied = interaction(OTHER_MEMBER)
+    await view.toggle_button.callback(denied)
+    assert denied.response.sent[0]["embed"].title == "🔒 Not allowed"
+    assert await enabled_ids(handler) == ["402", "999"]
+
+    # Disabled accounts sort last when the roster is opened again.
+    again = interaction(MANAGER, manage=True)
+    await handler._handle_list_players_slash(again)
+    assert [e.player_id for e in again.followup.sent[0]["view"].roster] == ["402", "401"]
 
 
 @pytest.mark.asyncio
@@ -512,7 +522,7 @@ async def test_roster_lists_the_accounts_of_the_servers_kingdom_whoever_added_th
     await register(handler, OTHER_GUILD, OTHER_MEMBER, "414")
 
     async def roster_of(guild_id):
-        action = interaction(OTHER_MEMBER, guild_id=guild_id)
+        action = interaction(MANAGER, guild_id=guild_id, manage=True)
         await handler._handle_list_players_slash(action)
         reply = action.followup.sent[0]
         assert reply["ephemeral"] is True
@@ -538,25 +548,20 @@ async def test_roster_of_a_server_without_a_kingdom_asks_which_kingdom(db):
     handler = make_handler(db)
     await register(handler, GUILD, MEMBER, "421")
 
-    member = interaction(MEMBER, guild_id=NO_KINGDOM_GUILD)
-    await handler._handle_list_players_slash(member)
-    reply = member.followup.sent[0]
-    assert reply["embed"].title == "📋 Which Kingdom?"
-    assert reply["ephemeral"] is True and "view" not in reply
-    assert "Ask a server manager to set it in `/settings`." in reply["embed"].description
-    assert "`/gift accounts`" in reply["embed"].description  # where the member's own accounts are
-
     manager = interaction(MANAGER, guild_id=NO_KINGDOM_GUILD, manage=True)
     await handler._handle_list_players_slash(manager)
-    description = manager.followup.sent[0]["embed"].description
-    assert manager.followup.sent[0]["embed"].title == "📋 Which Kingdom?"
-    assert "Set it in `/settings`." in description and "Ask a server manager" not in description
+    reply = manager.followup.sent[0]
+    assert reply["embed"].title == "📋 Which Kingdom?"
+    assert reply["ephemeral"] is True and "view" not in reply
+    assert "Set it in `/settings`." in reply["embed"].description
+    assert "**My accounts** in `/gift`" in reply["embed"].description  # where one's own accounts are
 
     # A kingdom nobody registered an account of is a different, empty state.
-    empty = interaction(MEMBER, guild_id=OTHER_GUILD)
+    empty = interaction(MANAGER, guild_id=OTHER_GUILD, manage=True)
     await handler._handle_list_players_slash(empty)
     assert empty.followup.sent[0]["embed"].title == "📋 No Players Yet"
     assert "kingdom `795`" in empty.followup.sent[0]["embed"].description
+    assert "`/giftadmin import`" in empty.followup.sent[0]["embed"].description
 
 
 @pytest.mark.asyncio
@@ -565,11 +570,14 @@ async def test_roster_kingdom_parameter_is_for_bot_operators_only(db):
     await register(handler, GUILD, MEMBER, "431")
     await register(handler, OTHER_GUILD, OTHER_MEMBER, "432")
 
-    for action in (interaction(MEMBER), interaction(MANAGER, manage=True)):
+    for action, reason in (
+        (interaction(MEMBER), "manage the gift-code roster"),
+        (interaction(MANAGER, manage=True), "Only bot operators"),
+    ):
         await handler._handle_list_players_slash(action, kingdom=OTHER_KINGDOM)
         denial = action.response.sent[0]
         assert denial["embed"].title == "🔒 Not allowed" and denial["ephemeral"] is True
-        assert "Only bot operators" in denial["embed"].description
+        assert reason in denial["embed"].description
         assert action.followup.sent == []
 
     # The operator is in a server of kingdom 830 and holds no Manage Server there.
@@ -598,7 +606,7 @@ async def test_profiles_need_no_assignment_and_the_status_filter_narrows_the_ros
         ])
     handler = make_handler(db)
 
-    action = interaction(OTHER_MEMBER)
+    action = interaction(MANAGER, manage=True)
     await handler._handle_list_players_slash(action)
     view = action.followup.sent[0]["view"]
     assert [e.player_id for e in view.roster] == ["501", "502"]
@@ -606,9 +614,9 @@ async def test_profiles_need_no_assignment_and_the_status_filter_narrows_the_ros
     assert [o.value for o in view.status_select.options] == ["all", "enabled", "disabled"]
 
     view.status_select._values = ["disabled"]
-    await view.status_select.callback(interaction(OTHER_MEMBER))
+    await view.status_select.callback(interaction(MANAGER, manage=True))
     assert [e.player_id for e in view.filtered_players] == ["502"]
-    assert view.selected_player.player_id == "502" and view.toggle_button.disabled  # not this member's account
+    assert view.selected_player.player_id == "502" and view.toggle_button.label == "Enable"
     assert "**1 matches** · 2 total" in view.build_embed().description
     assert "Filter: **Disabled**" in view.build_embed().description
 
@@ -657,97 +665,88 @@ async def test_roster_health_reports_reach_and_disables_failing_players(db):
     assert member_click.response.sent[0]["embed"].title == "🔒 Not allowed"
 
 
-# --------------------------------------------------------------------- /giftadmin redeem
+# ------------------------------------------------- entering a code the bot knows
 
 
 @pytest.mark.asyncio
-async def test_manual_redeem_waits_for_a_running_auto_job_on_the_same_code(db):
+async def test_entering_a_code_that_is_being_redeemed_right_now_says_so(db):
     handler = make_handler(db)
     await register(handler, GUILD, MEMBER, "701")
     handler._jobs.claim(RedemptionJob(gift_code="SUMMER", kind="auto"))
 
     action = interaction(MANAGER, manage=True)
-    await handler._handle_redeem_gift_code_slash(action, "summer")
+    await handler._handle_enter_code(action, "summer")
 
     embed = action.followup.sent[0]["embed"]
-    assert embed.title == "⏳ Redemption Job Already Running"
-    assert "Auto-redemption is already processing" in embed.description
+    assert embed.title == "⏳ Already in Progress"
+    assert "being redeemed for every account" in embed.description
     assert handler._gift_code_service.calls == []
 
 
 @pytest.mark.asyncio
-async def test_redeem_covers_every_enabled_account_whichever_server_starts_it(db, monkeypatch):
-    handler = make_handler(db)
-    await register(handler, GUILD, MEMBER, "801")
-    await register(handler, OTHER_GUILD, OTHER_MEMBER, "802", "804")
-    await register(handler, GUILD, MEMBER, "803", kingdom=None)
-    await handler._player_registry_service.set_players_enabled(["804"], False)
-    captured = []
-
-    async def fake_job(**kwargs):
-        captured.append(kwargs)
-
-    monkeypatch.setattr(handler, "_run_manual_redemption_job", fake_job)
-
-    member = interaction(MEMBER)
-    await handler._handle_redeem_gift_code_slash(member, "CODE")
-    assert member.followup.sent[0]["embed"].title == "🔒 Not allowed"
-    assert captured == []
-
-    # A manager's run is not narrowed to the kingdom of the server it is started in.
-    manager = interaction(MANAGER, manage=True)
-    await handler._handle_redeem_gift_code_slash(manager, "CODE")
-    await handler._jobs.get("CODE").task
-    assert [p.player_id for p in captured[0]["registered_players"]] == ["801", "802", "803"]
-    assert captured[0]["job"].total == 3 and captured[0]["job"].guild_id == GUILD
-    assert "all 3 enabled players on the list" in manager.followup.sent[0]["embed"].description
-
-    # Neither a server without a kingdom nor a bot operator gets a different run.
-    unset = interaction(MANAGER, guild_id=NO_KINGDOM_GUILD, manage=True)
-    await handler._handle_redeem_gift_code_slash(unset, "SECOND")
-    await handler._jobs.get("SECOND").task
-    operator = interaction(OPERATOR, guild_id=OTHER_GUILD)
-    await handler._handle_redeem_gift_code_slash(operator, "THIRD")
-    await handler._jobs.get("THIRD").task
-    for run in captured[1:]:
-        assert [p.player_id for p in run["registered_players"]] == ["801", "802", "803"]
-    assert [run["guild_id"] for run in captured] == [GUILD, NO_KINGDOM_GUILD, OTHER_GUILD]
-
-
-@pytest.mark.asyncio
-async def test_cancel_button_accepts_requester_and_managers_only(db):
-    handler = make_handler(db)
-    job = RedemptionJob(gift_code="CODE", kind="manual", guild_id=GUILD, requester_id=MEMBER)
-    from handlers.gift_code_handler import RedemptionProgressView
-
-    view = RedemptionProgressView(handler, job)
-    stranger = interaction(OTHER_MEMBER)
-    assert not await view.interaction_check(stranger)
-    assert stranger.response.sent[0]["embed"].title == "🔒 Not allowed"
-    assert await view.interaction_check(interaction(MANAGER, manage=True))
-
-    click = interaction(MEMBER)
-    assert await view.interaction_check(click)
-    await view.cancel_button.callback(click)
-    assert job.stop_requested and job.stopped_by == MEMBER
-    assert view.cancel_button.disabled
-
-
-@pytest.mark.asyncio
-async def test_cancelled_manual_job_posts_a_cancelled_summary_and_a_ping(db):
-    handler = make_handler(db)
-    channel = Channel()
-    job = RedemptionJob(gift_code="CODE", kind="manual", guild_id=GUILD, requester_id=MEMBER, total=3)
-    job.request_stop(user_id=MANAGER)
-    await handler._send_redemption_results_to_channel(
-        channel, MEMBER, "CODE", [{"player_id": "1", "status_category": "success"}], total=3, job=job,
+async def test_a_manager_runs_a_known_code_again_for_the_accounts_without_it(db, gift_cards):
+    channel, other_channel = Channel(789, GUILD), Channel(790, OTHER_GUILD)
+    handler = make_handler(
+        db,
+        guild_settings=[gift_server(GUILD, 789), gift_server(OTHER_GUILD, 790)],
+        channels={789: channel, 790: other_channel},
     )
-    summary, ping = channel.sent
-    assert summary["embed"].title == "⏹️ Redemption Cancelled"
-    assert "**Processed:** 1/3" in summary["embed"].description
-    assert f"Cancelled by <@{MANAGER}>. 2 player(s) were not processed" in summary["embed"].fields[0].value
-    assert ping["content"].startswith(f"<@{MEMBER}> redemption cancelled for `CODE`")
-    assert "https://discord.test/m" in ping["content"]
+    handler._ensure_pending_worker = lambda: None
+    await register(handler, GUILD, MEMBER, "801", "803")
+    await register(handler, OTHER_GUILD, OTHER_MEMBER, "802", "804")
+    await handler._player_registry_service.set_players_enabled(["804"], False)
+    add_code(db, 4, "CODE", status="completed")
+    await handler._gift_code_service.mark_gift_code_completed(4)
+    with Session(db.engine) as session, session.begin():
+        session.add(GiftCodeRedemption(user_id=BOT_ID, player_id="801", gift_code="CODE", success=True))
+        # A failure that looked final when the code first ran.
+        session.add(GiftCodeRedemption(user_id=BOT_ID, player_id="802", gift_code="CODE", success=False,
+                                       error_code="CASTLE_LEVEL_TOO_LOW"))
+
+    # A member is told the bot has the code; nothing is queued.
+    member = interaction(MEMBER)
+    await handler._handle_enter_code(member, "CODE")
+    assert member.followup.sent[0]["embed"].title == "ℹ️ The Bot Already Has This Code"
+    assert "**My accounts**" in member.followup.sent[0]["embed"].description
+    assert pending_codes(db) == []
+
+    manager = interaction(MANAGER, manage=True)
+    await handler._handle_enter_code(manager, "CODE")
+    reply = manager.followup.sent[0]
+    assert reply["ephemeral"] is True and reply["embed"].title == "🎁 Running the Code Again"
+    assert "the 2 of 3 enabled account(s)" in reply["embed"].description
+    assert "<#789>" in reply["embed"].description
+    assert pending_codes(db) == ["CODE"]
+
+    await handler._process_pending_codes()
+
+    # Only accounts without the code are tried, the earlier "final" failure included;
+    # the run is not narrowed to the kingdom of the server it was started from.
+    assert handler._gift_code_service.calls == [(802, "CODE"), (803, "CODE")]
+    assert pending_codes(db) == []
+    # The manager's server gets a fresh summary; other servers hear nothing new.
+    assert len(channel.sent) == 1 and other_channel.sent == []
+    assert "Run again by a server manager" in channel.sent[0]["embed"].description
+    assert handler._rerun_guilds == {} and handler._retry_failed == set()
+
+    done = interaction(MANAGER, manage=True)
+    await handler._handle_enter_code(done, "CODE")
+    assert done.followup.sent[0]["embed"].title == "✅ Everyone Already Has This Code"
+    assert pending_codes(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_manager_without_a_gift_channel_is_told_where_results_are(db):
+    handler = make_handler(db)
+    handler._ensure_pending_worker = lambda: None
+    await register(handler, GUILD, MEMBER, "811")
+    add_code(db, 5, "CODE", status="completed")
+    await handler._gift_code_service.mark_gift_code_completed(5)
+
+    manager = interaction(MANAGER, manage=True)
+    await handler._handle_enter_code(manager, "CODE")
+    description = manager.followup.sent[0]["embed"].description
+    assert "no gift-code channel" in description and "`/settings`" in description
 
 
 # --------------------------------------------------------------- auto-redemption
@@ -959,38 +958,16 @@ def test_bounded_join_marks_the_rest():
 
 
 @pytest.mark.asyncio
-async def test_manual_redeem_rechecks_the_guard_after_loading_targets(db, monkeypatch):
-    """The auto poller can claim the code while /giftadmin redeem awaits the database."""
+async def test_entering_a_code_is_refused_while_shutting_down(db):
     handler = make_handler(db)
-    await register(handler, GUILD, MEMBER, "711")
-    original_targets = handler._player_registry_service.get_auto_redeem_targets
-
-    async def targets_while_auto_claims(*args, **kwargs):
-        handler._jobs.claim(RedemptionJob(gift_code="RACE", kind="auto"))
-        return await original_targets(*args, **kwargs)
-
-    monkeypatch.setattr(handler._player_registry_service, "get_auto_redeem_targets", targets_while_auto_claims)
-    started = []
-    monkeypatch.setattr(handler, "_run_manual_redemption_job", lambda **kwargs: started.append(kwargs))
-
-    action = interaction(MANAGER, manage=True)
-    await handler._handle_redeem_gift_code_slash(action, "RACE")
-
-    assert action.followup.sent[-1]["embed"].title == "⏳ Redemption Job Already Running"
-    assert started == []
-    assert handler._jobs.get("RACE").kind == "auto"
-
-
-@pytest.mark.asyncio
-async def test_redeem_is_refused_while_shutting_down(db):
-    handler = make_handler(db)
+    await register(handler, GUILD, MEMBER, "921")
     handler._closing = True
+
     action = interaction(MANAGER, manage=True)
+    await handler._handle_enter_code(action, "CODE")
 
-    await handler._handle_redeem_gift_code_slash(action, "CODE")
-
-    assert "restarting" in action.followup.sent[0]["content"]
-    assert handler._jobs.get("CODE") is None
+    assert action.followup.sent[0]["embed"].title == "⏳ Restarting"
+    assert handler._gift_code_service.calls == [] and handler._jobs.active_jobs() == []
 
 
 @pytest.mark.asyncio
@@ -1060,3 +1037,129 @@ async def test_retry_pass_edits_the_first_announcement_instead_of_posting_again(
     assert final.description == "Auto-redemption finished for kingdom 830."
     assert gift_cards[-1].stats.counts["success"] == 2 and gift_cards[-1].title == "Gift code redeemed"
     assert handler._auto_announcements == {}
+
+
+# ------------------------------------------------- active codes for new accounts
+
+
+def announcing_channel(channel_id, guild_id):
+    """A channel whose announcement can be found again by its message ID, like after a restart."""
+    channel = Channel(channel_id, guild_id)
+    posted = SimpleNamespace(id=555, edit=AsyncMock())
+
+    async def send(**kwargs):
+        channel.sent.append(kwargs)
+        return posted
+
+    channel.send = send
+    channel.get_partial_message = lambda message_id: posted
+    channel.posted = posted
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_a_new_account_gets_the_active_codes_and_no_new_announcement(db, gift_cards):
+    channel, other_channel = announcing_channel(789, GUILD), announcing_channel(790, OTHER_GUILD)
+    handler = make_handler(
+        db,
+        guild_settings=[gift_server(GUILD, 789), gift_server(OTHER_GUILD, 790)],
+        channels={789: channel, 790: other_channel},
+    )
+    handler._ensure_pending_worker = lambda: None
+    await register(handler, GUILD, MEMBER, "951")
+    add_code(db, 9, "LIVE")
+    add_code(db, 10, "GONE", status="completed")  # finished and no longer offered
+    await handler._process_pending_codes()
+    assert handler._gift_code_service.calls == [(951, "LIVE")]
+    assert len(channel.sent) == 1 and other_channel.sent == []
+
+    # Somebody signs up while LIVE still works.
+    handler._gift_code_service.active = ["LIVE", "UNSEEN"]
+    newcomer = interaction(OTHER_MEMBER, guild_id=OTHER_GUILD)
+    await handler._handle_add_player_slash(newcomer, "952")
+    assert "active right now are being redeemed" in newcomer.followup.sent[0]["embed"].description
+    # Only the active code the bot knows is queued again.
+    assert pending_codes(db) == ["LIVE"]
+
+    await handler._process_pending_codes()
+
+    # One request: the new account. Everyone with a stored result is skipped.
+    assert handler._gift_code_service.calls == [(951, "LIVE"), (952, "LIVE")]
+    assert pending_codes(db) == []
+    # The summary that exists is brought up to date; nothing new is posted anywhere.
+    assert len(channel.sent) == 1 and other_channel.sent == []
+    channel.posted.edit.assert_awaited_once()
+    assert gift_cards[-1].stats.counts["success"] == 2
+
+
+@pytest.mark.asyncio
+async def test_accounts_added_while_a_code_is_running_get_another_pass(db, gift_cards):
+    handler = make_handler(db)
+    handler._ensure_pending_worker = lambda: None
+    handler._gift_code_service.active = ["LIVE"]
+    await register(handler, GUILD, MEMBER, "961")
+    add_code(db, 11, "LIVE")
+    queued = []
+
+    async def added_mid_run():
+        # The run already took its list of accounts when this one is registered.
+        await register(handler, GUILD, OTHER_MEMBER, "962")
+        queued.append(await handler._catch_up_new_accounts())
+        return {"success": True, "message": "OK"}
+
+    handler._gift_code_service.responses[961] = added_mid_run
+
+    await handler._process_pending_codes()
+    assert queued == [1]
+    assert handler._gift_code_service.calls == [(961, "LIVE")]
+    assert pending_codes(db) == ["LIVE"] and handler._reopen_after_run == set()
+
+    await handler._process_pending_codes()
+    assert handler._gift_code_service.calls == [(961, "LIVE"), (962, "LIVE")]
+    assert pending_codes(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_re_run_leaves_the_summary_alone_when_the_code_stopped_working(db, gift_cards):
+    channel = announcing_channel(789, GUILD)
+    handler = make_handler(db, guild_settings=[gift_server(GUILD, 789)], channels={789: channel})
+    handler._ensure_pending_worker = lambda: None
+    handler._gift_code_service.active = ["LIMITED"]
+    await register(handler, GUILD, MEMBER, "971")
+    add_code(db, 12, "LIMITED")
+    await handler._process_pending_codes()
+    assert len(channel.sent) == 1
+
+    # The claim limit was reached before the next member signed up.
+    handler._gift_code_service.responses[972] = {
+        "success": False, "error_code": "GIFT_CODE_CLAIM_LIMIT_REACHED", "message": "Gift code claim limit has been reached.",
+    }
+    await register(handler, GUILD, OTHER_MEMBER, "972")
+    assert await handler._catch_up_new_accounts() == 1
+    await handler._process_pending_codes()
+
+    assert pending_codes(db) == []
+    channel.posted.edit.assert_not_awaited()
+    assert len(channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_queued_re_run_whose_code_expired_is_closed_without_touching_its_summary(db, gift_cards):
+    channel = announcing_channel(789, GUILD)
+    handler = make_handler(db, guild_settings=[gift_server(GUILD, 789)], channels={789: channel})
+    handler._ensure_pending_worker = lambda: None
+    handler._gift_code_service.active = ["SHORT"]
+    await register(handler, GUILD, MEMBER, "981")
+    add_code(db, 13, "SHORT")
+    await handler._process_pending_codes()
+    await register(handler, GUILD, OTHER_MEMBER, "982")
+    assert await handler._catch_up_new_accounts() == 1
+
+    with Session(db.engine) as session, session.begin():
+        session.get(GiftCode, 13).expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await handler._process_pending_codes()
+
+    assert pending_codes(db) == []
+    assert handler._gift_code_service.calls == [(981, "SHORT")]
+    assert len(channel.sent) == 1
+    channel.posted.edit.assert_not_awaited()

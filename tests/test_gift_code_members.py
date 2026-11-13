@@ -380,7 +380,7 @@ async def test_a_member_submitted_code_is_checked_with_their_account_and_queued(
     add_account(db, "702", MEMBER)
 
     action = interaction(MEMBER)
-    await handler._handle_submit_code(action, "  FOUND2026 ")
+    await handler._handle_enter_code(action, "  FOUND2026 ")
 
     assert action.response.deferred["ephemeral"] is True
     embed = action.followup.sent[0]["embed"]
@@ -405,7 +405,7 @@ async def test_a_member_submitted_code_is_checked_with_their_account_and_queued(
     assert is_new is False and row.id == stored.id
 
     again = interaction(OTHER_MEMBER)
-    await handler._handle_submit_code(again, "FOUND2026")
+    await handler._handle_enter_code(again, "FOUND2026")
     assert again.followup.sent[0]["embed"].title == "ℹ️ The Bot Already Has This Code"
 
 
@@ -417,7 +417,7 @@ async def test_rejected_unverifiable_and_rate_limited_submissions_are_not_queued
     await register(handler, GUILD, MEMBER, "711")
 
     bad_format = interaction(MEMBER)
-    await handler._handle_submit_code(bad_format, "two words")
+    await handler._handle_enter_code(bad_format, "two words")
     assert bad_format.followup.sent[0]["embed"].title == "❌ That Does Not Look Like a Gift Code"
     assert handler._gift_code_service.calls == []
 
@@ -426,24 +426,24 @@ async def test_rejected_unverifiable_and_rate_limited_submissions_are_not_queued
         "global_code_error": True,
     }
     unknown = interaction(MEMBER)
-    await handler._handle_submit_code(unknown, "NOPE")
+    await handler._handle_enter_code(unknown, "NOPE")
     assert unknown.followup.sent[0]["embed"].title == "❌ The Code Does Not Work"
 
     # One submission per minute per member.
     hurried = interaction(MEMBER)
-    await handler._handle_submit_code(hurried, "NOPE2")
+    await handler._handle_enter_code(hurried, "NOPE2")
     assert hurried.followup.sent[0]["embed"].title == "⏳ Slow Down"
 
     responses[711] = OUTAGE
     handler._submit_cooldowns.clear()
     down = interaction(MEMBER)
-    await handler._handle_submit_code(down, "LATER")
+    await handler._handle_enter_code(down, "LATER")
     assert down.followup.sent[0]["embed"].title == "⚠️ Could Not Check the Code"
 
     responses[711] = MISMATCH
     handler._submit_cooldowns.clear()
     broken = interaction(MEMBER)
-    await handler._handle_submit_code(broken, "MAYBE")
+    await handler._handle_enter_code(broken, "MAYBE")
     assert "not confirmed" in broken.followup.sent[0]["embed"].description
 
     # A requirement the test account does not meet still proves the code exists.
@@ -453,7 +453,7 @@ async def test_rejected_unverifiable_and_rate_limited_submissions_are_not_queued
     }
     handler._submit_cooldowns.clear()
     vip = interaction(MEMBER)
-    await handler._handle_submit_code(vip, "VIPONLY")
+    await handler._handle_enter_code(vip, "VIPONLY")
     assert vip.followup.sent[0]["embed"].title == "✅ Code Accepted — Thank You!"
     assert pending_codes(db) == ["VIPONLY"]
     assert handler._jobs.active_jobs() == []
@@ -487,7 +487,10 @@ async def test_my_accounts_lists_own_accounts_of_every_kingdom_with_recent_resul
     assert action.followup.sent[0]["ephemeral"] is True
     embed = action.followup.sent[0]["embed"]
     assert "2 account(s) on the gift-code list" in embed.description
-    assert [f.name for f in embed.fields] == ["Gov 601", "Gov 602"]
+    # The account the buttons act on is marked.
+    assert [f.name for f in embed.fields] == ["▸ Gov 601", "Gov 602"]
+    view = action.followup.sent[0]["view"]
+    assert [item.label for item in view.children if hasattr(item, "label")] == ["Add account", "Pause", "Remove"]
     first, second = embed.fields
     assert "`601` · Kingdom 830 · ✅ receiving codes" in first.value
     assert "`NEW` ✅ redeemed" in first.value and "`OLD` ☑️ already claimed" in first.value
@@ -537,7 +540,7 @@ async def test_gift_panel_is_posted_by_managers_and_claims_an_unset_channel(db):
 async def test_panel_buttons_open_the_member_workflows_and_refuse_banned_users(db):  # noqa: F811
     handler = make_handler(db)
     handler._handle_my_accounts = AsyncMock()
-    handler._handle_list_gift_codes_slash = AsyncMock()
+    handler._handle_active_codes = AsyncMock()
     view = GiftPanelView(handler)
     action = interaction(MEMBER)
 
@@ -545,7 +548,7 @@ async def test_panel_buttons_open_the_member_workflows_and_refuse_banned_users(d
     await view.mine_button.callback(action)
     handler._handle_my_accounts.assert_awaited_once_with(action)
     await view.codes_button.callback(action)
-    handler._handle_list_gift_codes_slash.assert_awaited_once_with(action, ephemeral=True)
+    handler._handle_active_codes.assert_awaited_once_with(action)
 
     handler._access._banned_user_ids = {MEMBER}
     banned = interaction(MEMBER)
@@ -555,17 +558,65 @@ async def test_panel_buttons_open_the_member_workflows_and_refuse_banned_users(d
 
 
 @pytest.mark.asyncio
-async def test_redeem_is_refused_where_the_bot_cannot_post_the_progress_card(db):  # noqa: F811
+async def test_gift_command_opens_the_same_panel_privately(db):  # noqa: F811
     handler = make_handler(db)
-    await register(handler, GUILD, MEMBER, "731")
-    action = interaction(MANAGER, manage=True)
-    action.channel.guild.me = SimpleNamespace(id=BOT_ID)
-    action.channel.permissions_for = lambda member: discord.Permissions(view_channel=True, send_messages=False)
+    action = interaction(MEMBER)
+    await handler._handle_gift(action)
+    panel = action.response.sent[0]
+    assert panel["ephemeral"] is True and panel["embed"].title == "🎁 Gift codes"
+    assert isinstance(panel["view"], GiftPanelView)
+    assert action.channel.sent == []  # nothing is posted in the channel
 
-    await handler._handle_redeem_gift_code_slash(action, "CODE")
+    outside = interaction(MEMBER, guild_id=None)
+    await handler._handle_gift(outside)
+    assert outside.response.sent[0]["embed"].title == "🔒 Not allowed"
 
-    assert action.followup.sent[0]["embed"].title == "❌ Channel Unavailable"
-    assert handler._jobs.get("CODE") is None and handler._gift_code_service.calls == []
+
+@pytest.mark.asyncio
+async def test_active_codes_are_a_private_copyable_list_without_controls(db):  # noqa: F811
+    handler = make_handler(db)
+    handler._gift_code_service.get_available_gift_codes = AsyncMock(return_value={"success": True, "data": [
+        {"code": "ALPHA", "expiresAt": "2099-01-01T00:00:00Z"}, {"code": "BE`TA"}, {"id": 3},
+    ]})
+    for action in (interaction(MEMBER), interaction(MANAGER, manage=True)):
+        await handler._handle_active_codes(action)
+        reply = action.followup.sent[0]
+        assert action.response.deferred["ephemeral"] is True and reply["ephemeral"] is True
+        assert reply["content"] == "`ALPHA`\n`BETA`"
+        assert "view" not in reply  # managers enter a code to run it again; there is no button here
+        assert [f.name for f in reply["embed"].fields] == ["ALPHA", "BE`TA"]
+        assert reply["embed"].fields[0].value.startswith("Expires <t:")
+        assert "centurygame.com" in reply["embed"].description
+
+    handler._gift_code_service.get_available_gift_codes = AsyncMock(return_value={"success": True, "data": []})
+    empty = interaction(MEMBER)
+    await handler._handle_active_codes(empty)
+    assert empty.followup.sent[0]["embed"].title == "📋 No Active Gift Codes"
+
+
+@pytest.mark.asyncio
+async def test_an_entered_code_is_checked_with_up_to_three_accounts(db):  # noqa: F811
+    invalid = {"success": False, "error_code": "INVALID_PLAYER_ID", "message": "Player not found."}
+    handler = make_handler(db, responses={741: invalid, 742: invalid})
+    handler._ensure_pending_worker = lambda: None
+    await register(handler, GUILD, MANAGER, "741", "742", "743", "744")
+
+    # Two test accounts are broken; the third proves the code.
+    action = interaction(MEMBER)
+    await handler._handle_enter_code(action, "TRIPLE")
+    assert action.followup.sent[0]["embed"].title == "✅ Code Accepted — Thank You!"
+    assert handler._gift_code_service.calls == [(741, "TRIPLE"), (742, "TRIPLE"), (743, "TRIPLE")]
+    assert pending_codes(db) == ["TRIPLE"]
+
+    # When none of the three can use it, the code is not queued and nobody else is tried.
+    handler._gift_code_service.responses[743] = invalid
+    handler._gift_code_service.calls.clear()
+    unsure = interaction(OTHER_MEMBER)
+    await handler._handle_enter_code(unsure, "UNSURE")
+    embed = unsure.followup.sent[0]["embed"]
+    assert embed.title == "⚠️ Could Not Check the Code" and "was not queued" in embed.description
+    assert len(handler._gift_code_service.calls) == 3
+    assert pending_codes(db) == ["TRIPLE"]
 
 
 # ------------------------------------------------------- second review fixes
@@ -634,23 +685,6 @@ def test_an_interrupted_pass_never_reads_as_finished():
     assert partly.title == "🎁 New Gift Code Redeemed!" and "continues automatically" in partly.description
     done = handler._build_auto_redemption_embed("CODE", 0, [], scope="kingdom 830", final=True)
     assert done.title == "ℹ️ Gift Code Finished Without New Rewards"
-
-
-@pytest.mark.asyncio
-async def test_details_of_a_run_are_for_the_requester_managers_and_operators(db):  # noqa: F811
-    from handlers.gift_code_handler import RedemptionResultsView
-
-    handler = make_handler(db)
-    embed = discord.Embed(title="Summary")
-    issues = [{"player_id": "1", "status_category": "invalid_id", "message": "x"}]
-    # Every run covers the whole list now, so there is one rule for all of them.
-    view = RedemptionResultsView(embed, issues, MEMBER, access_policy=handler._access, timeout=60)
-    assert await view.interaction_check(interaction(MEMBER))
-    assert await view.interaction_check(interaction(MANAGER, manage=True))
-    assert await view.interaction_check(interaction(OPERATOR))
-    stranger = interaction(OTHER_MEMBER)
-    assert not await view.interaction_check(stranger)
-    assert stranger.response.sent[0]["ephemeral"] is True
 
 
 def test_submission_budgets_are_per_member_and_per_server():

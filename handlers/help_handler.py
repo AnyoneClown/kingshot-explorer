@@ -1,190 +1,73 @@
-"""A private starting point for the bot's available commands."""
+"""``/help``: one private screen of what the bot does, with clickable commands.
 
-import inspect
-from functools import partial
+The commands are Discord command mentions (``</gift:123>``): tapping one opens the
+real command with Discord's own option hints, validation and autocomplete, so the
+help screen needs no buttons or forms of its own.
+"""
+
+import asyncio
+import logging
+import time
+from typing import Iterable
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from handlers.permissions import AccessPolicy, interaction_guild_id
-from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
+from handlers.permissions import AccessPolicy
+from handlers.ui import EmbedColors
 
+logger = logging.getLogger(__name__)
 
-# Actions are (command, button label, example); a command inside a group is named
-# with a space, like Discord shows it ("gift codes").
-GROUPS = {
-    "Players": (
-        "Look up a Governor ID or internal player UID, browse a kingdom's Mystic Trial leaderboard, "
-        "or open the game's rankings (power, kills, alliances, trials) for a kingdom or all kingdoms.",
+# (section title, manager-only, ((command, what it is for), ...)); a command inside a
+# group is named with a space, like Discord shows it ("giftadmin panel").
+SECTIONS = (
+    (
+        "🎁 Gift codes",
+        False,
         (
-            ("player", "View player", "/player player_id:123456"),
-            ("scout", "Scout kingdom", "/scout kingdom:830 limit:5"),
-            ("leaderboard", "Leaderboards", "/leaderboard board:Personal Power kingdom:830"),
-            ("gift roster", "Server roster", "/gift roster"),
+            (
+                "gift",
+                "add your Governor ID and new codes are redeemed for you automatically; "
+                "see your accounts, copy the active codes, send in a code the bot has not found yet",
+            ),
         ),
     ),
-    "KVK": (
-        "Browse match history, compare two kingdoms, or build a prep dossier before a KvK.",
+    (
+        "🔎 Players and kingdoms",
+        False,
         (
-            ("kvk history", "Kingdom history", "/kvk history kingdom:830"),
-            ("kvk compare", "Compare kingdoms", "/kvk compare kingdom_a:830 kingdom_b:831"),
-            ("kvk prep", "Prep dossier", "/kvk prep kingdom_a:830 kingdom_b:831"),
+            ("player", "a player's profile: stats, heroes and governor gear"),
+            ("scout", "the top 5 Mystic Trial players of a kingdom"),
+            ("leaderboard", "rankings: power, kills, alliances, trials"),
+            ("kvk", "a kingdom's KvK history, or two kingdoms compared"),
+            ("calendar", "the kingdom's events today, this week and next week"),
         ),
     ),
-    "Gifts": (
-        "Add your Governor ID with /gift add to receive new codes automatically, check your "
-        "accounts with /gift accounts, and send in a code the bot has not found yet with /gift submit. "
-        "Server managers can post a sign-up panel with buttons, import alliances and redeem a code "
-        "for everyone on the list with /giftadmin. The list is shared by all servers; /gift roster "
-        "shows the players of this server's kingdom.",
+    (
+        "⏰ Reminders",
+        False,
+        (("reminders", "this channel's reminders; server managers create, edit and cancel them there"),),
+    ),
+    (
+        "🛠️ Server managers",
+        True,
         (
-            ("gift codes", "Available codes", "/gift codes"),
-            ("gift add", "Add players", "/gift add player_ids:123456,654321"),
-            ("gift accounts", "My accounts", "/gift accounts"),
-            ("gift submit", "Submit a code", "/gift submit code:EXAMPLE"),
-            ("gift remove", "Remove player", "/gift remove player_id:123456"),
-            ("giftadmin import", "Import alliance", "/giftadmin import kid:830"),
-            ("giftadmin redeem", "Redeem code", "/giftadmin redeem gift_code:EXAMPLE"),
-            ("giftadmin panel", "Post sign-up panel", "/giftadmin panel"),
+            ("settings", "the server's kingdom, channels, timezone, manager role and AI replies"),
+            ("giftadmin panel", "post the gift-code panel with buttons in a channel"),
+            ("giftadmin import", "add a whole alliance to the gift-code list"),
+            ("giftadmin roster", "the accounts of this server's kingdom: enable, disable, remove"),
+            ("giftadmin redeem", "hand the bot a code, or run a known code again"),
         ),
     ),
-    "Calendar": (
-        "See what is on in a kingdom today, this week and next week: KvK and transfer countdowns, "
-        "events that start or end today, and what is coming. Leave the kingdom empty to use this "
-        "server's kingdom. Server managers can have the summary posted every day at 08:00 UTC: "
-        "set the server's kingdom and pick the channel in /settings.",
-        (("calendar", "Event calendar", "/calendar kingdom:795"),),
-    ),
-    "Reminders": (
-        "Review this channel's reminders. Creating, editing, and cancelling reminders "
-        "requires a server manager; edit and cancel are buttons on the reminder list.",
-        (
-            ("reminders", "Upcoming reminders", "/reminders"),
-            ("remind", "Create reminder", "/remind"),
-        ),
-    ),
-    "Settings": (
-        "Server-wide settings: the server's kingdom, the gift-code channel, the daily event calendar, "
-        "the bot manager role and AI replies. Available to server managers.",
-        (("settings", "Open settings", "/settings"),),
-    ),
-}
-# Actions only offered to server managers (Manage Server, the manager role, or bot operators).
-ADMIN_COMMANDS = {"giftadmin redeem", "giftadmin import", "giftadmin panel", "remind", "settings"}
-# Discord allows five buttons per row; action buttons fill these rows in order.
-ACTION_ROWS = (1, 2)
-BUTTONS_PER_ROW = 5
-# Remembered manager decisions; every use re-checks first, so old entries are only memory.
-MANAGER_CACHE_SIZE = 1024
-# Friendlier form labels for slash-command parameters.
-FIELD_LABELS = {
-    "player_ids": "Player IDs",
-    "player_id": "Player ID",
-    "kid": "Kingdom ID",
-    "gift_code": "Gift code",
-    "code": "Gift code",
-    "event_id": "Event ID",
-    "kingdom": "Kingdom number",
-    "kingdom_a": "First kingdom",
-    "kingdom_b": "Second kingdom",
-}
-
-
-def field_label(name: str) -> str:
-    return FIELD_LABELS.get(name) or name.replace("_", " ").capitalize().replace(" id", " ID")
-
-
-class CommandInputModal(discord.ui.Modal):
-    """Collect the required text/number inputs for a help action."""
-
-    def __init__(self, handler, command, label: str, author_id: int):
-        super().__init__(title=label, timeout=180)
-        self.handler = handler
-        self.command = command
-        self.author_id = author_id
-        self.inputs = []
-        for parameter in command.parameters:
-            if not parameter.required:
-                continue
-            field = discord.ui.TextInput(
-                label=field_label(parameter.name)[:45],
-                placeholder=parameter.description[:100],
-                max_length=20 if parameter.type == discord.AppCommandOptionType.integer else 1000,
-            )
-            self.inputs.append((parameter, field))
-            self.add_item(field)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Open your own /help to use this form.", ephemeral=True)
-            return
-        values = {}
-        for parameter, field in self.inputs:
-            label = field_label(parameter.name)
-            value = field.value.strip()
-            if not value:
-                await interaction.response.send_message(f"Enter {label.lower()}.", ephemeral=True)
-                return
-            if parameter.type == discord.AppCommandOptionType.integer:
-                try:
-                    value = int(value)
-                except ValueError:
-                    await interaction.response.send_message(
-                        f"{label} must be a whole number. Reopen the form to try again.", ephemeral=True
-                    )
-                    return
-            values[parameter.name] = value
-        await self.handler.run_command(interaction, self.command.qualified_name, values)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        await send_ui_error(interaction, error)
-
-
-class HelpView(OwnedView):
-    def __init__(self, handler, interaction: discord.Interaction):
-        super().__init__(interaction.user.id)
-        self.handler = handler
-        self.groups = handler.available_groups(interaction)
-        self.category = next(iter(self.groups))
-        self.category_select.options = [discord.SelectOption(label=name) for name in self.groups]
-        self._update_actions()
-
-    def _update_actions(self) -> None:
-        for item in list(self.children):
-            if item.row in ACTION_ROWS:
-                self.remove_item(item)
-        for option in self.category_select.options:
-            option.default = option.label == self.category
-        actions = self.groups[self.category][1][: len(ACTION_ROWS) * BUTTONS_PER_ROW]
-        for index, (name, label, _) in enumerate(actions):
-            button = discord.ui.Button(
-                label=label, style=discord.ButtonStyle.primary, row=ACTION_ROWS[index // BUTTONS_PER_ROW]
-            )
-            button.callback = partial(self.handler.open_command, name=name, label=label)
-            self.add_item(button)
-
-    def build_embed(self) -> discord.Embed:
-        description, actions = self.groups[self.category]
-        embed = build_status_embed(
-            title=f"Help · {self.category}",
-            description=description,
-            color=EmbedColors.INFO,
-            footer="Player and KVK reports are posted in this channel. Reopen /help when controls expire.",
-        )
-        for _, label, example in actions:
-            embed.add_field(name=label, value=f"`{example}`", inline=False)
-        return embed
-
-    @discord.ui.select(placeholder="Choose a feature", row=0)
-    async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.category = select.values[0]
-        self._update_actions()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Bot status", style=discord.ButtonStyle.secondary, row=3)
-    async def status_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handler.run_command(interaction, "status", {})
+    ("ℹ️ Bot", False, (("status", "is the bot healthy"),)),
+)
+# Commands that only make sense inside a server.
+GUILD_ONLY_COMMANDS = {"gift", "reminders", "settings"}
+KINGDOM_HINT = "Commands that take a kingdom use this server's kingdom when you leave it empty."
+# After a failed lookup of the command IDs, wait this long before asking Discord again.
+COMMAND_ID_RETRY_SECONDS = 600.0
+COMMAND_ID_FETCH_TIMEOUT_SECONDS = 2.0
 
 
 class HelpHandler:
@@ -197,130 +80,95 @@ class HelpHandler:
         self._bot = bot
         self._admin_user_ids = admin_user_ids if admin_user_ids is not None else set()
         self._access_policy = access_policy
-        self._manager_cache: dict[tuple[int, int | None], bool] = {}
+        # Top-level command name -> Discord command ID, for clickable mentions.
+        self._command_ids: dict[str, int] = {}
+        self._command_ids_retry_at = 0.0
 
     @property
     def _access(self) -> AccessPolicy:
         # Without an injected policy, read the admin set live so changes apply immediately.
         return self._access_policy or AccessPolicy(self._admin_user_ids)
 
-    async def refresh_access(self, interaction: discord.Interaction) -> bool:
-        """Re-evaluate (and remember) whether the user may manage the bot here."""
-        allowed = interaction.guild is not None and await self._access.can_manage(interaction)
-        key = (interaction.user.id, interaction_guild_id(interaction))
-        # Bounded: one entry per user and server would otherwise grow forever.
-        self._manager_cache.pop(key, None)
-        while len(self._manager_cache) >= MANAGER_CACHE_SIZE:
-            self._manager_cache.pop(next(iter(self._manager_cache)))
-        self._manager_cache[key] = allowed
-        return allowed
+    # ------------------------------------------------------------ command IDs
 
-    def _is_manager(self, interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            return False
-        cached = self._manager_cache.get((interaction.user.id, interaction_guild_id(interaction)))
-        if cached is not None:
-            return cached
-        return self._access.is_super_admin(interaction.user.id)
+    def remember_commands(self, synced: Iterable) -> None:
+        """Keep the IDs of the synced commands (called after ``tree.sync()``)."""
+        for command in synced or ():
+            name, command_id = getattr(command, "name", None), getattr(command, "id", None)
+            if name and command_id:
+                self._command_ids[str(name)] = int(command_id)
+
+    async def _ensure_command_ids(self) -> None:
+        """Load the command IDs when the sync did not provide them; never raises."""
+        if self._command_ids or time.monotonic() < self._command_ids_retry_at:
+            return
+        self._command_ids_retry_at = time.monotonic() + COMMAND_ID_RETRY_SECONDS
+        fetch = getattr(getattr(self._bot, "tree", None), "fetch_commands", None)
+        if not callable(fetch):
+            return
+        try:
+            # Short: /help must answer within Discord's three seconds.
+            self.remember_commands(await asyncio.wait_for(fetch(), COMMAND_ID_FETCH_TIMEOUT_SECONDS))
+        except Exception:
+            logger.info("Could not load command IDs for /help; commands are shown as text", exc_info=True)
+
+    def mention(self, name: str) -> str:
+        """A clickable mention of a command, or its name as text when the ID is unknown."""
+        command_id = self._command_ids.get(name.split()[0])
+        return f"</{name}:{command_id}>" if command_id else f"`/{name}`"
+
+    # ----------------------------------------------------------------- content
 
     def find_command(self, name: str):
-        """Resolve "gift codes" style names: a top-level command or a subcommand of a group."""
+        """Resolve "giftadmin panel" style names: a top-level command or a subcommand of a group."""
         first, *rest = name.split()
         command = self._bot.tree.get_command(first)
         for part in rest:
             command = command.get_command(part) if isinstance(command, app_commands.Group) else None
         return None if isinstance(command, app_commands.Group) else command
 
-    def register_commands(self) -> None:
-        @self._bot.tree.command(name="help", description="Browse available features and start a workflow")
-        async def help_command(interaction: discord.Interaction):
-            await self.refresh_access(interaction)
-            view = HelpView(self, interaction)
-            await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
-            view.message = await interaction.original_response()
-
-    def available_groups(self, interaction: discord.Interaction) -> dict:
-        groups = {}
-        is_admin = self._is_manager(interaction)
-        for category, (description, actions) in GROUPS.items():
-            available = tuple(
-                action for action in actions
-                if self.find_command(action[0]) is not None
-                and (action[0] not in ADMIN_COMMANDS or is_admin)
-                and (category not in {"Reminders", "Settings", "Gifts"} or interaction.guild is not None)
-            )
-            if available:
-                groups[category] = (description, available)
+    def build_embed(self, *, in_guild: bool, is_manager: bool) -> discord.Embed:
+        embed = discord.Embed(
+            title="What this bot does",
+            description="Tap a command to run it.",
+            color=EmbedColors.INFO,
+        )
+        for title, manager_only, entries in SECTIONS:
+            if manager_only and not is_manager:
+                continue
+            lines = [
+                f"{self.mention(name)} — {text}"
+                for name, text in entries
+                if self.find_command(name) is not None and (in_guild or name.split()[0] not in GUILD_ONLY_COMMANDS)
+            ]
+            if lines:
+                embed.add_field(name=title, value="\n".join(lines)[:1024], inline=False)
         if self._bot.get_command("t") is not None:
             prefix = self._bot.command_prefix
-            groups["Translation"] = (
-                "Right-click a message (long-press on mobile) → **Apps → Translate** to read it in your "
-                "Discord language; only you see the result.\n\n"
-                f"To translate for everyone, reply to a message with `{prefix}en` for English or "
-                f"`{prefix}t Spanish` for another language.\n\n"
-                "Members with the configured Translator role have their messages translated to English automatically.",
-                (),
-            )
-        return groups
-
-    def _allowed(self, interaction: discord.Interaction, name: str) -> bool:
-        return name == "status" or any(
-            action[0] == name for _, actions in self.available_groups(interaction).values() for action in actions
-        )
-
-    async def open_command(self, interaction: discord.Interaction, *, name: str, label: str) -> None:
-        await self.refresh_access(interaction)
-        if not self._allowed(interaction, name):
-            await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
-            return
-        command = self.find_command(name)
-        if name == "giftadmin import":
-            await interaction.response.send_message(
-                embed=build_status_embed(
-                    title="Import alliance",
-                    description=(
-                        "Run `/giftadmin import` in this channel. Enter the kingdom number in `kid`, "
-                        "then choose `alliance` from Discord's autocomplete list.\n\n"
-                        "The list shows the top 15 alliances by power. When a tag is unavailable, "
-                        "the alliance ID identifies the choice. Options may take a moment to load; "
-                        "you can also enter an exact 3-character tag.\n\n"
-                        "Example: open `/giftadmin import`, enter `830` for `kid`, then choose an alliance."
-                    ),
+            embed.add_field(
+                name="🌐 Translation",
+                value=(
+                    "Right-click a message (long-press on mobile) → **Apps → Translate** to read it in your "
+                    "Discord language; only you see the result.\n"
+                    f"To translate for everyone, reply to a message with `{prefix}en` for English or "
+                    f"`{prefix}t Spanish` for another language."
                 ),
-                ephemeral=True,
+                inline=False,
             )
-            return
-        if any(parameter.required for parameter in command.parameters):
-            await interaction.response.send_modal(CommandInputModal(self, command, label, interaction.user.id))
-        else:
-            # Access was just checked: a second lookup could push the response past
-            # Discord's 3-second deadline when the settings database is slow.
-            await self.run_command(interaction, name, {}, refresh=False)
+        embed.set_footer(text=KINGDOM_HINT)
+        return embed
 
-    async def run_command(
-        self, interaction: discord.Interaction, name: str, values: dict, *, refresh: bool = True
-    ) -> None:
-        command = self.find_command(name)
-        if refresh:
-            await self.refresh_access(interaction)
-        if command is None or not self._allowed(interaction, name):
-            await interaction.response.send_message("That action is not available here. Reopen /help.", ephemeral=True)
-            return
-        # Calling the callback directly skips the command's checks (cooldowns), so run
-        # them here; the callbacks themselves keep their validation and authorization.
-        try:
-            for check in getattr(command, "checks", None) or ():
-                allowed = check(interaction)
-                if inspect.isawaitable(allowed):
-                    allowed = await allowed
-                if not allowed:
-                    raise app_commands.CheckFailure()
-        except app_commands.CommandOnCooldown as error:
-            await interaction.response.send_message(
-                f"Slow down — try again in {error.retry_after:.0f}s.", ephemeral=True
-            )
-            return
-        except app_commands.CheckFailure:
-            await interaction.response.send_message("You can't use this command here.", ephemeral=True)
-            return
-        await command.callback(interaction, **values)
+    # ---------------------------------------------------------------- command
+
+    def register_commands(self) -> None:
+        @self._bot.tree.command(name="help", description="What the bot does and the commands for it")
+        async def help_command(interaction: discord.Interaction):
+            await self._handle_help(interaction)
+
+    async def _handle_help(self, interaction: discord.Interaction) -> None:
+        in_guild = interaction.guild is not None
+        is_manager = in_guild and await self._access.can_manage(interaction)
+        await self._ensure_command_ids()
+        await interaction.response.send_message(
+            embed=self.build_embed(in_guild=in_guild, is_manager=is_manager), ephemeral=True
+        )

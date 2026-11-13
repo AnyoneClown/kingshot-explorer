@@ -557,31 +557,6 @@ def test_calendar_command_explains_errors_privately():
     asyncio.run(check())
 
 
-def test_accepting_the_channel_offer_saves_the_kingdom_and_posts():
-    async def check():
-        handler, config, channel = make_handler(settings(kingdom=None))
-
-        await handler._after_channel_setup(GUILD_ID, 830)
-
-        assert (GUILD_ID, {"kingdom_id": 830}) in config.updates
-        channel.send.assert_awaited_once()
-        assert handler.service.calls == [830]
-
-    asyncio.run(check())
-
-
-def test_accepting_the_channel_offer_keeps_a_kingdom_that_is_already_set():
-    async def check():
-        handler, config, _ = make_handler(settings())
-
-        await handler._after_channel_setup(GUILD_ID, 830)
-
-        assert all("kingdom_id" not in changes for _, changes in config.updates)
-        assert handler.service.calls == [KINGDOM]
-
-    asyncio.run(check())
-
-
 # -------------------------------------------------------------- daily post
 
 
@@ -728,25 +703,19 @@ def test_daily_task_reports_whether_it_runs():
     handler.stop_daily_task()
 
 
-def test_channel_offer_goes_to_a_manager_once_per_server(monkeypatch):
-    offers = []
-
-    async def fake_offer(interaction, **kwargs):
-        offers.append((interaction.user.id, kwargs["setting"]))
-        return True
-
-    monkeypatch.setattr("handlers.calendar_handler.offer_channel_setup", fake_offer)
+def test_calendar_command_sends_no_setup_prompt_to_managers():
+    """The daily post is set up in /settings; opening a calendar offers nothing extra."""
 
     async def check():
         handler, _, _ = make_handler(settings(channel_id=None))
-        member, manager = make_interaction(user_id=1), make_interaction(user_id=2)
+        manager = make_interaction(user_id=2)
         manager.user.guild_permissions = SimpleNamespace(administrator=False, manage_guild=True)
 
-        await handler._handle_calendar(member)
-        assert offers == []
         await handler._handle_calendar(manager)
-        await handler._handle_calendar(manager)
-        assert offers == [(2, "calendar_channel_id")]
+
+        # Only the public calendar itself is sent.
+        assert manager.followup.send.await_count == 1
+        assert "view" in manager.followup.send.call_args.kwargs
 
     asyncio.run(check())
 

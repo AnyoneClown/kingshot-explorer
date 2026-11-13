@@ -27,7 +27,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from handlers.permissions import AccessPolicy, interaction_guild_id, send_denied
-from handlers.setup_prompts import bot_can_attach, offer_channel_setup
+from handlers.setup_prompts import bot_can_attach
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 from services import calendar_card_renderer as card_renderer
 from services.kingshot_calendar_service import (
@@ -590,7 +590,6 @@ class CalendarHandler:
         self._posted_on: dict[int, date] = {}
         # Last reason a server's post failed, so a broken channel is logged once.
         self._post_failures: dict[int, str] = {}
-        self._setup_offered: set[int] = set()
         self._background_tasks: set[asyncio.Task] = set()
         self._card_cache: dict[tuple, list[bytes]] = {}
         logger.info("CalendarHandler initialized")
@@ -723,32 +722,6 @@ class CalendarHandler:
             await interaction.delete_original_response()
         except discord.HTTPException:
             logger.debug("Could not remove the private calendar receipt", exc_info=True)
-
-        if (
-            guild_id is not None
-            and guild_id not in self._setup_offered
-            and self._guild_configuration_service is not None
-            and await self._access.can_manage(interaction)
-        ):
-            # Without a channel the daily summary is posted nowhere; offer it to a
-            # manager once per server.
-            self._setup_offered.add(guild_id)
-            await offer_channel_setup(
-                interaction,
-                setting="calendar_channel_id",
-                guild_config_service=self._guild_configuration_service,
-                access_policy=self._access,
-                on_saved=lambda _channel_id, guild_id=guild_id, kingdom=int(kingdom): self._after_channel_setup(
-                    guild_id, kingdom
-                ),
-            )
-
-    async def _after_channel_setup(self, guild_id: int, kingdom: int) -> None:
-        """A manager accepted "post the calendar here": remember the kingdom and post."""
-        settings = await self._settings(guild_id)
-        if settings is not None and not getattr(settings, "kingdom_id", None):
-            await self._guild_configuration_service.update_for_guild(guild_id, kingdom_id=kingdom)
-        await self.post_now(guild_id)
 
     async def send_private_panel(self, interaction: discord.Interaction, kingdom: int, tab: str = TAB_TODAY) -> None:
         """Open a private copy of the calendar panel for whoever pressed a button."""

@@ -1,17 +1,16 @@
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import logging
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 
 from handlers.confirm_view import ConfirmView
-from handlers.permissions import AccessPolicy, manager_only_command
+from handlers.permissions import AccessPolicy
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, card_files, edit_panel_message, render_card
 from services import reminder_card_renderer
 from services.reminder_card_renderer import ReminderRow
@@ -20,6 +19,7 @@ from services.event_scheduler_service import (
     IEventSchedulerService,
     ScheduledEvent,
 )
+from services.guild_configuration_service import DEFAULT_TIME_ZONE, canonical_time_zone
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,10 @@ def parse_event_time(date: str, time: str, time_zone: str) -> datetime:
     try:
         zone = ZoneInfo(time_zone.strip())
     except (ZoneInfoNotFoundError, ValueError):
-        raise ValueError("Use a timezone such as UTC, Europe/Kyiv, or America/New_York.") from None
+        raise ValueError(
+            "The server's timezone is not valid. A server manager can set it in /settings, "
+            "for example Europe/Kyiv or America/New_York."
+        ) from None
     candidates = set()
     for fold in (0, 1):
         candidate = local.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc)
@@ -46,7 +49,7 @@ def parse_event_time(date: str, time: str, time_zone: str) -> datetime:
     if not candidates:
         raise ValueError("That local time does not exist because the clocks move forward. Choose another time.")
     if len(candidates) > 1:
-        raise ValueError("That local time occurs twice when the clocks move back. Enter the intended time in UTC.")
+        raise ValueError("That local time occurs twice when the clocks move back. Choose a time outside that hour.")
     return candidates.pop()
 
 
@@ -128,7 +131,19 @@ class SchedulerHealth:
         return "\n".join(lines)
 
 
+def when_label(time_zone: str) -> str:
+    """Label of the form's date/time field; it names the timezone (Discord allows 45 characters)."""
+    label = f"Date and time ({time_zone})"
+    return label if len(label) <= 45 else f"When ({time_zone})"[:45]
+
+
 class EventForm(discord.ui.Modal):
+    """Create or edit a reminder: when it is posted, what it says, how often it repeats.
+
+    The date and time are entered in the server's timezone (``/settings``), passed in
+    as ``time_zone`` so the label, the default and the parsing all use the same one.
+    """
+
     def __init__(
         self,
         handler,
@@ -136,34 +151,29 @@ class EventForm(discord.ui.Modal):
         channel_id: int,
         *,
         event: ScheduledEvent | None = None,
-        date: str = "",
-        time: str = "",
-        message: str = "",
-        time_zone: str = "UTC",
-        reminder_minutes: int = 10,
-        repeat_every_days: int | None = None,
+        time_zone: str = DEFAULT_TIME_ZONE,
+        panel: "EventListView | None" = None,
     ):
-        super().__init__(title="Edit reminder" if event else "Schedule event", timeout=300)
+        super().__init__(title="Edit reminder" if event else "Create reminder", timeout=300)
         self.handler, self.author_id, self.channel_id, self.event = (
             handler,
             author_id,
             channel_id,
             event,
         )
-        if event:
-            date, time = event.event_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M").split()
-            message, repeat_every_days = event.message, event.repeat_every_days
-        self.when = discord.ui.TextInput(
-            label="Reminder date/time" if event else "Event date/time",
-            placeholder="YYYY-MM-DD HH:MM",
-            default=f"{date} {time}".strip() or None,
-            max_length=16,
+        self.time_zone = time_zone
+        # The /reminders panel this form was opened from; it is redrawn after saving.
+        self.panel = panel
+        message = event.message if event else ""
+        repeat_every_days = event.repeat_every_days if event else None
+        self.when_default = (
+            event.event_time.astimezone(ZoneInfo(time_zone)).strftime("%Y-%m-%d %H:%M") if event else None
         )
-        self.zone = discord.ui.TextInput(
-            label="Timezone",
-            placeholder="Europe/Kyiv or America/New_York",
-            default=time_zone,
-            max_length=100,
+        self.when = discord.ui.TextInput(
+            label=when_label(time_zone),
+            placeholder="YYYY-MM-DD HH:MM, for example 2026-12-24 18:30",
+            default=self.when_default,
+            max_length=16,
         )
         self.message_input = discord.ui.TextInput(
             label="Reminder message",
@@ -177,45 +187,42 @@ class EventForm(discord.ui.Modal):
             default=str(repeat_every_days) if repeat_every_days else None,
             max_length=3,
         )
-        for item in (self.when, self.zone, self.message_input, self.repeat):
+        for item in (self.when, self.message_input, self.repeat):
             self.add_item(item)
-        if not event:
-            self.lead = discord.ui.TextInput(
-                label="Remind how many minutes before?",
-                default=str(reminder_minutes),
-                max_length=4,
-            )
-            self.add_item(self.lead)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not await self.handler._can_manage(interaction, self.author_id, self.channel_id):
             return
+        when = self.when.value.strip()
         try:
-            date, time = self.when.value.strip().split()
+            date, time = when.split()
             repeat = int(self.repeat.value) if self.repeat.value.strip() else None
-            lead = int(self.lead.value) if self.event is None else 0
         except ValueError:
             await self.handler._send_error(
                 interaction,
-                "Use YYYY-MM-DD HH:MM and whole numbers for minutes and days.",
+                "Use YYYY-MM-DD HH:MM for the date and time, and a whole number of days to repeat.",
             )
             return
+        # An untouched time keeps the stored instant: a local time inside a
+        # clock-change hour could not be entered again.
+        keep_time = self.event.event_time if self.event and when == self.when_default else None
         await self.handler._show_preview(
             interaction,
             date,
             time,
             self.message_input.value,
             repeat,
-            lead,
-            self.zone.value,
+            self.time_zone,
             event=self.event,
+            panel=self.panel,
+            keep_time=keep_time,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        logger.error("Event form failed", exc_info=(type(error), error, error.__traceback__))
+        logger.error("Reminder form failed", exc_info=(type(error), error, error.__traceback__))
         await self.handler._send_error(
             interaction,
-            "The reminder could not be prepared. Reopen /remind or /reminders.",
+            "The reminder could not be prepared. Reopen /reminders.",
         )
 
 
@@ -227,6 +234,7 @@ class EventPreview(OwnedView):
         channel_id: int,
         event: ScheduledEvent,
         embed: discord.Embed,
+        panel: "EventListView | None" = None,
     ):
         super().__init__(author_id)
         self.handler, self.channel_id, self.event, self.embed = (
@@ -235,6 +243,7 @@ class EventPreview(OwnedView):
             event,
             embed,
         )
+        self.panel = panel
         self.saving = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -285,16 +294,18 @@ class EventPreview(OwnedView):
             self.saving = False
             await self.handler._send_error(
                 interaction,
-                "This reminder is no longer active or its time has passed. Reopen /reminders or /remind.",
+                "This reminder is no longer active or its time has passed. Reopen /reminders.",
             )
             return
         self.stop()
-        self.embed.title = "Reminder updated" if event.id is not None else "Event scheduled"
-        self.embed.description = "Saved. Use /reminders to edit or cancel this reminder."
+        self.embed.title = "Reminder updated" if event.id is not None else "Reminder saved"
+        self.embed.description = "Saved. Edit or cancel it in `/reminders`."
         self.embed.color = EmbedColors.SUCCESS
         await interaction.edit_original_response(
             embed=self.embed, view=None, allowed_mentions=discord.AllowedMentions.none()
         )
+        if self.panel is not None:
+            await self.panel.reload(select=event)
 
     @discord.ui.button(label="Discard", style=discord.ButtonStyle.secondary)
     async def discard(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -306,13 +317,23 @@ class EventPreview(OwnedView):
         self.stop()
         self.saving = True
         await interaction.response.edit_message(
-            embed=build_status_embed(title="Draft discarded", description="The schedule was not changed."),
+            embed=build_status_embed(title="Draft discarded", description="No reminder was changed."),
             view=None,
         )
 
 
 class EventListView(OwnedView):
+    """The channel's reminders in one message: a menu, and for managers edit, cancel and create.
+
+    It also serves a channel without reminders, where managers still get **Create reminder**.
+    """
+
     PANEL_TIMEOUT_SECONDS = 900.0
+    # Discord allows 25 options per menu. A longer list is shown 23 at a time, with an
+    # "earlier" and a "later" entry to move through it.
+    MENU_SIZE = 25
+    MENU_PAGE_SIZE = 23
+    PAGE_PREFIX = "page:"
 
     def __init__(
         self,
@@ -323,26 +344,63 @@ class EventListView(OwnedView):
         can_manage: bool,
     ):
         super().__init__(author_id, timeout=self.PANEL_TIMEOUT_SECONDS)
-        self.handler, self.channel_id, self.events = handler, channel_id, events
+        self.handler, self.channel_id, self.events = handler, channel_id, list(events)
+        self.can_manage = can_manage
         self.index = 0
-        self.edit.disabled = self.cancel.disabled = self.create.disabled = not can_manage
         self._refresh_controls()
 
+    def _menu_start(self) -> int:
+        if len(self.events) <= self.MENU_SIZE:
+            return 0
+        return self.index // self.MENU_PAGE_SIZE * self.MENU_PAGE_SIZE
+
     def _refresh_controls(self):
-        self.previous.disabled = self.index == 0
-        self.next.disabled = self.index >= len(self.events) - 1
+        self.index = min(max(0, self.index), max(0, len(self.events) - 1))
+        # Members only browse; an empty channel has nothing to pick, edit or cancel.
+        wanted = [self.select_event] if self.events else []
+        if self.can_manage:
+            wanted += [self.edit, self.cancel] if self.events else []
+            wanted.append(self.create)
+        if list(self.children) != wanted:
+            self.clear_items()
+            for item in wanted:
+                self.add_item(item)
+        if not self.events:
+            return
         event_id = self.events[self.index].id
         self.edit.custom_id = f"event:edit:{event_id}"
         self.cancel.custom_id = f"event:cancel:{event_id}"
-        start = self.index // 25 * 25
-        self.select_event.options = [
+        paged = len(self.events) > self.MENU_SIZE
+        start = self._menu_start()
+        end = min(len(self.events), start + (self.MENU_PAGE_SIZE if paged else self.MENU_SIZE))
+        options = []
+        if start > 0:
+            first = start - self.MENU_PAGE_SIZE
+            options.append(
+                discord.SelectOption(
+                    label=f"Earlier reminders ({first + 1}–{start})",
+                    value=f"{self.PAGE_PREFIX}{first}",
+                    emoji="⬆️",
+                )
+            )
+        options.extend(
             discord.SelectOption(
-                label=f"#{event.id} · {event.message}"[:100],
+                label=f"#{event.id} · {_short_label(event.message, 80)}"[:100],
                 value=str(event.id),
                 default=index == self.index,
             )
-            for index, event in enumerate(self.events[start : start + 25], start)
-        ]
+            for index, event in enumerate(self.events[start:end], start)
+        )
+        if end < len(self.events):
+            last = min(len(self.events), end + self.MENU_PAGE_SIZE)
+            options.append(
+                discord.SelectOption(
+                    label=f"Later reminders ({end + 1}–{last})",
+                    value=f"{self.PAGE_PREFIX}{end}",
+                    emoji="⬇️",
+                )
+            )
+        self.select_event.options = options
 
     def card_rows(self) -> list[ReminderRow]:
         """Every reminder of the channel as a row of the dashboard card."""
@@ -364,6 +422,8 @@ class EventListView(OwnedView):
         The card is drawn again for every selection (it highlights the selected
         reminder); without one the embed stands on its own.
         """
+        if not self.events:
+            return self.empty_embed(), []
         card = await render_card(
             reminder_card_renderer.render_reminders_card,
             self.card_rows(),
@@ -375,11 +435,24 @@ class EventListView(OwnedView):
             embed.set_image(url=f"attachment://{reminder_card_renderer.CARD_FILENAME}")
         return embed, card_files(card, reminder_card_renderer.CARD_FILENAME)
 
+    def empty_embed(self) -> discord.Embed:
+        hint = (
+            "Press **Create reminder** to add one."
+            if self.can_manage
+            else "A server manager can create one with `/reminders`."
+        )
+        return build_status_embed(
+            title="No reminders in this channel",
+            description=f"Nothing is scheduled here. {hint}",
+        )
+
     def embed(self, *, pictures: bool = False) -> discord.Embed:
         """Details of the selected reminder. With ``pictures`` the short facts share one row."""
+        if not self.events:
+            return self.empty_embed()
         event = self.events[self.index]
         embed = build_status_embed(
-            title=f"Scheduled event #{event.id}",
+            title=f"Reminder #{event.id}",
             description=f"{len(self.events)} active reminder(s) in this channel.",
         )
         embed.add_field(
@@ -409,9 +482,10 @@ class EventListView(OwnedView):
                 value=message[offset : offset + 950],
                 inline=False,
             )
-        embed.set_footer(
-            text=f"Event {self.index + 1}/{len(self.events)} · Times use your Discord timezone · ID {event.id}"
-        )
+        footer = f"Reminder {self.index + 1}/{len(self.events)} · Times use your Discord timezone"
+        if len(self.events) > self.MENU_SIZE:
+            footer += f" · The menu lists {self.MENU_PAGE_SIZE} at a time"
+        embed.set_footer(text=footer)
         if len(event.message) > 1900:
             embed.description += " Message preview shortened to 1900 characters."
         return embed
@@ -426,47 +500,93 @@ class EventListView(OwnedView):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @discord.ui.select(placeholder="Choose an event", row=0)
+    async def reload(self, *, select: ScheduledEvent | None = None, notice: str | None = None) -> None:
+        """Load the channel's reminders again and redraw the panel's message.
+
+        Called after a reminder was saved or cancelled from another (private) message,
+        so it never raises: a failure leaves the panel as it was. ``select`` picks the
+        reminder to show (by ID, or for a new one by its time and message).
+        """
+        try:
+            self.events = await self.handler._scheduler_service.get_events_for_channel(self.channel_id)
+        except Exception:
+            logger.warning("Could not reload the reminders of channel %s", self.channel_id, exc_info=True)
+            return
+        if select is not None:
+            self.index = next(
+                (
+                    index
+                    for index, event in enumerate(self.events)
+                    if (event.id == select.id if select.id is not None
+                        else (event.event_time, event.message) == (select.event_time, select.message))
+                ),
+                self.index,
+            )
+        await self._redraw(notice)
+
+    async def _redraw(self, notice: str | None = None) -> None:
+        self._refresh_controls()
+        if self.message is None:
+            return
+        try:
+            embed, files = await self.build_message()
+            if notice:
+                embed.description = notice
+            await edit_panel_message(
+                self.message,
+                embed=embed,
+                view=self if self.children else None,
+                attachments=files,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.debug("Could not redraw the reminders panel", exc_info=True)
+
+    @discord.ui.select(placeholder="Choose a reminder", row=0)
     async def select_event(self, interaction: discord.Interaction, select: discord.ui.Select):
-        event_id = int(select.values[0])
-        self.index = next(index for index, event in enumerate(self.events) if event.id == event_id)
+        value = select.values[0]
+        if value.startswith(self.PAGE_PREFIX):
+            self.index = int(value[len(self.PAGE_PREFIX):])
+        else:
+            self.index = next(
+                (index for index, event in enumerate(self.events) if event.id == int(value)), self.index
+            )
         await self._render(interaction)
 
-    @discord.ui.button(label="Previous", row=1)
-    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.index = max(0, self.index - 1)
-        await self._render(interaction)
-
-    @discord.ui.button(label="Next", row=1)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.index = min(len(self.events) - 1, self.index + 1)
-        await self._render(interaction)
-
-    @discord.ui.button(label="Edit reminder", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Edit reminder", style=discord.ButtonStyle.primary, row=1)
     async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.handler._can_manage(interaction, self.author_id, self.channel_id):
             return
         event_id = int(interaction.data["custom_id"].rsplit(":", 1)[1])
         event = next((event for event in self.events if event.id == event_id), None)
         if event is None:
-            await self.handler._send_error(interaction, "This event is no longer active. Reopen /reminders.")
+            await self.handler._send_error(interaction, "This reminder is no longer active. Reopen /reminders.")
             return
         if len(event.message) > 4000:
             await self.handler._send_error(
                 interaction,
-                "This legacy message exceeds the form limit. Create a shorter reminder, then cancel this event.",
+                "This legacy message exceeds the form limit. Create a shorter reminder, then cancel this one.",
             )
             return
-        await interaction.response.send_modal(EventForm(self.handler, self.author_id, self.channel_id, event=event))
+        await interaction.response.send_modal(
+            EventForm(
+                self.handler,
+                self.author_id,
+                self.channel_id,
+                event=event,
+                time_zone=await self.handler._time_zone(interaction),
+                panel=self,
+            )
+        )
 
-    @discord.ui.button(label="Cancel event", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="Cancel reminder", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.handler._can_manage(interaction, self.author_id, self.channel_id):
             return
         event_id = int(interaction.data["custom_id"].rsplit(":", 1)[1])
         event = next((event for event in self.events if event.id == event_id), None)
         if event is None:
-            await self.handler._send_error(interaction, "This event is no longer active. Reopen /reminders.")
+            await self.handler._send_error(interaction, "This reminder is no longer active. Reopen /reminders.")
             return
 
         async def confirm(confirm_interaction: discord.Interaction):
@@ -476,10 +596,10 @@ class EventListView(OwnedView):
         prompt = ConfirmView(
             interaction.user.id,
             on_confirm=confirm,
-            confirm_label="Cancel event",
+            confirm_label="Cancel reminder",
             keep_label="Keep",
-            kept_title="Event kept",
-            kept_description=f"Event #{event_id} is still scheduled.",
+            kept_title="Reminder kept",
+            kept_description=f"Reminder #{event_id} is still scheduled.",
         )
         await interaction.response.send_message(
             embed=build_status_embed(
@@ -506,7 +626,7 @@ class EventListView(OwnedView):
             logger.exception("Could not cancel reminder %s", event_id)
             await interaction.edit_original_response(
                 embed=build_status_embed(
-                    title="Event not cancelled",
+                    title="Reminder not cancelled",
                     description="The reminder could not be cancelled right now. Try again in a moment.",
                     color=EmbedColors.WARNING,
                 ),
@@ -516,8 +636,8 @@ class EventListView(OwnedView):
         if not cancelled:
             await interaction.edit_original_response(
                 embed=build_status_embed(
-                    title="Event not cancelled",
-                    description="This event is no longer active. Reopen /reminders.",
+                    title="Reminder not cancelled",
+                    description="This reminder is no longer active. Reopen /reminders.",
                     color=EmbedColors.WARNING,
                 ),
                 view=None,
@@ -525,8 +645,8 @@ class EventListView(OwnedView):
             return
         await interaction.edit_original_response(
             embed=build_status_embed(
-                title="Event cancelled",
-                description=f"Event #{event_id} was cancelled.",
+                title="Reminder cancelled",
+                description=f"Reminder #{event_id} was cancelled.",
                 color=EmbedColors.SUCCESS,
             ),
             view=None,
@@ -534,45 +654,21 @@ class EventListView(OwnedView):
         await self._refresh_after_cancel(event_id)
 
     async def _refresh_after_cancel(self, event_id: int):
-        """Update the public list after a cancellation; failures leave the stale card."""
+        """Update the list after a cancellation; a failed reload drops the reminder locally."""
         try:
             self.events = await self.handler._scheduler_service.get_events_for_channel(self.channel_id)
         except Exception:
-            logger.warning("Could not refresh events after cancelling %s", event_id, exc_info=True)
+            logger.warning("Could not refresh reminders after cancelling %s", event_id, exc_info=True)
             self.events = [event for event in self.events if event.id != event_id]
-        if self.message is None:
-            if not self.events:
-                self.stop()
-            return
-        try:
-            if self.events:
-                self.index = min(self.index, len(self.events) - 1)
-                self._refresh_controls()
-                embed, files = await self.build_message()
-                embed.description = f"Event #{event_id} cancelled. {len(self.events)} active reminder(s) remain."
-                await edit_panel_message(
-                    self.message, embed=embed, view=self, attachments=files,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                self.stop()
-                await edit_panel_message(
-                    self.message,
-                    embed=build_status_embed(
-                        title="Event cancelled",
-                        description="There are no active reminders in this channel.",
-                        color=EmbedColors.SUCCESS,
-                    ),
-                    view=None,
-                    attachments=[],
-                )
-        except discord.HTTPException:
-            logger.debug("Could not refresh the events panel", exc_info=True)
+        await self._redraw(
+            f"Reminder #{event_id} cancelled. {len(self.events)} active reminder(s) remain."
+            if self.events
+            else None
+        )
 
-    @discord.ui.button(label="Create event", row=2)
+    @discord.ui.button(label="Create reminder", style=discord.ButtonStyle.success, row=1)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await self.handler._can_manage(interaction, self.author_id, self.channel_id):
-            await self.handler.open_schedule_form(interaction)
+        await self.handler.open_reminder_form(interaction, panel=self)
 
 
 class EventHandler:
@@ -587,8 +683,11 @@ class EventHandler:
         bot: commands.Bot,
         admin_user_ids: set[int] | None = None,
         access_policy: AccessPolicy | None = None,
+        guild_configuration_service=None,
     ):
         self._scheduler_service, self._bot = scheduler_service, bot
+        # Source of the server's timezone, in which reminder times are entered.
+        self._guild_configuration_service = guild_configuration_service
         self._admin_user_ids = admin_user_ids or set()
         self._access = access_policy or AccessPolicy(self._admin_user_ids)
         self._scheduler_loop = None
@@ -634,100 +733,52 @@ class EventHandler:
             await self._send_error(interaction, "Only the person who opened this form can submit it.")
             return False
         if interaction.channel_id is None or (channel_id is not None and interaction.channel_id != channel_id):
-            await self._send_error(interaction, "Open this action in the event's channel.")
+            await self._send_error(interaction, "Use this in the reminder's channel.")
             return False
         return True
 
     def register_commands(self):
         @self._bot.tree.command(
-            name="remind",
-            description="Create a reminder: open the form, or preview one from options",
-        )
-        @manager_only_command
-        @app_commands.describe(
-            date="Event date (YYYY-MM-DD)",
-            time="Event time (HH:MM in the selected timezone)",
-            message="Reminder message",
-            time_zone="Timezone name, for example Europe/Kyiv (default: UTC)",
-            repeat_every_days="Repeat every N days (fixed 24-hour periods)",
-            reminder_minutes="Minutes before the event to send the reminder (default: 10)",
-        )
-        async def schedule_event(
-            interaction: discord.Interaction,
-            date: Optional[str] = None,
-            time: Optional[str] = None,
-            message: Optional[str] = None,
-            repeat_every_days: Optional[int] = None,
-            reminder_minutes: int = 10,
-            time_zone: str = "UTC",
-        ):
-            await self._handle_schedule_event(
-                interaction,
-                date,
-                time,
-                message,
-                repeat_every_days,
-                reminder_minutes,
-                time_zone,
-            )
-
-        @self._bot.tree.command(
             name="reminders",
-            description="Browse this channel's reminders; managers can edit and cancel them",
+            description="This channel's reminders; server managers create, edit and cancel them",
         )
         async def list_events(interaction: discord.Interaction):
             await self._handle_list_events(interaction)
 
-    async def open_schedule_form(self, interaction: discord.Interaction, **defaults):
-        if await self._can_manage(interaction):
-            await interaction.response.send_modal(
-                EventForm(self, interaction.user.id, interaction.channel_id, **defaults)
-            )
+    async def _time_zone(self, interaction: discord.Interaction) -> str:
+        """The server's timezone from ``/settings`` (UTC when unset or unavailable).
 
-    async def _handle_schedule_event(
-        self,
-        interaction: discord.Interaction,
-        date: str | None = None,
-        time: str | None = None,
-        message: str | None = None,
-        repeat_every_days: int | None = None,
-        reminder_minutes: int = 10,
-        time_zone: str = "UTC",
-    ):
-        if not all(value is not None for value in (date, time, message)):
-            if (
-                len(date or "") > 10
-                or len(time or "") > 5
-                or len(message or "") > 1900
-                or len(time_zone) > 100
-                or not 1 <= reminder_minutes <= 1440
-                or (repeat_every_days is not None and not 1 <= repeat_every_days <= 365)
-            ):
-                if await self._can_manage(interaction):
-                    await self._send_error(
-                        interaction,
-                        "Use YYYY-MM-DD, HH:MM, a message up to 1900 characters, 1–1440 reminder minutes, and 1–365 repeat days.",
-                    )
-                return
-            await self.open_schedule_form(
-                interaction,
-                date=date or "",
-                time=time or "",
-                message=message or "",
-                repeat_every_days=repeat_every_days,
-                reminder_minutes=reminder_minutes,
-                time_zone=time_zone,
-            )
-            return
-        await self._show_preview(
-            interaction,
-            date,
-            time,
-            message,
-            repeat_every_days,
-            reminder_minutes,
-            time_zone,
+        Reminder times are entered in it; the form and the preview name it, so a
+        fallback to UTC is visible before anything is saved.
+        """
+        guild_id = getattr(interaction, "guild_id", None)
+        service = self._guild_configuration_service
+        if guild_id is None or service is None:
+            return DEFAULT_TIME_ZONE
+        try:
+            settings = await service.get_settings(guild_id)
+        except Exception:
+            logger.warning("Could not load the timezone of guild %s; using UTC", guild_id, exc_info=True)
+            return DEFAULT_TIME_ZONE
+        return canonical_time_zone(getattr(settings, "time_zone", None)) or DEFAULT_TIME_ZONE
+
+    async def open_reminder_form(self, interaction: discord.Interaction, *, panel: EventListView | None = None):
+        """Open the empty "Create reminder" form (managers only)."""
+        allowed = (
+            await self._can_manage(interaction, panel.author_id, panel.channel_id)
+            if panel is not None
+            else await self._can_manage(interaction)
         )
+        if allowed:
+            await interaction.response.send_modal(
+                EventForm(
+                    self,
+                    interaction.user.id,
+                    interaction.channel_id,
+                    time_zone=await self._time_zone(interaction),
+                    panel=panel,
+                )
+            )
 
     async def _show_preview(
         self,
@@ -736,27 +787,24 @@ class EventHandler:
         time: str,
         message: str,
         repeat_every_days: int | None,
-        reminder_minutes: int,
-        time_zone: str,
+        time_zone: str = DEFAULT_TIME_ZONE,
         *,
         event: ScheduledEvent | None = None,
+        panel: EventListView | None = None,
+        keep_time: datetime | None = None,
     ):
+        """Show what will be saved. ``date`` and ``time`` are when the reminder is posted, in ``time_zone``."""
         if not await self._can_manage(interaction):
             return
         try:
             message = message.strip()
             if not message or len(message) > 1900:
                 raise ValueError("Provide a reminder message between 1 and 1900 characters.")
-            if event is None and not 1 <= reminder_minutes <= 1440:
-                raise ValueError("Reminder lead time must be between 1 and 1440 minutes.")
             if repeat_every_days is not None and not 1 <= repeat_every_days <= 365:
-                raise ValueError("Repeat interval must be between 1 and 365 days, or blank for a one-time event.")
-            selected_time = parse_event_time(date, time, time_zone)
-            reminder_time = selected_time - timedelta(minutes=reminder_minutes)
+                raise ValueError("Repeat interval must be between 1 and 365 days, or blank for a one-time reminder.")
+            reminder_time = keep_time or parse_event_time(date, time, time_zone)
             if reminder_time <= datetime.now(timezone.utc):
-                raise ValueError(
-                    "The reminder must be in the future. Choose a later time or a shorter reminder lead time."
-                )
+                raise ValueError("The reminder must be in the future. Choose a later date or time.")
         except ValueError as error:
             await self._send_error(interaction, str(error))
             return
@@ -773,23 +821,17 @@ class EventHandler:
             repeat_every_days,
         )
         embed = build_status_embed(
-            title="Preview reminder changes" if event else "Preview event",
-            description=f"Review the times and message, then save. The reminder will ping {format_targets(role_names)}.",
+            title="Preview reminder changes" if event else "Preview reminder",
+            description=f"Check the time and the message, then save. The reminder will ping {format_targets(role_names)}.",
         )
-        if event is None:
-            embed.add_field(
-                name="Event",
-                value=self._format_discord_timestamp(selected_time),
-                inline=False,
-            )
         embed.add_field(
-            name="Reminder",
+            name="Posted",
             value=self._format_discord_timestamp(reminder_time),
             inline=False,
         )
         embed.add_field(
-            name="Input timezone",
-            value=f"{time_zone.strip()} · {selected_time.astimezone(ZoneInfo(time_zone.strip())):%Y-%m-%d %H:%M %Z}",
+            name="Server time",
+            value=f"{reminder_time.astimezone(ZoneInfo(time_zone)):%Y-%m-%d %H:%M %Z} · {time_zone}",
             inline=False,
         )
         embed.add_field(name="Repeat", value=self._format_repeat(repeat_every_days), inline=False)
@@ -802,11 +844,12 @@ class EventHandler:
                 inline=False,
             )
         embed.set_footer(
-            text="Times use your Discord timezone. Editing changes the reminder time directly."
-            if event
-            else "Times use your Discord timezone. Nothing is saved until you confirm."
+            text=(
+                f"Entered in the server's timezone ({time_zone}); managers change it in /settings. "
+                "Nothing is saved until you press Save reminder."
+            )
         )
-        view = EventPreview(self, interaction.user.id, interaction.channel_id, draft, embed)
+        view = EventPreview(self, interaction.user.id, interaction.channel_id, draft, embed, panel=panel)
         await interaction.response.send_message(
             embed=embed,
             view=view,
@@ -837,7 +880,7 @@ class EventHandler:
         if getattr(permissions, "view_channel", True) is False or getattr(permissions, send_bit, True) is False:
             return (
                 "I can't post in this channel. Give me **View Channel** and **Send Messages** here, "
-                "or schedule the reminder in a channel I can write to.",
+                "or create the reminder in a channel I can write to.",
                 None,
             )
         pings_everyone = any(
@@ -853,27 +896,18 @@ class EventHandler:
 
     async def _handle_list_events(self, interaction: discord.Interaction):
         if interaction.channel_id is None:
-            await self._send_error(interaction, "Use /reminders in a channel.", title="Events unavailable")
+            await self._send_error(interaction, "Use /reminders in a channel.", title="Reminders unavailable")
             return
         # Defer privately so errors stay private; the panel itself is posted publicly.
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             events = await self._scheduler_service.get_events_for_channel(interaction.channel_id)
         except Exception:
-            logger.exception("Could not load events for channel %s", interaction.channel_id)
+            logger.exception("Could not load reminders for channel %s", interaction.channel_id)
             await self._send_error(
                 interaction,
-                "Scheduled events could not be loaded right now. Try /reminders again in a moment.",
-                title="Events unavailable",
-            )
-            return
-        if not events:
-            await interaction.followup.send(
-                embed=build_status_embed(
-                    title="No scheduled events",
-                    description="There are no active reminders in this channel. Server managers can use /remind to create one.",
-                ),
-                ephemeral=True,
+                "The reminders could not be loaded right now. Try /reminders again in a moment.",
+                title="Reminders unavailable",
             )
             return
         view = EventListView(
@@ -884,7 +918,15 @@ class EventHandler:
             await self._access.can_manage(interaction),
         )
         embed, files = await view.build_message()
-        await interaction.edit_original_response(content="Events ready.")
+        if not events:
+            # Nothing to show the channel: the empty state stays private. Managers get
+            # the Create button, and the message turns into the list once one is saved.
+            if view.children:
+                view.message = await interaction.edit_original_response(embed=embed, view=view)
+            else:
+                await interaction.edit_original_response(embed=embed)
+            return
+        await interaction.edit_original_response(content="Reminders ready.")
         view.message = await interaction.followup.send(
             embed=embed,
             view=view,
@@ -896,7 +938,7 @@ class EventHandler:
         try:
             await interaction.delete_original_response()
         except discord.HTTPException:
-            logger.debug("Could not remove the private events receipt", exc_info=True)
+            logger.debug("Could not remove the private reminders receipt", exc_info=True)
 
     # ------------------------------------------------------------------ scheduler
 

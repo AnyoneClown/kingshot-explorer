@@ -181,6 +181,14 @@ class GiftCodeService(IGiftCodeService):
 
         return await run_db_operation(await self._get_db_manager(), _inner)
 
+    async def reopen_gift_code(self, code_id: int) -> bool:
+        """Queue a finished code for another automatic pass; True when it was reopened."""
+
+        async def _inner(db_session: AsyncSession):
+            return await GiftCodeRepository(db_session).mark_pending(code_id)
+
+        return await run_db_operation(await self._get_db_manager(), _inner)
+
     async def get_recent_gift_codes(self, limit: int = 5) -> list[Any]:
         async def _inner(db_session: AsyncSession):
             return await GiftCodeRepository(db_session).list_recent(limit)

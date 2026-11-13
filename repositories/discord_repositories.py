@@ -725,6 +725,19 @@ class GiftCodeRepository:
         )
         return bool(result.rowcount)
 
+    async def mark_pending(self, code_id: int) -> bool:
+        """Queue a finished code again; True when it was reopened.
+
+        ``auto_redeem_completed_at`` is kept: a pending code that has it is a re-run
+        (for accounts added later), not a newly found code.
+        """
+        result = await self._session.execute(
+            update(GiftCode)
+            .where(GiftCode.id == code_id, GiftCode.auto_redeem_status == AUTO_REDEEM_COMPLETED)
+            .values(auto_redeem_status=AUTO_REDEEM_PENDING)
+        )
+        return bool(result.rowcount)
+
 
 class GiftCodeRedemptionRepository:
     """Repository for gift code redemption attempts."""

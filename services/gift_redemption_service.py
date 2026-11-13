@@ -1,4 +1,4 @@
-"""Bulk gift-code redemption shared by the automatic and manual runs.
+"""Bulk gift-code redemption behind the automatic runs and the check of an entered code.
 
 Retry policy (the only retry layer)
     ``KingshotAPIClient`` makes exactly one paced HTTP attempt per call (global
@@ -17,8 +17,8 @@ Persistence
 
 One job per code
     ``CodeJobGuard`` holds at most one running job per gift code, shared by the
-    automatic run and ``/giftadmin redeem``, so the same code is never redeemed twice in
-    parallel.
+    automatic run and the check of an entered code, so the same code is never
+    redeemed twice in parallel.
 """
 
 from __future__ import annotations
@@ -118,7 +118,6 @@ _RETRYABLE_PHRASES = (
 _LOOKUP_OUTAGE_ERROR_CODES = frozenset({"NETWORK_ERROR", "GATEWAY_ERROR", "MAX_RETRIES_EXCEEDED"})
 
 JOB_AUTO = "auto"
-JOB_MANUAL = "manual"
 STOP_CANCELLED = "cancelled"
 STOP_SHUTDOWN = "shutdown"
 
@@ -247,7 +246,7 @@ async def _pause(delay: float, stop_event: asyncio.Event | None) -> bool:
 
 @dataclass(eq=False)
 class RedemptionJob:
-    """One running redemption of one code (automatic or manual)."""
+    """One running job on one code: an automatic run, or the check of an entered code."""
 
     gift_code: str
     kind: str
@@ -279,7 +278,7 @@ class RedemptionJob:
 
 
 class CodeJobGuard:
-    """At most one running redemption job per gift code (auto and manual share it)."""
+    """At most one running job per gift code."""
 
     def __init__(self) -> None:
         self._jobs: dict[str, RedemptionJob] = {}
@@ -310,12 +309,6 @@ class CodeJobGuard:
 
     def active_jobs(self) -> list[RedemptionJob]:
         return list(self._jobs.values())
-
-    def manual_job_for_guild(self, guild_id: int | None) -> RedemptionJob | None:
-        return next(
-            (job for job in self._jobs.values() if job.kind == JOB_MANUAL and job.guild_id == guild_id),
-            None,
-        )
 
     async def shutdown(self, *, grace_seconds: float = 8.0, cancel_wait_seconds: float = 2.0) -> None:
         """Stop every job: let in-flight players finish (results are saved), then cancel."""
@@ -930,7 +923,7 @@ class GiftRedemptionService:
         players never started are left out of the results.
 
         ``use_recorded_outcomes`` (automatic runs) skips players whose outcome for this
-        code is already stored, including final failures; manual runs only skip
+        code is already stored, including final failures; a manager's re-run only skips
         players who already have the code.
         """
         seen_ids: set[str] = set()

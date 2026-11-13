@@ -5,13 +5,10 @@ import pytest
 
 from handlers.gift_code_handler import (
     GiftCodeHandler,
-    GiftCodesView,
+    MyAccountsView,
     PlayerListPaginationView,
     PlayerSearchModal,
-    RedemptionResultsView,
 )
-from handlers.permissions import AccessPolicy
-from handlers.ui import EmbedColors
 
 
 def make_handler():
@@ -48,17 +45,21 @@ def player(index):
 
 
 @pytest.mark.asyncio
-async def test_player_search_filters_pagination_and_selected_action():
+async def test_roster_pages_filters_and_searches():
     handler = make_handler()
     view = PlayerListPaginationView(handler, [player(i) for i in range(24)], 123)
     action = interaction()
     assert view.page_count == 3
     assert "Castle: Unavailable" in view.build_embed().description
+    # The dead "View player" and the separate "Clear search" buttons are gone.
+    assert sorted(item.label for item in view.children if hasattr(item, "label")) == [
+        "Disable", "Next", "Previous", "Remove", "Roster health", "Search",
+    ]
     await view.next_button.callback(action)
     view.player_select._values = ["2"]
     await view.player_select.callback(action)
-    await view.view_player.callback(action)
-    handler._bot.tree.get_command("player").callback.assert_awaited_once_with(action, player_id="12")
+    assert view.selected_player.player_id == "12"
+    assert view.toggle_button.label == "Disable" and not view.remove_button.disabled
 
     view.status_select._values = ["disabled"]
     await view.status_select.callback(action)
@@ -74,9 +75,11 @@ async def test_player_search_filters_pagination_and_selected_action():
 
     modal.query._value = "no-match"
     await modal.on_submit(action)
-    assert view.player_select.disabled and view.view_player.disabled
+    assert view.player_select.disabled and view.toggle_button.disabled and view.remove_button.disabled
     assert "No players match" in view.build_embed().description
-    await view.clear_button.callback(action)
+    # An empty search shows everyone again.
+    modal.query._value = ""
+    await modal.on_submit(action)
     assert len(view.filtered_players) == 12
     view.status_select._values = ["enabled"]
     await view.status_select.callback(action)
@@ -86,70 +89,118 @@ async def test_player_search_filters_pagination_and_selected_action():
 
 
 @pytest.mark.asyncio
-async def test_gift_actions_paginate_and_recheck_admin_authorization():
+async def test_roster_remove_asks_first_and_redraws_the_roster_afterwards():
     handler = make_handler()
-    codes = [{"code": f"CODE{i}"} for i in range(25)]
-    view = GiftCodesView(handler, codes, 123, can_redeem=True)
-    action = interaction()
-    await view.next_button.callback(action)
-    await view.next_button.callback(action)
-    assert view.next_button.disabled
-    assert len(view.build_embed().fields) == 5
-    view.code_select._values = ["24"]
-    await view.code_select.callback(action)
-    assert view.selected_index == 24
-
-    # Codes are copyable plain lines in the message content.
-    assert view.build_content().splitlines() == [f"`CODE{i}`" for i in range(20, 25)]
-
-    # Removing an admin after the card was opened must revoke the button too.
-    handler._access = AccessPolicy([])
-    await view.redeem_button.callback(action)
-    assert action.followup.send.call_args.kwargs["embed"].title == "🔒 Not allowed"
-    handler._gift_code_service.redeem_gift_code_remote.assert_not_awaited()
-    readonly = GiftCodesView(handler, codes, 123, can_redeem=False)
-    assert readonly.redeem_button not in readonly.children
-    assert readonly.code_select not in readonly.children
-    assert "centurygame.com" in readonly.build_embed().description
-    assert not await view.interaction_check(interaction(456))
+    entries = [player(2), player(4)]
+    view = PlayerListPaginationView(handler, entries, 123, kingdom="830")
     view.message = SimpleNamespace(edit=AsyncMock())
-    await view.on_timeout()
-    assert all(item.disabled for item in view.children)
+    handler._player_registry_service.remove_player.return_value = SimpleNamespace(removed=True)
+
+    click = interaction()
+    click.original_response = AsyncMock()
+    await view.remove_button.callback(click)
+    prompt = click.response.send_message.call_args.kwargs
+    assert prompt["ephemeral"] is True and "Remove" in prompt["embed"].title
+    handler._player_registry_service.remove_player.assert_not_awaited()  # nothing happens before the confirm
+
+    confirm = interaction()
+    confirm.edit_original_response = AsyncMock()
+    await prompt["view"].confirm_button.callback(confirm)
+    handler._player_registry_service.remove_player.assert_awaited_once_with("2")
+    assert "Removed" in confirm.edit_original_response.call_args.kwargs["embed"].title
+    assert [entry.player_id for entry in view.roster] == ["4"]
+    view.message.edit.assert_awaited_once()
+
+
+def account(player_id, *, enabled=True, owner=123):
+    return SimpleNamespace(
+        player_id=str(player_id), player_name=f"Player {player_id}", enabled=enabled,
+        kingdom="830", castle_level=None, added_by_user_id=owner,
+    )
+
+
+def accounts_handler(entries):
+    handler = make_handler()
+    handler._gift_code_service.get_recent_gift_codes = AsyncMock(return_value=[SimpleNamespace(code="CODE1")])
+    handler._gift_code_service.get_redemption_rows = AsyncMock(return_value=[])
+    handler._gift_code_service.get_available_gift_codes = AsyncMock(return_value={"success": True, "data": []})
+    registry = handler._player_registry_service
+    registry.list_owned_entries.return_value = entries
+    registry.get_entry.side_effect = lambda player_id: next(
+        (entry for entry in entries if entry.player_id == str(player_id)), None
+    )
+    return handler
 
 
 @pytest.mark.asyncio
-async def test_normal_progress_message_is_throttled_and_replaced_by_summary():
-    handler = make_handler()
-    message = SimpleNamespace(edit=AsyncMock())
-    channel = SimpleNamespace(id=789, send=AsyncMock(return_value=message))
-    result = {"player_id": "2", "status_category": handler.STATUS_SUCCESS}
+async def test_my_accounts_is_one_private_panel_with_add_pause_and_remove():
+    entries = [account(1), account(2, enabled=False)]
+    handler = accounts_handler(entries)
+    action = interaction()
+    await handler._handle_my_accounts(action)
+    sent = action.followup.send.call_args.kwargs
+    assert sent["ephemeral"] is True
+    view = sent["view"]
+    assert isinstance(view, MyAccountsView)
+    assert [item.label for item in view.children if hasattr(item, "label")] == ["Add account", "Pause", "Remove"]
+    # Two accounts: a menu picks the one the buttons act on, and the embed marks it.
+    assert [option.value for option in view.account_select.options] == ["1", "2"]
+    assert [field.name for field in sent["embed"].fields] == ["▸ Player 1", "Player 2"]
+    assert "⏸️ paused" in sent["embed"].fields[1].value
 
-    async def redeem(**kwargs):
-        progress = kwargs["progress"]
-        await progress([], "Redeeming players")
-        await progress([result], "Redeeming players")  # Same phase is throttled.
-        await progress([result], "Saving redemption results")
-        return [result]
+    pick = interaction()
+    pick.edit_original_response = AsyncMock()
+    view.account_select._values = ["2"]
+    await view.account_select.callback(pick)
+    assert view.toggle_button.label == "Resume"
 
-    handler._run_bulk_redemption = redeem
-    await handler._run_manual_redemption_job(
-        gift_code="CODE", registered_players=[player(2)], actor_user_id=123,
-        guild_id=456, channel=channel,
+    resume = interaction()
+    resume.edit_original_response = AsyncMock()
+    await view.toggle_button.callback(resume)
+    handler._player_registry_service.set_players_enabled.assert_awaited_once_with(["2"], True)
+    assert entries[1].enabled is True and view.toggle_button.label == "Pause"
+    assert "✅ receiving codes" in resume.edit_original_response.call_args.kwargs["embed"].fields[1].value
+
+
+@pytest.mark.asyncio
+async def test_my_accounts_with_one_or_no_account_has_no_menu():
+    handler = accounts_handler([account(1)])
+    action = interaction()
+    await handler._handle_my_accounts(action)
+    view = action.followup.send.call_args.kwargs["view"]
+    assert view.account_select not in view.children
+    assert view.selected.player_id == "1" and not view.toggle_button.disabled
+
+    handler = accounts_handler([])
+    action = interaction()
+    await handler._handle_my_accounts(action)
+    sent = action.followup.send.call_args.kwargs
+    assert "Add account" in sent["embed"].description
+    view = sent["view"]
+    assert view.toggle_button.disabled and view.remove_button.disabled and not view.add_button.disabled
+    await view.add_button.callback(action)
+    action.response.send_modal.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_my_accounts_refuses_someone_elses_account_and_reloads_after_a_removal():
+    entries = [account(1), account(2)]
+    handler = accounts_handler(entries)
+    handler._access = SimpleNamespace(
+        is_super_admin=lambda user_id: False, can_manage=AsyncMock(return_value=False)
     )
-    assert channel.send.await_count == 2
-    progress_card = channel.send.call_args_list[0].kwargs
-    assert "0/1 players" in progress_card["embed"].description
-    assert "▱" in progress_card["embed"].description
-    assert progress_card["view"].cancel_button.label == "Cancel"
-    assert message.edit.await_count == 3
-    final = message.edit.call_args.kwargs
-    assert final["embed"].title == "✅ All Gift Codes Redeemed Successfully!"
-    assert final["view"] is None
-    assert "content" not in final  # Edited-in mentions do not notify.
-    ping = channel.send.call_args_list[1].kwargs
-    assert ping["content"].startswith("<@123> redemption finished for `CODE`")
-    assert [user.id for user in ping["allowed_mentions"].users] == [123]
-    assert ping["allowed_mentions"].everyone is False and ping["allowed_mentions"].roles is False
+    view = MyAccountsView(handler, 123, entries)
+    view.message = SimpleNamespace(edit=AsyncMock())
+    entries[0].added_by_user_id = 999  # no longer theirs
+    denied = interaction()
+    await view.toggle_button.callback(denied)
+    handler._player_registry_service.set_players_enabled.assert_not_awaited()
+
+    handler._player_registry_service.list_owned_entries.return_value = [entries[1]]
+    await view.reload()
+    assert [entry.player_id for entry in view.entries] == ["2"]
+    assert view.account_select not in view.children
+    view.message.edit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -167,8 +218,8 @@ async def test_bulk_reports_cached_results_rate_limit_wait_and_persistence(monke
     async def progress(results, phase):
         updates.append((len(results), phase))
 
-    results = await handler._run_bulk_redemption(
-        gift_code="CODE", registered_players=[player(0), player(2)], actor_user_id=123,
+    results = await handler._redemption.run_bulk(
+        gift_code="CODE", players=[player(0), player(2)], actor_user_id=123,
         guild_id=456, channel_id=789, progress=progress,
     )
     assert updates[0] == (1, "Redeeming players")
@@ -177,42 +228,6 @@ async def test_bulk_reports_cached_results_rate_limit_wait_and_persistence(monke
     assert [row["status_category"] for row in results] == ["already_redeemed", "success"]
     assert handler._gift_code_service.redeem_gift_code_remote.await_count == 2
     handler._tracking_service.log_gift_code_redemptions_many.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_already_claimed_is_success_and_details_cover_every_issue():
-    handler = make_handler()
-    channel = SimpleNamespace(send=AsyncMock())
-    results = [{"status_category": "already_redeemed"}] * 10
-    await handler._send_redemption_results_to_channel(channel, 123, "CODE", results)
-    summary = channel.send.call_args_list[0].kwargs
-    assert "Everyone Has Already Claimed" in summary["embed"].title
-    assert summary["embed"].color == EmbedColors.SUCCESS
-    assert summary["view"] is None
-
-    issues = [
-        {"player_id": str(i), "status_category": "skipped" if i == 0 else "api_rejected",
-         "player_name": "x" * 400, "message": "reason " * 300}
-        for i in range(12)
-    ]
-    await handler._send_redemption_results_to_channel(channel, 123, "CODE", results + issues)
-    view = channel.send.call_args_list[2].kwargs["view"]
-    assert isinstance(view, RedemptionResultsView)
-    assert len(view.issues) == 12
-    action = interaction()
-    await view.details_button.callback(action)
-    names = []
-    for page in range(3):
-        embed = view.build_embed()
-        assert len(embed) < 6000
-        assert all(len(field.name) <= 256 and len(field.value) <= 1024 for field in embed.fields)
-        names.extend(field.name for field in embed.fields)
-        if page < 2:
-            await view.next_button.callback(action)
-    assert len(names) == 12
-    assert view.next_button.disabled
-    await view.details_button.callback(action)
-    assert view.build_embed() is view.summary
 
 
 @pytest.mark.asyncio
@@ -250,8 +265,8 @@ async def test_progress_reports_finished_players_while_a_batch_peer_waits():
             finished.set()
 
     handler._gift_code_service.redeem_gift_code_remote.side_effect = redeem
-    task = asyncio.create_task(handler._run_bulk_redemption(
-        gift_code="CODE", registered_players=[player(0), player(2), player(4)], actor_user_id=123,
+    task = asyncio.create_task(handler._redemption.run_bulk(
+        gift_code="CODE", players=[player(0), player(2), player(4)], actor_user_id=123,
         guild_id=456, channel_id=789, progress=progress,
     ))
     try:

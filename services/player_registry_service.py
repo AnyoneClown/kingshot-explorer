@@ -231,7 +231,7 @@ class PlayerRegistryService:
         """Stop redeeming for accounts that keep failing as invalid.
 
         A manager of the account's kingdom, or its owner, can switch it back on in
-        ``/gift roster`` once the Governor ID is fixed. Returns how many were disabled.
+        ``/giftadmin roster`` (or under "My accounts") once the Governor ID is fixed. Returns how many were disabled.
         """
         return await self.set_players_enabled(player_ids, False, session=session)
 

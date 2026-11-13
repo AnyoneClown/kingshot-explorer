@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -10,7 +12,7 @@ from discord.ext import commands
 from handlers.calendar_handler import DAILY_POST_TIME
 from handlers.permissions import AccessPolicy, manager_only_command, send_denied
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
-from services.guild_configuration_service import GuildConfigurationService
+from services.guild_configuration_service import DEFAULT_TIME_ZONE, GuildConfigurationService, canonical_time_zone
 from services.kingshot_calendar_service import MAX_KINGDOM_NUMBER, CalendarError, KingdomNotTrackedError
 
 logger = logging.getLogger(__name__)
@@ -50,8 +52,34 @@ class ServerKingdomModal(discord.ui.Modal, title="Server kingdom"):
         await send_ui_error(interaction, error)
 
 
+class ServerTimezoneModal(discord.ui.Modal, title="Server timezone"):
+    """Asks for the timezone reminder times are entered in."""
+
+    time_zone = discord.ui.TextInput(
+        label="Timezone",
+        placeholder="For example Europe/Kyiv, America/New_York or UTC",
+        min_length=1,
+        max_length=64,
+    )
+
+    def __init__(self, view: "GuildConfigView", *, current: str | None = None):
+        super().__init__(timeout=300)
+        self._view = view
+        self.time_zone.default = current or DEFAULT_TIME_ZONE
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._view.apply_time_zone(interaction, str(self.time_zone.value))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_ui_error(interaction, error)
+
+
 class GuildConfigView(OwnedView):
-    """Ephemeral manager control panel for guild configuration."""
+    """Ephemeral manager control panel for guild configuration.
+
+    Until the server's kingdom, gift-code channel and calendar channel are all set,
+    the panel opens with a three-step setup checklist; after that it lists the settings.
+    """
 
     def __init__(
         self,
@@ -63,6 +91,7 @@ class GuildConfigView(OwnedView):
         access_policy: AccessPolicy | None = None,
         guild: discord.Guild | None = None,
         calendar=None,
+        gift=None,
         timeout: float = 600.0,
     ):
         super().__init__(author_id, timeout=timeout)
@@ -73,10 +102,21 @@ class GuildConfigView(OwnedView):
         self._guild = guild
         # The calendar handler: checks a kingdom and posts the first daily calendar.
         self._calendar = calendar
-        # As last shown; lets the kingdom controls open a modal without a database read.
+        # The gift-code handler: posts the sign-up panel in the gift-code channel.
+        self._gift = gift
+        # As last shown; lets the kingdom and timezone buttons open a form without a database read.
         self._kingdom: int | None = None
+        self._time_zone: str | None = None
+        # Whether this panel already posted the sign-up panel (nothing stores it).
+        self._panel_posted = False
         self._warnings: list[str] = []
         self._notes: list[str] = []
+        if not self._can_post_panel:
+            self.remove_item(self.post_panel_button)
+
+    @property
+    def _can_post_panel(self) -> bool:
+        return callable(getattr(self._gift, "post_panel", None))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """The panel can stay open for a long time: re-check manager rights on every click."""
@@ -111,8 +151,12 @@ class GuildConfigView(OwnedView):
         manager_role = getattr(guild_config, "manager_role_id", None)
         calendar_channel = getattr(guild_config, "calendar_channel_id", None)
         kingdom = getattr(guild_config, "kingdom_id", None)
+        time_zone = getattr(guild_config, "time_zone", None) or DEFAULT_TIME_ZONE
         self._kingdom = kingdom
+        self._time_zone = time_zone
         self._sync_kingdom_button(kingdom)
+        self._sync_time_zone_button(time_zone)
+        self._sync_panel_button(gift_channel)
         # Show what is saved inside the menus too, instead of empty placeholders.
         # Only values the menu can hold: a deleted channel or role, or a channel of
         # another type, as a default would make Discord reject the whole panel.
@@ -126,18 +170,23 @@ class GuildConfigView(OwnedView):
             self._selectable_channel(calendar_channel), discord.SelectDefaultValueType.channel
         )
 
-        lines = [
-            f"Server: **{self._guild_name}**",
-            f"Kingdom: {f'**{kingdom}**' if kingdom else 'Not set'}",
-            f"AI replies: **{ai_replies_status}**",
-            f"Gift-code announcements: {_mention_channel(gift_channel)}",
-            f"Event calendar: {self._calendar_summary(calendar_channel, kingdom)}",
+        other_settings = [
             f"Bot manager role: {_mention_role(manager_role)}",
-            "",
-            self._setup_progress(gift_channel, calendar_channel, kingdom),
-            "Use the menus below to pick channels and the manager role. "
-            "Clear a menu's selection to unset it.",
+            f"Reminder timezone: **{time_zone}**",
+            f"AI replies: **{ai_replies_status}**",
         ]
+        lines = [f"Server: **{self._guild_name}**"]
+        if kingdom and gift_channel and calendar_channel:
+            lines += [
+                f"Kingdom: **{kingdom}**",
+                f"Gift-code announcements: {_mention_channel(gift_channel)}",
+                f"Event calendar: {self._calendar_summary(calendar_channel, kingdom)}",
+                *other_settings,
+                "",
+                "Use the buttons and menus below to change a setting. Clear a menu's selection to unset it.",
+            ]
+        else:
+            lines += ["", *self._checklist(kingdom, gift_channel, calendar_channel), "", *other_settings]
         warnings = [
             warning
             for warning in (
@@ -153,7 +202,7 @@ class GuildConfigView(OwnedView):
         self._warnings = []
         self._notes = []
         return build_status_embed(
-            title="Bot Configuration",
+            title="Bot settings",
             description="\n".join(lines),
             color=EmbedColors.NEUTRAL,
             footer=(
@@ -162,6 +211,45 @@ class GuildConfigView(OwnedView):
                 "Server Settings → Integrations"
             ),
         )
+
+    def _checklist(self, kingdom: int | None, gift_channel: int | None, calendar_channel: int | None) -> list[str]:
+        """The three setup steps: done ones with their value, the next one marked, each with what to press."""
+        gift_value = _mention_channel(gift_channel)
+        if self._can_post_panel and not self._panel_posted:
+            gift_value += " · press **Post sign-up panel** to put the sign-up buttons there"
+        steps = (
+            (
+                bool(kingdom),
+                "Kingdom",
+                f"**{kingdom}**",
+                "press **Set kingdom** and enter the kingdom this server plays in.",
+            ),
+            (
+                bool(gift_channel),
+                "Gift codes",
+                gift_value,
+                "pick the channel for new codes and their results in the **Gift-code channel** menu"
+                + (", then post the sign-up panel there." if self._can_post_panel else "."),
+            ),
+            (
+                bool(calendar_channel),
+                "Daily event calendar",
+                self._calendar_summary(calendar_channel, kingdom),
+                "pick its channel in the **Event calendar channel** menu.",
+            ),
+        )
+        done = sum(1 for step in steps if step[0])
+        lines = [f"**Setup: {done} of {len(steps)} steps done**"]
+        next_marked = False
+        for number, (is_done, name, value, todo) in enumerate(steps, 1):
+            if is_done:
+                lines.append(f"✅ **{number}. {name}** — {value}")
+            elif not next_marked:
+                next_marked = True
+                lines.append(f"➡️ **{number}. {name}** — next: {todo}")
+            else:
+                lines.append(f"⬜ **{number}. {name}** — {todo}")
+        return lines
 
     @staticmethod
     def _calendar_summary(channel_id: int | None, kingdom: int | None) -> str:
@@ -190,30 +278,71 @@ class GuildConfigView(OwnedView):
     def _defaults(object_id: int | None, kind: discord.SelectDefaultValueType) -> list[discord.SelectDefaultValue]:
         return [discord.SelectDefaultValue(id=int(object_id), type=kind)] if object_id else []
 
-    @staticmethod
-    def _setup_progress(gift_channel: int | None, calendar_channel: int | None, kingdom: int | None) -> str:
-        missing = []
-        if not gift_channel:
-            missing.append("a channel for gift-code announcements")
-        if not kingdom:
-            missing.append("the server's kingdom")
-        if not calendar_channel:
-            missing.append("a channel for the daily event calendar")
-        if not missing:
-            return "✅ Everything is set up."
-        return f"Setup {3 - len(missing)}/3 — still to pick: {', '.join(missing)}."
-
     def _sync_random_replies_button(self, enabled: bool) -> None:
         self.toggle_random_replies_button.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
         self.toggle_random_replies_button.label = f"AI Replies: {'On' if enabled else 'Off'}"
 
     def _sync_kingdom_button(self, kingdom: int | None) -> None:
         self.kingdom_button.label = f"Kingdom: {kingdom}" if kingdom else "Set kingdom"
+        # The first setup step stands out until it is done.
+        self.kingdom_button.style = discord.ButtonStyle.secondary if kingdom else discord.ButtonStyle.primary
+
+    def _sync_time_zone_button(self, time_zone: str) -> None:
+        self.time_zone_button.label = f"Timezone: {time_zone}"[:80]
+
+    def _sync_panel_button(self, gift_channel: int | None) -> None:
+        self.post_panel_button.disabled = not gift_channel
+        self.post_panel_button.style = (
+            discord.ButtonStyle.primary if gift_channel and not self._panel_posted else discord.ButtonStyle.secondary
+        )
 
     # Not named ``_refresh``: that is discord.py's own View method, called with the
     # message's components when a message carrying the view is edited.
     async def _show(self, interaction: discord.Interaction) -> None:
         await interaction.edit_original_response(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Set kingdom", emoji="🏰", style=discord.ButtonStyle.secondary, row=0)
+    async def kingdom_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        del button
+        await interaction.response.send_modal(ServerKingdomModal(self, current=self._kingdom))
+
+    @discord.ui.button(label="Post sign-up panel", emoji="🎁", style=discord.ButtonStyle.secondary, row=0)
+    async def post_panel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Post the gift-code sign-up panel in the server's gift-code channel."""
+        del button
+        post_panel = getattr(self._gift, "post_panel", None)
+        if not callable(post_panel):
+            await interaction.response.send_message("The sign-up panel is unavailable right now.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        channel_id = getattr(await self._settings(), "gift_code_channel_id", None)
+        guild = self._guild or getattr(interaction, "guild", None)
+        get_channel = getattr(guild, "get_channel", None)
+        channel = get_channel(channel_id) if channel_id and callable(get_channel) else None
+        if not channel_id:
+            self._warnings.append("Pick the gift-code channel first, then post the sign-up panel.")
+        elif channel is None:
+            self._warnings.append(f"I can't find <#{channel_id}>. Pick the gift-code channel again.")
+        else:
+            try:
+                await post_panel(channel)
+            except discord.HTTPException:
+                logger.info("Could not post the gift-code panel in channel %s", channel_id, exc_info=True)
+                self._warnings.append(
+                    f"I could not post the sign-up panel in <#{channel_id}>. "
+                    "I need View Channel, Send Messages and Embed Links there."
+                )
+            else:
+                self._panel_posted = True
+                self._notes.append(
+                    f"The sign-up panel is posted in <#{channel_id}>. Pin it so members can always find it."
+                )
+        await self._show(interaction)
+
+    @discord.ui.button(label="Timezone: UTC", emoji="🕒", style=discord.ButtonStyle.secondary, row=0)
+    async def time_zone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        del button
+        await interaction.response.send_modal(ServerTimezoneModal(self, current=self._time_zone))
 
     @discord.ui.button(label="AI Replies", style=discord.ButtonStyle.secondary, row=0)
     async def toggle_random_replies_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -226,17 +355,6 @@ class GuildConfigView(OwnedView):
         )
         self._sync_random_replies_button(updated.use_random_replies)
         await self._show(interaction)
-
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=0)
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        del button
-        await interaction.response.defer()
-        await self._show(interaction)
-
-    @discord.ui.button(label="Set kingdom", emoji="🏰", style=discord.ButtonStyle.secondary, row=0)
-    async def kingdom_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        del button
-        await interaction.response.send_modal(ServerKingdomModal(self, current=self._kingdom))
 
     async def apply_kingdom(
         self, interaction: discord.Interaction, raw_kingdom: str, pending_channel_id: int | None = None
@@ -276,6 +394,29 @@ class GuildConfigView(OwnedView):
         await self._post_calendar_now()
         await self._show(interaction)
 
+    async def apply_time_zone(self, interaction: discord.Interaction, raw_time_zone: str) -> None:
+        """Save the timezone reminder times are entered in, from the modal."""
+        if interaction.user.id != self.author_id or not await self._access.require_manager(
+            interaction, "configure the bot"
+        ):
+            return
+        time_zone = canonical_time_zone(raw_time_zone)
+        if time_zone is None:
+            shown = raw_time_zone.strip().replace("`", "")[:40]
+            await interaction.response.send_message(
+                f"`{shown}` is not a timezone I know. Use a name from the tz database, such as "
+                "`Europe/Kyiv`, `America/New_York`, `Asia/Tokyo` or `UTC`. A city alone, like `Kyiv`, works too.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        await self._guild_config_service.update_for_guild(self._guild_id, time_zone=time_zone)
+        local_now = datetime.now(ZoneInfo(time_zone))
+        self._notes.append(
+            f"Reminder times are entered in **{time_zone}** (it is {local_now:%H:%M} there now)."
+        )
+        await self._show(interaction)
+
     async def _post_calendar_now(self) -> None:
         """Post today's calendar once the daily post is fully set up, as a visible check."""
         if self._calendar is None:
@@ -300,21 +441,52 @@ class GuildConfigView(OwnedView):
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=_TEXT_CHANNEL_TYPES,
-        placeholder="Gift-code announcement channel",
+        placeholder="Gift-code channel (new codes, results and the sign-up panel)",
         min_values=0,
         max_values=1,
         row=1,
     )
     async def gift_channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         channel_id = select.values[0].id if select.values else None
+        if channel_id and self._can_post_panel:
+            # A new channel has no panel yet: point at the button that posts one.
+            self._panel_posted = False
+            self._notes.append(
+                f"New gift codes are announced in <#{channel_id}>. "
+                "Press **Post sign-up panel** to put the sign-up buttons there."
+            )
         await self._update(interaction, gift_code_channel_id=channel_id)
 
     @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="Bot manager role",
+        cls=discord.ui.ChannelSelect,
+        channel_types=_TEXT_CHANNEL_TYPES,
+        placeholder=f"Event calendar channel (daily post at {DAILY_POST_TIME:%H:%M} UTC)",
         min_values=0,
         max_values=1,
         row=2,
+    )
+    async def calendar_channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        channel_id = select.values[0].id if select.values else None
+        if channel_id is None:
+            await self._update(interaction, calendar_channel_id=None)
+            return
+        if not self._kingdom:
+            # The post needs a kingdom: ask for it now and save both together.
+            await interaction.response.send_modal(ServerKingdomModal(self, pending_channel_id=channel_id))
+            return
+        await interaction.response.defer()
+        await self._guild_config_service.update_for_guild(
+            self._guild_id, calendar_channel_id=channel_id, calendar_last_posted_on=None
+        )
+        await self._post_calendar_now()
+        await self._show(interaction)
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="Bot manager role (optional)",
+        min_values=0,
+        max_values=1,
+        row=3,
     )
     async def manager_role_select(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
         # Holders of the manager role must not be able to hand it to another role:
@@ -334,30 +506,6 @@ class GuildConfigView(OwnedView):
             return
         await self._update(interaction, manager_role_id=role.id if role is not None else None)
 
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=_TEXT_CHANNEL_TYPES,
-        placeholder=f"Event calendar channel (daily post at {DAILY_POST_TIME:%H:%M} UTC)",
-        min_values=0,
-        max_values=1,
-        row=3,
-    )
-    async def calendar_channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        channel_id = select.values[0].id if select.values else None
-        if channel_id is None:
-            await self._update(interaction, calendar_channel_id=None)
-            return
-        if not self._kingdom:
-            # The post needs a kingdom: ask for it now and save both together.
-            await interaction.response.send_modal(ServerKingdomModal(self, pending_channel_id=channel_id))
-            return
-        await interaction.response.defer()
-        await self._guild_config_service.update_for_guild(
-            self._guild_id, calendar_channel_id=channel_id, calendar_last_posted_on=None
-        )
-        await self._post_calendar_now()
-        await self._show(interaction)
-
 
 class GuildConfigHandler:
     """Manager-only guild configuration command handler."""
@@ -369,10 +517,13 @@ class GuildConfigHandler:
         admin_user_ids: set[int] | None = None,
         access_policy: AccessPolicy | None = None,
         calendar_handler=None,
+        gift_handler=None,
     ):
         self._bot = bot
         self._guild_config_service = guild_config_service
         self._calendar_handler = calendar_handler
+        # Posts the gift-code sign-up panel for the setup checklist (``post_panel(channel)``).
+        self._gift_handler = gift_handler
         self._admin_user_ids = admin_user_ids or set()
         self._access = access_policy or AccessPolicy(
             self._admin_user_ids,
@@ -381,7 +532,7 @@ class GuildConfigHandler:
         logger.info("GuildConfigHandler initialized")
 
     def register_commands(self):
-        @self._bot.tree.command(name="settings", description="Open the server's bot settings: kingdom, channels, manager role, AI replies")
+        @self._bot.tree.command(name="settings", description="Server setup and bot settings: kingdom, channels, timezone, manager role, AI replies")
         @manager_only_command
         async def configure(interaction: discord.Interaction):
             await self._handle_configure(interaction)
@@ -403,6 +554,7 @@ class GuildConfigHandler:
             access_policy=self._access,
             guild=interaction.guild if isinstance(interaction.guild, discord.Guild) else None,
             calendar=self._calendar_handler,
+            gift=self._gift_handler,
         )
         view.message = await interaction.edit_original_response(
             embed=await view.build_embed(),

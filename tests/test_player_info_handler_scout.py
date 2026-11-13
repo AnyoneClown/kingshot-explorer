@@ -187,9 +187,30 @@ def test_player_card_uses_local_hero_and_gear_ids(tmp_path):
     assert strip.height == 216
 
 
-def test_scout_single_summary_navigation_and_unavailable_data():
+def _scout_interaction(guild_id=None):
+    return SimpleNamespace(
+        user=SimpleNamespace(id=1, name="Tester", discriminator="0"),
+        guild=SimpleNamespace(id=guild_id) if guild_id else None,
+        guild_id=guild_id,
+        response=SimpleNamespace(defer=AsyncMock(), edit_message=AsyncMock(), send_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+
+def _settings(kingdom):
+    return SimpleNamespace(get_settings=AsyncMock(return_value=SimpleNamespace(kingdom_id=kingdom)))
+
+
+def test_scout_posts_one_card_of_the_top_five_without_controls():
     async def check():
-        entries = [{"rank": index + 1, "fid": None, "uid": index + 200, "score": index} for index in range(20)]
+        # The API may return more rows than asked for: the report still has five.
+        entries = [
+            {"rank": index + 1, "uid": index + 200, "fid": index + 100, "name": f"Board {index}", "score": 3000 - index,
+             "alliance": {"aid": 1, "abbr": "KOR", "name": "Serendipity"}}
+            for index in range(20)
+        ]
         active, peak = 0, 0
 
         async def get_player(uid):
@@ -200,7 +221,8 @@ def test_scout_single_summary_navigation_and_unavailable_data():
             active -= 1
             index = int(uid) - 200
             return {"success": True, "data": {
-                "uid": int(uid), "fid": index + 100, "name": f"Player {index}", "power": 0, "stove_lv": 0,
+                "uid": int(uid), "fid": index + 100, "name": f"Player {index}", "power": 773_164_098, "stove_lv": 70,
+                "kid": 830, "alliance": {"aid": 2, "abbr": "NEW", "name": "Moved"}, "rank": 99, "score": 999999,
             }}
 
         service = SimpleNamespace(
@@ -209,115 +231,59 @@ def test_scout_single_summary_navigation_and_unavailable_data():
             get_player_by_fid=AsyncMock(),
         )
         handler = PlayerInfoHandler(object(), object(), object(), service)
-        handler._fetch_arena_heroes = AsyncMock(side_effect=[[{"id": 50024}], None, None])
-        handler._render_player_card = AsyncMock(
-            side_effect=[card_renderer.PlayerCard(b"image", heroes_drawn=1)] + [card_renderer.PlayerCard(None)] * 2
-        )
         interaction = _scout_interaction()
-        message = interaction.followup.send.return_value
-        await handler._handle_scout_slash(interaction, 830, 99)
+        await handler._handle_scout_slash(interaction, 830)
+
+        service.get_kingdom_board.assert_awaited_once_with(20, 830, limit=5, resolve=True)
+        # One profile per shown player, all at once; nothing for the rows beyond the fifth.
+        assert service.get_player.await_count == 5 and peak == 5
+        service.get_player_by_fid.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once_with(thinking=True)
         interaction.followup.send.assert_awaited_once()
-        assert service.get_player.await_count == 15
-        assert 1 <= peak <= 3
-        service.get_player_by_fid.assert_not_awaited()
-        view = interaction.followup.send.call_args.kwargs["view"]
-        assert len(view.entries) == 15
-        # The ranking is a picture card attached to the summary.
         sent = interaction.followup.send.call_args.kwargs
-        assert [file.filename for file in sent["files"]] == ["leaderboard.png"]
-        assert sent["embed"].image.url == "attachment://leaderboard.png"
-        assert sent["embed"].description == "**Mystic Trial leaderboard**"
-        first_row = view.leaderboard_rows()[0]
-        assert (first_row.rank, first_row.name, first_row.text, first_row.value) == (1, "Player 0", "0", 0.0)
-        assert view.previous_button.disabled and not view.next_button.disabled
-        assert view.summary_button.disabled
-        assert "public message" in view.build_summary().footer.text
-        # Without a card the ranking is text.
-        card, view.summary_card = view.summary_card, None
-        assert "**#1 Player 0** · 0" in view.build_summary().description
-        assert len(view.build_summary().description) < 4096
-        view.summary_card = card
-        assert not any(option.default for option in view.player_select.options)
-        await _select(view, interaction, "0")
-        first = interaction.edit_original_response.call_args.kwargs
-        assert [file.filename for file in first["attachments"]] == ["player_card.png"]
-        assert first["embed"].image.url == "attachment://player_card.png"
-        fields = {field.name: field.value for field in first["embed"].fields}
-        assert fields["Power"] == "0" and fields["Castle Level"] == "0"
-        assert fields["VIP Level"] == "Unavailable"
-        await view.next_button.callback(interaction)
-        second = interaction.edit_original_response.call_args.kwargs
-        assert second["attachments"] == []
-        assert second["embed"].fields[-1].value == "Loadout unavailable"
-        assert view.current_player == 1
-        await view.summary_button.callback(interaction)
-        # Back on the summary the leaderboard card replaces the player card.
-        back = interaction.response.edit_message.call_args.kwargs
-        assert [file.filename for file in back["attachments"]] == ["leaderboard.png"]
-        assert back["embed"].image.url == "attachment://leaderboard.png"
-        await _select(view, interaction, "14")
-        assert view.current_player == 14 and view.next_button.disabled
-        assert not view.showing_summary
-        assert view.player_select.options[14].default
-        entered, release = asyncio.Event(), asyncio.Event()
-
-        async def slow_arena(uid):
-            entered.set()
-            await release.wait()
-            return None
-
-        handler._fetch_arena_heroes = slow_arena
-        handler._render_player_card = AsyncMock(return_value=card_renderer.PlayerCard(None))
-        pending = asyncio.create_task(_select(view, interaction, "14"))
-        await entered.wait()
-        assert not await view.interaction_check(interaction)
-        assert view.current_player == 14
-        release.set()
-        await pending
-        assert not view._loading
-        assert service.get_player.await_count == 15
-        service.get_player_by_fid.assert_not_awaited()
-        stranger = SimpleNamespace(user=SimpleNamespace(id=2), response=SimpleNamespace(send_message=AsyncMock()))
-        assert not await view.interaction_check(stranger)
-        assert stranger.response.send_message.call_args.kwargs["ephemeral"]
-        await view.on_timeout()
-        assert all(item.disabled for item in view.children)
-        message.edit.assert_awaited_once()
-        assert view.timeout == 900
+        assert "view" not in sent
+        assert [file.filename for file in sent["files"]] == ["scout.png"]
+        assert sent["files"][0].fp.read(8) == b"\x89PNG\r\n\x1a\n"
+        embed = sent["embed"]
+        assert embed.title == "🔎 Scout Report · Kingdom 830"
+        assert embed.description == "**Mystic Trial · top 5**"
+        assert embed.image.url == "attachment://scout.png"
+        assert embed.fields[0].name == "Governor IDs"
+        assert embed.fields[0].value == "#1 `100` · #2 `101` · #3 `102` · #4 `103` · #5 `104`"
+        assert "/player" in embed.footer.text and "/leaderboard" in embed.footer.text
 
     asyncio.run(check())
 
 
-async def _select(view, interaction, value):
-    view.player_select._values = [value]
-    await view.player_select.callback(interaction)
+def test_scout_rows_take_rank_and_score_from_the_board_and_the_rest_from_the_profile():
+    entry = {"rank": 1, "uid": 28584855, "fid": 117248174, "name": "Old Name", "score": 2846,
+             "alliance": {"abbr": "OLD", "name": "Old Alliance"}}
+    profile = {"uid": 28584855, "fid": 117248174, "name": "Resolved Player", "power": 773_164_098, "stove_lv": 70,
+               "alliance": {"abbr": "FKA", "name": "FateKillsAll"}, "rank": 99, "score": 999999}
 
+    player = PlayerInfoHandler._scout_player(entry, profile, 0, 830)
+    row = player["row"]
+    assert (row.rank, row.name, row.tag) == (1, "Resolved Player", "FKA")
+    assert (row.town_center, row.power, row.score, row.value) == ("TG8", "773.16M", "2,846", 2846.0)
+    assert player["player_id"] == "117248174"
 
-def _scout_interaction():
-    return SimpleNamespace(
-        user=SimpleNamespace(id=1, name="Tester", discriminator="0"),
-        guild=None,
-        response=SimpleNamespace(defer=AsyncMock(), edit_message=AsyncMock(), send_message=AsyncMock()),
-        followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))),
-        edit_original_response=AsyncMock(),
-    )
+    # Without a profile the board entry still gives a full row, minus the two columns.
+    bare = PlayerInfoHandler._scout_player(entry, None, 0, 830)["row"]
+    assert (bare.name, bare.tag, bare.town_center, bare.power, bare.score) == ("Old Name", "OLD", "", "", "2,846")
+    # Nothing known at all: a labeled row at its position on the board.
+    unknown = PlayerInfoHandler._scout_player({"uid": 5}, None, 3, 830)
+    assert (unknown["row"].rank, unknown["row"].name, unknown["row"].score) == (4, "Unknown player", "")
+    assert unknown["player_id"] is None
+    # Hidden or zero values are not printed as "0".
+    hidden = PlayerInfoHandler._scout_player(entry, dict(profile, power=0, stove_lv=0), 0, 830)["row"]
+    assert (hidden.town_center, hidden.power) == ("", "")
+    assert PlayerInfoHandler._scout_player(entry, dict(profile, stove_lv=28), 0, 830)["row"].town_center == "28"
 
 
 @pytest.mark.parametrize("source", ["uid_only", "fid_only", "embedded"])
-def test_scout_resolves_identity_for_summary_selector_and_cached_details(source):
+def test_scout_looks_a_profile_up_by_uid_then_governor_id_and_reuses_an_embedded_one(source):
     async def check():
-        profile = {
-            "uid": 28584855,
-            "fid": 117248174,
-            "name": "Resolved Player",
-            "power": 0,
-            "vip": 0,
-            "stove_lv": 0,
-            "kid": 830,
-            "alliance": {"abbr": "FKA", "name": "FateKillsAll"},
-            "rank": 99,
-            "score": 999999,
-        }
+        profile = {"uid": 28584855, "fid": 117248174, "name": "Resolved Player", "power": 5, "kid": 830}
         entry = {"rank": 1, "uid": 28584855, "score": 2846, "fid": None}
         if source == "fid_only":
             entry.pop("uid")
@@ -325,32 +291,11 @@ def test_scout_resolves_identity_for_summary_selector_and_cached_details(source)
         elif source == "embedded":
             entry["player"] = profile
         service = SimpleNamespace(
-            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {"entries": [entry]}}),
             get_player=AsyncMock(return_value={"success": True, "data": profile}),
             get_player_by_fid=AsyncMock(return_value={"success": True, "data": profile}),
         )
         handler = PlayerInfoHandler(object(), object(), object(), service)
-        handler._fetch_arena_heroes = AsyncMock(return_value=None)
-        interaction = _scout_interaction()
-        await handler._handle_scout_slash(interaction, 830, 5)
-        view = interaction.followup.send.call_args.kwargs["view"]
-        assert view.entries[0]["player"] == profile
-        assert view.entries[0]["rank"] == 1 and view.entries[0]["score"] == 2846
-        (row,) = view.leaderboard_rows()[:1]
-        assert (row.rank, row.name, row.text) == (1, "Resolved Player", "2,846")
-        assert all(other.text != "999,999" for other in view.leaderboard_rows())
-        assert "Resolved Player" in view.player_select.options[0].label
-        assert "117248174" in view.player_select.options[0].description
-        await _select(view, interaction, "0")
-        embed = interaction.edit_original_response.call_args.kwargs["embed"]
-        fields = {field.name: field.value for field in embed.fields}
-        assert embed.title == "📊 Resolved Player"
-        assert fields["Player ID"] == "`117248174`"
-        assert fields["Power"] == "0" and fields["Castle Level"] == "0"
-        assert fields["Alliance"] == "`[FKA]` FateKillsAll"
-        assert fields["Mystic Trial"] == "Kingdom Rank: #1\nScore: 2,846"
-        await view.summary_button.callback(interaction)
-        await _select(view, interaction, "0")
+        assert await handler._scout_profiles([entry]) == [profile]
         if source == "uid_only":
             service.get_player.assert_awaited_once_with("28584855")
             service.get_player_by_fid.assert_not_awaited()
@@ -364,39 +309,131 @@ def test_scout_resolves_identity_for_summary_selector_and_cached_details(source)
     asyncio.run(check())
 
 
-def test_scout_unavailable_profile_preserves_board_score_and_uid_arena(tmp_path):
+def test_scout_is_not_held_up_by_failed_or_slow_profiles():
     async def check():
-        uid = 28584855
+        entries = [{"rank": index + 1, "uid": index + 200, "name": f"Board {index}", "score": 10 - index}
+                   for index in range(3)]
+
+        async def get_player(uid):
+            if uid == "200":
+                return {"success": False, "error_message": "Temporarily unavailable"}
+            if uid == "201":
+                raise RuntimeError("boom")
+            await asyncio.sleep(60)
+
         service = SimpleNamespace(
-            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {
-                "entries": [{"rank": 1, "uid": uid, "score": 2846, "fid": None}],
-            }}),
-            get_player=AsyncMock(return_value={"success": False, "error_message": "Temporarily unavailable"}),
+            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {"entries": entries}}),
+            get_player=AsyncMock(side_effect=get_player),
             get_player_by_fid=AsyncMock(),
-            get_arena=AsyncMock(return_value={"success": True, "data": {"heroes": [{"id": 50024}]}}),
         )
         handler = PlayerInfoHandler(object(), object(), object(), service)
-        handler.ASSET_DIRS = card_renderer.AssetDirs(
-            heroes=tmp_path, hero_gear=tmp_path, governor_gear=tmp_path, charms=tmp_path
-        )
-        (tmp_path / "50024.png").write_bytes(card_renderer.write_rgba_png(1, 1, bytes([255, 0, 0, 255])))
+        handler.SCOUT_PROFILE_SECONDS = 0.05
+        assert await handler._scout_profiles(entries) == [None, None, None]
+
         interaction = _scout_interaction()
-        await handler._handle_scout_slash(interaction, 830, 5)
-        view = interaction.followup.send.call_args.kwargs["view"]
-        assert view.leaderboard_rows()[0].text == "2,846"
-        assert "Unavailable" in view.player_select.options[0].description
-        await _select(view, interaction, "0")
-        sent = interaction.edit_original_response.call_args.kwargs
-        fields = {field.name: field.value for field in sent["embed"].fields}
-        assert fields["Player ID"] == "`Unavailable`"
-        assert fields["Power"] == "Unavailable"
-        assert fields["Mystic Trial"] == "Kingdom Rank: #1\nScore: 2,846"
-        assert sent["attachments"][0].filename == "player_card.png"
-        assert fields["Governor Gear"] == "Unavailable"
-        service.get_arena.assert_awaited_once_with(str(uid))
-        service.get_player_by_fid.assert_not_awaited()
-        assert service.get_player.await_count >= 1
-        assert all(call.args == (str(uid),) for call in service.get_player.await_args_list)
+        await handler._handle_scout_slash(interaction, 830)
+        sent = interaction.followup.send.call_args.kwargs
+        assert [file.filename for file in sent["files"]] == ["scout.png"]
+        # No Governor ID is known, so the field is left out.
+        assert not sent["embed"].fields
+
+    asyncio.run(check())
+
+
+def test_scout_text_fallback_lists_the_same_columns(monkeypatch):
+    async def check():
+        entries = [{"rank": 1, "uid": 200, "fid": 100, "name": "Mila_*", "score": 2846,
+                    "alliance": {"abbr": "AQM"}, "player": {"fid": 100, "name": "Mila_*", "power": 1_500_000,
+                                                             "stove_lv": 35, "alliance": {"abbr": "AQM"}}},
+                   {"rank": 2, "uid": 201, "name": "Bare", "score": 12, "player": {"error": "uid not found"}}]
+        service = SimpleNamespace(
+            get_kingdom_board=AsyncMock(return_value={"success": True, "data": {"entries": entries}}),
+            get_player=AsyncMock(return_value={"success": False}),
+            get_player_by_fid=AsyncMock(),
+        )
+        handler = PlayerInfoHandler(object(), object(), object(), service)
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("no fonts")
+
+        monkeypatch.setattr("handlers.player_info_handler.ranking_card_renderer.render_scout_card", broken)
+        interaction = _scout_interaction()
+        await handler._handle_scout_slash(interaction, 830)
+        sent = interaction.followup.send.call_args.kwargs
+        assert sent["files"] == []
+        embed = sent["embed"]
+        assert embed.image.url is None
+        lines = embed.description.split("\n")
+        assert lines[0] == "**Mystic Trial · top 2**"
+        assert lines[1] == (
+            "**#1** `[AQM]` Mila\\_\\* · Town Center TG1 · Power 1.5M · Trial stages 2,846"
+        )
+        assert lines[2] == "**#2** Bare · Town Center unavailable · Power unavailable · Trial stages 12"
+        assert embed.fields[0].value == "#1 `100`"
+
+    asyncio.run(check())
+
+
+def test_scout_uses_the_servers_kingdom_and_asks_privately_when_there_is_none():
+    async def check():
+        board = {"success": True, "data": {"entries": [{"rank": 1, "uid": 200, "name": "Mila", "score": 5}]}}
+        service = SimpleNamespace(
+            get_kingdom_board=AsyncMock(return_value=board),
+            get_player=AsyncMock(return_value={"success": False}),
+            get_player_by_fid=AsyncMock(),
+        )
+        handler = PlayerInfoHandler(object(), object(), object(), service, guild_configuration_service=_settings(795))
+        interaction = _scout_interaction(guild_id=10)
+        await handler._handle_scout_slash(interaction)
+        # The lookup is acknowledged privately; the report itself is a public follow-up.
+        interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+        assert service.get_kingdom_board.await_args.args == (20, 795)
+        sent = interaction.followup.send.call_args.kwargs
+        assert sent["embed"].title == "🔎 Scout Report · Kingdom 795" and "ephemeral" not in sent
+        interaction.edit_original_response.assert_awaited_once_with(content="Scout report ready.")
+        interaction.delete_original_response.assert_awaited_once()
+
+        for handler, guild_id, hinted in (
+            (PlayerInfoHandler(object(), object(), object(), service, guild_configuration_service=_settings(None)), 10, True),
+            (PlayerInfoHandler(object(), object(), object(), service), None, False),
+        ):
+            service.get_kingdom_board.reset_mock()
+            asked = _scout_interaction(guild_id=guild_id)
+            await handler._handle_scout_slash(asked)
+            asked.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+            embed = asked.edit_original_response.call_args.kwargs["embed"]
+            assert embed.title == "Which kingdom?" and "`/scout kingdom:830`" in embed.description
+            assert ("`/settings`" in embed.description) is hinted
+            asked.followup.send.assert_not_awaited()
+            service.get_kingdom_board.assert_not_awaited()
+
+    asyncio.run(check())
+
+
+def test_scout_reports_board_problems():
+    async def check():
+        service = SimpleNamespace(
+            get_kingdom_board=AsyncMock(return_value={"success": False, "error_message": "gateway down"}),
+            get_player=AsyncMock(),
+            get_player_by_fid=AsyncMock(),
+        )
+        handler = PlayerInfoHandler(object(), object(), object(), service, guild_configuration_service=_settings(795))
+        public = _scout_interaction()
+        await handler._handle_scout_slash(public, 830)
+        failed = public.followup.send.call_args.kwargs["embed"]
+        assert failed.title == "❌ Could Not Scout Kingdom 830" and failed.description == "gateway down"
+
+        # After a private acknowledgement the problem replaces the private receipt.
+        private = _scout_interaction(guild_id=10)
+        await handler._handle_scout_slash(private)
+        assert private.edit_original_response.call_args.kwargs["embed"].title == "❌ Could Not Scout Kingdom 795"
+        private.followup.send.assert_not_awaited()
+
+        service.get_kingdom_board = AsyncMock(return_value={"success": True, "data": {"entries": []}})
+        empty = _scout_interaction()
+        await handler._handle_scout_slash(empty, 830)
+        assert "No Mystic Trial leaderboard entries" in empty.followup.send.call_args.kwargs["embed"].description
+        service.get_player.assert_not_awaited()
 
     asyncio.run(check())
 
@@ -506,21 +543,27 @@ def test_gear_summary_covers_hidden_unknown_and_missing_profiles():
     assert unknown.startswith("1/6 slots equipped · 0 charms") and "icons unavailable" in unknown
 
 
-def test_scout_options_use_ranges_and_reject_bad_values_privately():
+def test_scout_has_one_optional_kingdom_option_and_rejects_bad_values_privately():
     from discord.ext import commands
 
     bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
     handler = PlayerInfoHandler(object(), bot, object(), SimpleNamespace())
     handler.register_commands()
     command = bot.tree.get_command("scout")
-    kingdom = command.get_parameter("kingdom")
     assert bot.tree.get_command("player") is not None and bot.tree.get_command("stats") is None
-    limit = command.get_parameter("limit")
-    assert (kingdom.min_value, kingdom.max_value) == (1, 99999)
-    assert (limit.min_value, limit.max_value, limit.default) == (1, 15, 5)
+    assert [parameter.name for parameter in command.parameters] == ["kingdom"]
+    kingdom = command.get_parameter("kingdom")
+    assert (kingdom.min_value, kingdom.max_value, kingdom.required) == (1, 99999, False)
 
-    for kingdom_number, scout_limit in ((0, 5), (100000, 5), (830, 0)):
+    for kingdom_number in (0, 100000):
         interaction = _scout_interaction()
-        asyncio.run(handler._handle_scout_slash(interaction, kingdom_number, scout_limit))
+        asyncio.run(handler._handle_scout_slash(interaction, kingdom_number))
         interaction.response.defer.assert_not_awaited()
         assert interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    # Without the Data API there is nothing to scout: said privately, before any lookup.
+    unconfigured = PlayerInfoHandler(object(), object(), object(), None)
+    interaction = _scout_interaction()
+    asyncio.run(unconfigured._handle_scout_slash(interaction, 830))
+    interaction.response.defer.assert_not_awaited()
+    assert "Not Configured" in interaction.response.send_message.call_args.kwargs["embed"].title

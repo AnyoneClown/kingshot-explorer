@@ -6,6 +6,8 @@ import logging
 import time
 from dataclasses import dataclass, fields
 from datetime import date
+from functools import lru_cache
+from zoneinfo import ZoneInfo, available_timezones
 
 from sqlalchemy import select
 
@@ -24,8 +26,47 @@ EDITABLE_GUILD_SETTINGS = frozenset(
         "calendar_channel_id",
         "kingdom_id",
         "calendar_last_posted_on",
+        "time_zone",
     }
 )
+
+# Timezone of a server that has not chosen one.
+DEFAULT_TIME_ZONE = "UTC"
+
+
+@lru_cache(maxsize=1)
+def _time_zone_names() -> dict[str, str]:
+    """Every known IANA timezone by its lower-case name."""
+    return {name.casefold(): name for name in available_timezones()}
+
+
+def canonical_time_zone(raw: str | None) -> str | None:
+    """The IANA name for what a manager typed (``europe/kyiv``, ``New York``), or None.
+
+    Matching ignores case and treats spaces as underscores; a city alone
+    (``Kyiv``) is accepted when exactly one timezone ends with it. ``GMT+2`` is not
+    completed to ``Etc/GMT+2``: that zone is two hours *behind* UTC, the opposite of
+    what the person typing it means.
+    """
+    text = "_".join(str(raw or "").split()).casefold()
+    if not text:
+        return None
+    names = _time_zone_names()
+    name = names.get(text)
+    if name is None and "/" not in text:
+        cities = [
+            full
+            for folded, full in names.items()
+            if folded.rsplit("/", 1)[-1] == text and not folded.startswith("etc/")
+        ]
+        name = cities[0] if len(cities) == 1 else None
+    if name is None:
+        return None
+    try:
+        ZoneInfo(name)
+    except Exception:
+        return None
+    return name
 
 
 @dataclass(frozen=True)
@@ -39,6 +80,8 @@ class GuildSettings:
     calendar_channel_id: int | None = None
     kingdom_id: int | None = None
     calendar_last_posted_on: date | None = None
+    # IANA name the server's reminder times are entered in; None means UTC.
+    time_zone: str | None = None
 
     @classmethod
     def from_model(cls, model) -> "GuildSettings":

@@ -83,10 +83,12 @@ def test_guild_config_view_builds_embed_with_default_off_statuses():
 
     embed = asyncio.run(run_test())
 
-    assert embed.title == "Bot Configuration"
+    assert embed.title == "Bot settings"
     assert "Voice replies" not in embed.description
     assert "AI replies: **Disabled**" in embed.description
-    assert "✅ Everything is set up." not in embed.description
+    # Nothing is set up yet: the panel opens with the checklist, first step marked.
+    assert "**Setup: 0 of 3 steps done**" in embed.description
+    assert _step(embed, 1).startswith("➡️ **1. Kingdom** — next: press **Set kingdom**")
 
 
 def test_toggle_random_replies_button_updates_config_and_message():
@@ -102,7 +104,7 @@ def test_toggle_random_replies_button_updates_config_and_message():
 
     assert service.random_reply_updates == [True]
     assert interaction.response.deferred == (False, False)
-    assert interaction.edited_original_embed.title == "Bot Configuration"
+    assert interaction.edited_original_embed.title == "Bot settings"
     assert "AI replies: **Enabled**" in interaction.edited_original_embed.description
 
 
@@ -153,7 +155,7 @@ def test_configure_allows_server_managers():
     asyncio.run(handler._handle_configure(interaction))
 
     assert interaction.response.deferred == (True, True)
-    assert interaction.edited_original_embed.title == "Bot Configuration"
+    assert interaction.edited_original_embed.title == "Bot settings"
 
 
 def test_configure_allows_env_admin_without_server_admin_permission():
@@ -171,7 +173,7 @@ def test_configure_allows_env_admin_without_server_admin_permission():
     asyncio.run(handler._handle_configure(interaction))
 
     assert interaction.response.deferred == (True, True)
-    assert interaction.edited_original_embed.title == "Bot Configuration"
+    assert interaction.edited_original_embed.title == "Bot settings"
     assert interaction.edited_original_view is not None
 
 
@@ -303,25 +305,72 @@ def _calendar_view(service, calendar=None):
     )
 
 
-def _calendar_line(embed):
-    return next(line for line in embed.description.splitlines() if line.startswith("Event calendar:"))
+def _step(embed, number):
+    """The line of one setup step in the checklist."""
+    return next(line for line in embed.description.splitlines() if f"**{number}. " in line)
 
 
-def test_config_embed_describes_the_calendar_setup():
+def test_setup_checklist_marks_done_steps_and_the_next_one():
     async def run_test(**values):
         view = _calendar_view(CalendarConfigService(**values))
         embed = await view.build_embed()
-        kingdom_line = next(line for line in embed.description.splitlines() if line.startswith("Kingdom:"))
-        return kingdom_line, _calendar_line(embed), view.kingdom_button.label
+        return [_step(embed, number) for number in (1, 2, 3)], view.kingdom_button.label, embed.description
 
-    assert asyncio.run(run_test()) == ("Kingdom: Not set", "Event calendar: Not set", "Set kingdom")
-    assert asyncio.run(run_test(calendar_channel_id=555, kingdom_id=795)) == (
+    steps, kingdom_label, description = asyncio.run(run_test())
+    assert "**Setup: 0 of 3 steps done**" in description and kingdom_label == "Set kingdom"
+    assert steps == [
+        "➡️ **1. Kingdom** — next: press **Set kingdom** and enter the kingdom this server plays in.",
+        "⬜ **2. Gift codes** — pick the channel for new codes and their results in the "
+        "**Gift-code channel** menu.",
+        "⬜ **3. Daily event calendar** — pick its channel in the **Event calendar channel** menu.",
+    ]
+
+    steps, kingdom_label, description = asyncio.run(run_test(kingdom_id=795))
+    assert "**Setup: 1 of 3 steps done**" in description and kingdom_label == "Kingdom: 795"
+    assert steps[0] == "✅ **1. Kingdom** — **795**"
+    assert steps[1].startswith("➡️ **2. Gift codes** — next: pick the channel")
+    assert steps[2].startswith("⬜ **3. Daily event calendar** — ")
+
+    # A calendar channel without a kingdom is saved but not posted yet.
+    steps, _, _ = asyncio.run(run_test(calendar_channel_id=555))
+    assert steps[2] == "✅ **3. Daily event calendar** — <#555> · not posted yet: press **Set kingdom**"
+
+    steps, _, description = asyncio.run(run_test(kingdom_id=795, calendar_channel_id=555))
+    assert "**Setup: 2 of 3 steps done**" in description
+    assert steps[2] == "✅ **3. Daily event calendar** — <#555> · every day at 08:00 UTC"
+    # The other settings stay listed under the checklist.
+    assert "Bot manager role: Not set\nReminder timezone: **UTC**\nAI replies: **Disabled**" in description
+
+
+def test_finished_setup_reads_as_plain_settings():
+    async def run_test():
+        view = _calendar_view(
+            CalendarConfigService(
+                kingdom_id=795, gift_code_channel_id=444, calendar_channel_id=555, time_zone="Europe/Kyiv"
+            )
+        )
+        return (await view.build_embed()).description.splitlines(), view
+
+    lines, view = asyncio.run(run_test())
+    assert lines[:7] == [
+        "Server: **Test Guild**",
         "Kingdom: **795**",
+        "Gift-code announcements: <#444>",
         "Event calendar: <#555> · every day at 08:00 UTC",
-        "Kingdom: 795",
-    )
-    assert "press **Set kingdom**" in asyncio.run(run_test(calendar_channel_id=555))[1]
-    assert asyncio.run(run_test(kingdom_id=795))[:2] == ("Kingdom: **795**", "Event calendar: Not set")
+        "Bot manager role: Not set",
+        "Reminder timezone: **Europe/Kyiv**",
+        "AI replies: **Disabled**",
+    ]
+    assert not any("Setup:" in line or "**1. " in line for line in lines)
+    # Refresh is gone; without a gift handler there is no panel button either.
+    assert [item.label for item in view.children if hasattr(item, "label")] == [
+        "Kingdom: 795", "Timezone: Europe/Kyiv", "AI Replies: Off",
+    ]
+    assert [item.placeholder for item in view.children if hasattr(item, "placeholder")] == [
+        "Gift-code channel (new codes, results and the sign-up panel)",
+        "Event calendar channel (daily post at 08:00 UTC)",
+        "Bot manager role (optional)",
+    ]
 
 
 def test_picking_a_calendar_channel_without_a_kingdom_asks_for_the_kingdom():
@@ -348,9 +397,10 @@ def test_picking_a_calendar_channel_without_a_kingdom_asks_for_the_kingdom():
         {"kingdom_id": 795, "calendar_last_posted_on": None, "calendar_channel_id": 555}
     ]
     assert calendar.posted == [999]
-    description = submit.edited_original_embed.description
-    assert "Kingdom: **795**" in description and "Event calendar: <#555> · every day at 08:00 UTC" in description
-    assert "✅ Posted today's calendar in <#555>." in description
+    embed = submit.edited_original_embed
+    assert _step(embed, 1) == "✅ **1. Kingdom** — **795**"
+    assert _step(embed, 3) == "✅ **3. Daily event calendar** — <#555> · every day at 08:00 UTC"
+    assert "✅ Posted today's calendar in <#555>." in embed.description
 
 
 def test_picking_a_calendar_channel_with_a_kingdom_saves_and_posts():
@@ -389,8 +439,8 @@ def test_clearing_the_calendar_channel_stops_the_daily_post():
 
     assert service.updates == [{"calendar_channel_id": None}]
     assert calendar.posted == []
-    assert _calendar_line(interaction.edited_original_embed) == "Event calendar: Not set"
-    assert "Kingdom: **795**" in interaction.edited_original_embed.description
+    assert _step(interaction.edited_original_embed, 3).startswith("⬜ **3. Daily event calendar** — pick its channel")
+    assert _step(interaction.edited_original_embed, 1) == "✅ **1. Kingdom** — **795**"
 
 
 def test_kingdom_button_opens_the_form_with_the_saved_kingdom():
@@ -438,7 +488,8 @@ def test_server_kingdom_unknown_to_the_site_is_not_saved():
     assert service.updates == [] and calendar.posted == []
     assert "Kingdom **4242** is not on the kingshot.net calendar" in interaction.followups[0][0]
     assert interaction.followups[0][1] == {"ephemeral": True}
-    assert _calendar_line(interaction.edited_original_embed) == "Event calendar: Not set"
+    assert _step(interaction.edited_original_embed, 1).startswith("➡️ **1. Kingdom** — next:")
+    assert _step(interaction.edited_original_embed, 3).startswith("⬜ **3. Daily event calendar** — pick its channel")
 
 
 def test_server_kingdom_is_saved_when_the_site_cannot_be_asked():
@@ -469,3 +520,178 @@ def test_server_kingdom_form_is_only_for_the_panel_owner():
     asyncio.run(run_test())
 
     assert service.updates == []
+
+
+# ---------------------------------------------------------- sign-up panel
+
+
+class FakeGiftHandler:
+    def __init__(self, error=None):
+        self.error = error
+        self.posted = []
+
+    async def post_panel(self, channel):
+        if self.error is not None:
+            raise self.error
+        self.posted.append(channel.id)
+
+
+def _panel_view(service, gift, channels=None):
+    guild = SimpleNamespace(
+        get_channel=(channels or {}).get, get_role=lambda role_id: None, me=None,
+    )
+    return GuildConfigView(
+        guild_id=999, author_id=111, guild_name="Test Guild", guild_config_service=service, gift=gift, guild=guild,
+    )
+
+
+def _button_labels(view):
+    return [item.label for item in view.children if hasattr(item, "label")]
+
+
+def test_sign_up_panel_button_needs_a_gift_handler_and_a_gift_channel():
+    async def run_test(gift, **values):
+        view = _panel_view(CalendarConfigService(**values), gift)
+        embed = await view.build_embed()
+        return view, embed
+
+    # No handler injected (or one that cannot post panels yet): no button at all.
+    for gift in (None, SimpleNamespace()):
+        view, embed = asyncio.run(run_test(gift, gift_code_channel_id=444))
+        assert "Post sign-up panel" not in _button_labels(view)
+        assert _step(embed, 2) == "✅ **2. Gift codes** — <#444>"
+
+    view, embed = asyncio.run(run_test(FakeGiftHandler()))
+    assert _button_labels(view) == ["Set kingdom", "Post sign-up panel", "Timezone: UTC", "AI Replies: Off"]
+    assert view.post_panel_button.disabled
+    assert _step(embed, 2).endswith("menu, then post the sign-up panel there.")
+
+    view, embed = asyncio.run(run_test(FakeGiftHandler(), gift_code_channel_id=444))
+    assert not view.post_panel_button.disabled
+    assert _step(embed, 2) == (
+        "✅ **2. Gift codes** — <#444> · press **Post sign-up panel** to put the sign-up buttons there"
+    )
+
+
+def test_picking_the_gift_channel_points_at_the_sign_up_panel_button():
+    service = CalendarConfigService(kingdom_id=795)
+    interaction = ModalInteraction()
+
+    async def run_test():
+        view = _panel_view(service, FakeGiftHandler())
+        await view.build_embed()
+        view.gift_channel_select._values = [SimpleNamespace(id=444)]
+        await view.gift_channel_select.callback(interaction)
+        return view
+
+    view = asyncio.run(run_test())
+
+    assert service.updates == [{"gift_code_channel_id": 444}]
+    description = interaction.edited_original_embed.description
+    assert "**Setup: 2 of 3 steps done**" in description
+    assert (
+        "✅ New gift codes are announced in <#444>. Press **Post sign-up panel** to put the sign-up buttons there."
+        in description
+    )
+    assert not view.post_panel_button.disabled
+
+
+def test_sign_up_panel_is_posted_in_the_gift_channel():
+    service = CalendarConfigService(kingdom_id=795, gift_code_channel_id=444)
+    gift = FakeGiftHandler()
+    interaction = ModalInteraction()
+
+    async def run_test():
+        view = _panel_view(service, gift, {444: SimpleNamespace(id=444)})
+        await view.build_embed()
+        await view.post_panel_button.callback(interaction)
+
+    asyncio.run(run_test())
+
+    assert gift.posted == [444]
+    embed = interaction.edited_original_embed
+    assert "✅ The sign-up panel is posted in <#444>. Pin it so members can always find it." in embed.description
+    # Once posted, the checklist stops asking for it.
+    assert _step(embed, 2) == "✅ **2. Gift codes** — <#444>"
+
+
+def test_sign_up_panel_problems_are_explained_in_the_panel():
+    import discord
+
+    forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions")
+
+    async def run_test(gift, channels, **values):
+        interaction = ModalInteraction()
+        view = _panel_view(CalendarConfigService(**values), gift, channels)
+        await view.build_embed()
+        await view.post_panel_button.callback(interaction)
+        return interaction.edited_original_embed.description
+
+    channel = {444: SimpleNamespace(id=444)}
+    description = asyncio.run(run_test(FakeGiftHandler(forbidden), channel, gift_code_channel_id=444))
+    assert "⚠️ I could not post the sign-up panel in <#444>." in description
+    assert "View Channel, Send Messages and Embed Links" in description
+
+    gift = FakeGiftHandler()
+    description = asyncio.run(run_test(gift, {}, gift_code_channel_id=444))
+    assert "I can't find <#444>. Pick the gift-code channel again." in description
+
+    description = asyncio.run(run_test(gift, channel))
+    assert "Pick the gift-code channel first, then post the sign-up panel." in description
+    assert gift.posted == []
+
+
+# ---------------------------------------------------------------- timezone
+
+
+def test_timezone_button_opens_the_form_with_the_saved_timezone():
+    async def run_test(**values):
+        interaction = ModalInteraction()
+        view = _calendar_view(CalendarConfigService(**values))
+        await view.build_embed()
+        await view.time_zone_button.callback(interaction)
+        return view.time_zone_button.label, interaction.modal.time_zone.default
+
+    assert asyncio.run(run_test()) == ("Timezone: UTC", "UTC")
+    assert asyncio.run(run_test(time_zone="Europe/Kyiv")) == ("Timezone: Europe/Kyiv", "Europe/Kyiv")
+
+
+def test_server_timezone_is_saved_under_its_tz_database_name():
+    async def run_test(value):
+        service = CalendarConfigService()
+        interaction = ModalInteraction()
+        view = _calendar_view(service)
+        await view.apply_time_zone(interaction, value)
+        return service.updates, interaction, view
+
+    for typed, saved in [
+        ("Europe/Kyiv", "Europe/Kyiv"),
+        ("  europe/kyiv ", "Europe/Kyiv"),
+        ("america/new york", "America/New_York"),
+        ("Kyiv", "Europe/Kyiv"),
+        ("utc", "UTC"),
+    ]:
+        updates, interaction, view = asyncio.run(run_test(typed))
+        assert updates == [{"time_zone": saved}]
+        description = interaction.edited_original_embed.description
+        assert f"Reminder timezone: **{saved}**" in description
+        assert f"✅ Reminder times are entered in **{saved}**" in description
+        assert view.time_zone_button.label == f"Timezone: {saved}"
+
+
+def test_unknown_timezones_are_rejected_with_examples():
+    async def run_test(value, user_id=111):
+        service = CalendarConfigService()
+        interaction = ModalInteraction(user_id=user_id)
+        await _calendar_view(service).apply_time_zone(interaction, value)
+        return service.updates, interaction.response.sent_message
+
+    for value in ("Kyiv time", "GMT+2", "Mars/Olympus", "`"):
+        updates, (message, ephemeral) = asyncio.run(run_test(value))
+        assert updates == [] and ephemeral is True
+        assert "is not a timezone I know" in message
+        assert "`Europe/Kyiv`" in message and "`America/New_York`" in message
+        assert message.count("`") % 2 == 0  # what was typed cannot break the formatting
+
+    # The form belongs to the panel's owner.
+    assert asyncio.run(run_test("Europe/Kyiv", user_id=222)) == ([], None)

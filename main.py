@@ -290,14 +290,21 @@ class TranslatorBot:
             self.bot,
             admin_user_ids=config.admin_user_ids,
             access_policy=self.access_policy,
+            guild_configuration_service=self.guild_configuration_service,
         )
         self.player_info_handler = PlayerInfoHandler(
             self.player_info_service,
             self.bot,
             interaction_tracking_service=self.interaction_tracking_service,
             kingshot_data_service=self.kingshot_data_service,
+            guild_configuration_service=self.guild_configuration_service,
         )
-        self.kvk_handler = KVKHandler(self.kvk_service, self.bot, dossier_service=self.kvk_dossier_service)
+        self.kvk_handler = KVKHandler(
+            self.kvk_service,
+            self.bot,
+            dossier_service=self.kvk_dossier_service,
+            guild_configuration_service=self.guild_configuration_service,
+        )
         self.leaderboard_handler = LeaderboardHandler(
             self.leaderboard_service,
             self.bot,
@@ -328,6 +335,7 @@ class TranslatorBot:
             admin_user_ids=config.admin_user_ids,
             access_policy=self.access_policy,
             calendar_handler=self.calendar_handler,
+            gift_handler=self.gift_code_handler,
         )
 
         self.status_handler = StatusHandler(
@@ -386,6 +394,8 @@ class TranslatorBot:
                 try:
                     logger.info("Syncing slash commands...")
                     synced = await self.bot.tree.sync()
+                    # /help mentions commands by ID, so they are clickable.
+                    self.help_handler.remember_commands(synced)
                     command_names = ", ".join(f"/{cmd.name}" for cmd in synced)
                     logger.info("Synced %s slash command(s): %s", len(synced), command_names)
                     self._has_synced_commands = True
@@ -494,11 +504,11 @@ class TranslatorBot:
         embed = discord.Embed(
             title=f"Thanks for adding {getattr(self.bot.user, 'display_name', None) or 'the bot'}",
             description=(
-                "**Server managers:** run `/giftadmin panel` in the channel where members should sign up for gift "
-                "codes, and `/settings` for the server's kingdom, the daily event calendar and an "
-                "optional bot manager role.\n"
-                "**Everyone:** run `/help` for a tour of gift codes, player lookups, the event calendar, reminders "
-                "and translation (right-click a message → Apps → Translate)."
+                "**Server managers:** run `/settings`. Its three-step checklist sets the server's kingdom, "
+                "the gift-code channel with the sign-up panel, and the daily event calendar.\n"
+                "**Everyone:** run `/gift` to get new gift codes redeemed for you automatically, and `/help` "
+                "for everything else: player lookups, rankings, KvK, the event calendar, reminders and "
+                "translation (right-click a message → Apps → Translate)."
             ),
             color=discord.Color.blurple(),
         )

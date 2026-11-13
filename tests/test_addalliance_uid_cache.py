@@ -106,9 +106,13 @@ class FakeKingshotDataService:
         return {"success": True, "data": profile}
 
 
+async def no_active_codes():
+    return {"success": True, "data": []}
+
+
 def build_handler(registry, kingshot, mightpulse=None):
     return GiftCodeHandler(
-        gift_code_service=SimpleNamespace(),
+        gift_code_service=SimpleNamespace(get_available_gift_codes=no_active_codes),
         player_info_service=SimpleNamespace(),
         bot=SimpleNamespace(),
         config=SimpleNamespace(),
@@ -150,7 +154,7 @@ def test_addalliance_uses_cached_uid_without_resolving_profile():
     ]
     embed = interaction.followup.sent_embed
     assert embed.title == "ℹ️ Alliance Already on the Gift-Code List"
-    assert "Servers set to kingdom `830` list these players in `/gift roster`" in embed.description
+    assert "Managers of servers set to kingdom `830` see these players in `/giftadmin roster`" in embed.description
     assert [(field.name, field.value) for field in embed.fields] == [
         ("Already on the list (1)", "Kept as they are."),
     ]
@@ -189,7 +193,7 @@ def test_addalliance_resolves_uncached_uid_and_stores_uid_mapping():
     ]
     embed = interaction.followup.sent_embed
     assert "Added 1 Alliance Member" in embed.title
-    assert "Servers set to kingdom `830` list these players in `/gift roster`" in embed.description
+    assert "Managers of servers set to kingdom `830` see these players in `/giftadmin roster`" in embed.description
     assert [field.name for field in embed.fields] == ["Added (1)"]
 
 
@@ -336,7 +340,7 @@ def test_addalliance_reports_missing_governor_ids_without_claiming_success():
 
     assert registry.added_players == []
     assert interaction.followup.sent_embed.title == "⚠️ No Governor IDs Available"
-    assert "`/gift add`" in interaction.followup.sent_embed.description
+    assert "**Add my ID** in `/gift`" in interaction.followup.sent_embed.description
 
 
 def test_addalliance_rejects_mismatched_alliance_payload():

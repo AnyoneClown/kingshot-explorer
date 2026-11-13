@@ -116,3 +116,26 @@ def test_compact_numbers_and_number_parsing():
     assert card_drawing.compact_number(None) == "–"
     assert card_drawing.as_number("1,234") == 1234.0
     assert card_drawing.as_number(True) is None and card_drawing.as_number("n/a") is None
+
+
+def test_scout_card_has_five_rows_at_most_and_draws_rows_with_missing_columns():
+    from services.ranking_card_renderer import ScoutRow
+
+    def scout_height(count):
+        return height(card_drawing.HEADER_HEIGHT + renderer.SCOUT_COLUMNS_HEIGHT + count * renderer.SCOUT_ROW_HEIGHT + 8)
+
+    full = [
+        ScoutRow(name=f"Player {index}", rank=index + 1, tag="KOR", town_center="TG8", power="773.16M",
+                 score="3,024", value=3024 - index)
+        for index in range(8)
+    ]
+    card = opened(renderer.render_scout_card("Kingdom 830 · Scout report", full, note="Mystic Trial top 5"))
+    assert card.width == height(card_drawing.CARD_WIDTH)
+    assert card.height == scout_height(renderer.MAX_SCOUT_ROWS)
+    assert set(renderer.PODIUM.values()) <= colors(card)
+
+    # A player whose profile could not be loaded has only a name and a score.
+    bare = [ScoutRow(name="Nobody"), ScoutRow(name="مرحبا", tag="ARB", score="12", value=12)]
+    assert opened(renderer.render_scout_card("Top", bare)).height == scout_height(2)
+    assert opened(renderer.render_scout_card("Top", [])).height == scout_height(0)
+    assert ScoutRow(name="Mila", tag="AQM").label == "[AQM] Mila" and ScoutRow(name="Mila").label == "Mila"

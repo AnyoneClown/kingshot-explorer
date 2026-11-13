@@ -1,6 +1,7 @@
-"""PNG cards for ranked lists: a leaderboard, and two kingdoms' rankings side by side.
+"""PNG cards for ranked lists: a leaderboard, a scout report, and two kingdoms' rankings side by side.
 
-Used by ``/scout`` (Mystic Trial leaderboard) and the ``/kvk prep`` dossier (top
+Used by ``/leaderboard`` (any ranking board), ``/scout`` (a kingdom's top Mystic Trial
+players with their Town Center level and power) and the KvK prep dossier (top
 alliances, top players by power and by kills). Bars are scaled to the largest value on
 the card, so the two kingdoms of a dossier can be compared at a glance.
 
@@ -35,6 +36,12 @@ LEADERBOARD_FILENAME = "leaderboard.png"
 LEADERBOARD_ROW_HEIGHT = 22
 MAX_LEADERBOARD_ROWS = 15
 
+SCOUT_FILENAME = "scout.png"
+SCOUT_COLUMNS_HEIGHT = 18
+SCOUT_ROW_HEIGHT = 30
+MAX_SCOUT_ROWS = 5
+MISSING = "–"
+
 VERSUS_COLUMN_HEADER = 20
 VERSUS_ROW_HEIGHT = 26
 MAX_VERSUS_ROWS = 5
@@ -66,7 +73,9 @@ class RankedRow:
 UNSUPPORTED_NAME = "name in an unsupported script"
 
 
-def _name(card: Card, x: float, y: float, row: RankedRow, font, max_width: float, *, anchor: str) -> None:
+def _name(
+    card: Card, x: float, y: float, row: RankedRow | ScoutRow, font, max_width: float, *, anchor: str
+) -> None:
     """Draw a row's name, or say so when none of its characters can be drawn."""
     if can_draw(row.name, font):
         card.text(x, y, ellipsize(row.label, font, px(max_width)), font, TEXT, anchor=anchor)
@@ -118,6 +127,70 @@ def render_leaderboard_card(
             if row.value:
                 card.bar(bar_left, middle - 3, (bar_right - bar_left) * min(1.0, row.value / largest), 6, color or accent)
             card.text(CARD_WIDTH - PADDING, middle, row.shown_value, value_font, TEXT, anchor="rm")
+        return card.png()
+
+
+# -------------------------------------------------------------------- scout
+
+
+@dataclass(frozen=True)
+class ScoutRow:
+    """One player of a scout report. Columns without data are printed as ``–``."""
+
+    name: str
+    rank: Optional[int] = None
+    tag: str = ""
+    town_center: str = ""
+    power: str = ""
+    score: str = ""
+    # Drives the bar under the row; None draws an empty track.
+    value: Optional[float] = None
+
+    @property
+    def label(self) -> str:
+        return f"[{self.tag}] {self.name}" if self.tag else self.name
+
+
+def render_scout_card(title: str, rows: Sequence[ScoutRow], *, note: str = "", accent: Color = BLUE) -> bytes:
+    """A kingdom's top players, one row each: rank, name, Town Center, power and score."""
+    shown = list(rows[:MAX_SCOUT_ROWS])
+    largest = max((row.value or 0 for row in shown), default=0) or 1
+    # Right edges of the three number columns.
+    town_center_right = PADDING + 262
+    power_right = PADDING + 340
+    score_right = CARD_WIDTH - PADDING
+    with RENDER_LOCK:
+        card = Card(HEADER_HEIGHT + SCOUT_COLUMNS_HEIGHT + len(shown) * SCOUT_ROW_HEIGHT + 8)
+        card.header(0, title, accent, count=len(shown), note=note)
+        column_font = get_font(8.5, 500)
+        columns_middle = HEADER_HEIGHT + SCOUT_COLUMNS_HEIGHT / 2 + 2
+        name_left = PADDING + 26
+        card.text(name_left, columns_middle, "Player", column_font, MUTED, anchor="lm")
+        card.text(town_center_right, columns_middle, "Town Center", column_font, MUTED, anchor="rm")
+        card.text(power_right, columns_middle, "Power", column_font, MUTED, anchor="rm")
+        card.text(score_right, columns_middle, "Trial stages", column_font, MUTED, anchor="rm")
+        name_font, value_font, rank_font = get_font(11, 500), get_font(11, 600), get_font(9.5, 700)
+        for index, row in enumerate(shown):
+            top = HEADER_HEIGHT + SCOUT_COLUMNS_HEIGHT + index * SCOUT_ROW_HEIGHT
+            middle = top + 12
+            rank = row.rank if row.rank is not None else index + 1
+            color = PODIUM.get(rank)
+            if color is not None:
+                card.bar(PADDING, middle - 8, 18, 16, color, radius=4)
+                card.text(PADDING + 9, middle, str(rank), rank_font, (34, 31, 29), anchor="mm")
+            else:
+                card.text(PADDING + 9, middle, str(rank), rank_font, MUTED, anchor="mm")
+            _name(card, name_left, middle, row, name_font, town_center_right - 62 - name_left, anchor="lm")
+            for right, value in (
+                (town_center_right, row.town_center),
+                (power_right, row.power),
+                (score_right, row.score),
+            ):
+                card.text(right, middle, value or MISSING, value_font, TEXT if value else MUTED, anchor="rm")
+            bar_top = top + SCOUT_ROW_HEIGHT - 7
+            card.bar(name_left, bar_top, score_right - name_left, 3, TRACK)
+            if row.value:
+                card.bar(name_left, bar_top, (score_right - name_left) * min(1.0, row.value / largest), 3, color or accent)
         return card.png()
 
 

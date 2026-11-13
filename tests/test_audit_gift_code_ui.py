@@ -61,7 +61,7 @@ async def test_roster_toggle_is_acknowledged_before_the_database_write(db):  # n
     handler = kingdom_handler(db)
     registry = handler._player_registry_service
     await register(handler, MEMBER, "401")
-    opened = interaction(MEMBER)
+    opened = interaction(MANAGER, manage=True)
     await handler._handle_list_players_slash(opened)
     view = opened.followup.sent[0]["view"]
 
@@ -94,11 +94,11 @@ async def test_remove_confirmation_is_acknowledged_before_the_database_write(db)
     registry = handler._player_registry_service
     await register(handler, MEMBER, "301")
     owner = interaction(MEMBER)
-    await handler._handle_remove_player_slash(owner, "301")
+    await handler._request_remove(owner, await registry.get_entry("301"))
 
     click = interaction(MEMBER)
     seen = record_ack_state(registry, "remove_player", click)
-    await owner.followup.sent[0]["view"].confirm_button.callback(click)
+    await owner.response.sent[0]["view"].confirm_button.callback(click)
 
     assert seen == [True]
     assert click.response.deferred == {}
@@ -186,27 +186,6 @@ async def test_status_filter_answers_in_place_without_touching_the_database(db):
 
 
 @pytest.mark.asyncio
-async def test_redeem_that_reaches_the_job_start_during_shutdown_starts_nothing(db):  # noqa: F811
-    handler = kingdom_handler(db)
-    await register(handler, MEMBER, "801")
-    registry = handler._player_registry_service
-    load_targets = registry.get_auto_redeem_targets
-
-    async def targets_then_shutdown(*args, **kwargs):
-        targets = await load_targets(*args, **kwargs)
-        handler._closing = True  # shutdown starts while the list loads
-        return targets
-
-    registry.get_auto_redeem_targets = targets_then_shutdown
-    action = interaction(MANAGER, manage=True)
-    await handler._handle_redeem_gift_code_slash(action, "LATE")
-
-    assert handler._jobs.get("LATE") is None and handler._jobs.active_jobs() == []
-    assert handler._gift_code_service.calls == [] and action.channel.sent == []
-    assert "restarting" in action.followup.sent[-1]["content"]
-
-
-@pytest.mark.asyncio
 async def test_submitted_code_reaching_the_probe_during_shutdown_is_not_probed(db):  # noqa: F811
     handler = kingdom_handler(db)
     handler._ensure_pending_worker = lambda: None
@@ -223,7 +202,7 @@ async def test_submitted_code_reaching_the_probe_during_shutdown_is_not_probed(d
 
     registry.list_owned_entries = owned_then_shutdown
     action = interaction(MEMBER)
-    await handler._handle_submit_code(action, "LATECODE")
+    await handler._handle_enter_code(action, "LATECODE")
 
     # The submitter's own accounts are looked up on the shared list, not per server.
     assert owners == [MEMBER]

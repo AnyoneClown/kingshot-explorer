@@ -12,10 +12,8 @@ from discord.ext import commands
 
 from handlers.event_handler import EventHandler, SchedulerHealth
 from handlers.guild_config_handler import GuildConfigView
-from handlers.help_handler import HelpHandler
 from handlers.permissions import AccessPolicy
-from handlers.player_info_handler import PlayerInfoHandler, ScoutReportView
-from handlers.setup_prompts import ChannelSetupView, offer_channel_setup
+from handlers.player_info_handler import PlayerInfoHandler
 from handlers.status_handler import StatusHandler
 from handlers.translation_handler import TranslationHandler, language_for_locale
 from services.guild_configuration_service import GuildConfigurationService, GuildSettings
@@ -431,10 +429,11 @@ def test_configure_shows_saved_values_in_menus_and_rechecks_manager_rights():
         assert [value.id for value in view.gift_channel_select.default_values] == [111]
         assert view.calendar_channel_select.default_values == []
         assert [value.id for value in view.manager_role_select.default_values] == [222]
-        assert (
-            "Setup 1/3 — still to pick: the server's kingdom, a channel for the daily event calendar."
-            in embed.description
-        )
+        # Setup is not finished, so the panel opens with the checklist.
+        assert "**Setup: 1 of 3 steps done**" in embed.description
+        assert "➡️ **1. Kingdom** — next: press **Set kingdom**" in embed.description
+        assert "✅ **2. Gift codes** — <#111>" in embed.description
+        assert "⬜ **3. Daily event calendar** — pick its channel" in embed.description
 
         def click(*, roles):
             sent = AsyncMock()
@@ -455,92 +454,7 @@ def test_configure_shows_saved_values_in_menus_and_rechecks_manager_rights():
     asyncio.run(check())
 
 
-def test_channel_setup_is_offered_once_missing_and_saved_on_click():
-    async def check():
-        saved = []
-        settings = SimpleNamespace(gift_code_channel_id=None, manager_role_id=None)
-
-        async def update_for_guild(guild_id, **changes):
-            saved.append((guild_id, changes))
-
-        service = SimpleNamespace(get_settings=AsyncMock(return_value=settings), update_for_guild=update_for_guild)
-        policy = AccessPolicy(guild_configuration_service=service)
-
-        def interaction(*, manage):
-            return SimpleNamespace(
-                user=SimpleNamespace(
-                    id=7, roles=[], guild_permissions=SimpleNamespace(manage_guild=manage, administrator=False)),
-                guild_id=5, guild=SimpleNamespace(id=5), channel=SimpleNamespace(id=321),
-                response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock(), is_done=lambda: False),
-                followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))),
-                edit_original_response=AsyncMock(),
-            )
-
-        member = interaction(manage=False)
-        assert not await offer_channel_setup(
-            member, setting="gift_code_channel_id", guild_config_service=service, access_policy=policy)
-        member.followup.send.assert_not_awaited()
-
-        manager = interaction(manage=True)
-        followed = []
-
-        async def on_saved(channel_id):
-            followed.append(channel_id)
-
-        assert await offer_channel_setup(
-            manager, setting="gift_code_channel_id", guild_config_service=service, access_policy=policy,
-            on_saved=on_saved,
-        )
-        offer = manager.followup.send.call_args.kwargs
-        assert offer["ephemeral"] is True and "<#321>" in offer["embed"].description
-        view = offer["view"]
-        assert isinstance(view, ChannelSetupView) and view.use_button.label == "Announce gift codes here"
-        await view.use_button.callback(manager)
-        assert saved == [(5, {"gift_code_channel_id": 321})] and followed == [321]
-        assert manager.edit_original_response.call_args.kwargs["embed"].title == "✅ Channel saved"
-
-        # Already configured: nothing is offered.
-        settings.gift_code_channel_id = 321
-        again = interaction(manage=True)
-        assert not await offer_channel_setup(
-            again, setting="gift_code_channel_id", guild_config_service=service, access_policy=policy)
-
-    asyncio.run(check())
-
-
 # ----------------------------------------------------- help, events, alliance
-
-
-def test_help_forms_respect_command_cooldowns():
-    async def check():
-        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
-        runs = []
-
-        kvk = app_commands.Group(name="kvk", description="KvK")
-
-        @kvk.command(name="prep")
-        @app_commands.checks.cooldown(1, 60.0, key=lambda interaction: interaction.user.id)
-        async def kvk_prep(interaction: discord.Interaction, kingdom_a: int, kingdom_b: int):
-            runs.append((kingdom_a, kingdom_b))
-
-        bot.tree.add_command(kvk)
-
-        handler = HelpHandler(bot, {1})
-
-        def click():
-            return SimpleNamespace(
-                user=SimpleNamespace(id=5), guild=SimpleNamespace(id=10), guild_id=10,
-                created_at=datetime.now(timezone.utc),
-                response=SimpleNamespace(send_message=AsyncMock()),
-            )
-
-        await handler.run_command(click(), "kvk prep", {"kingdom_a": 1, "kingdom_b": 2})
-        second = click()
-        await handler.run_command(second, "kvk prep", {"kingdom_a": 1, "kingdom_b": 2})
-        assert runs == [(1, 2)]
-        assert "Slow down" in second.response.send_message.call_args.args[0]
-
-    asyncio.run(check())
 
 
 def test_reminders_cannot_be_scheduled_where_the_bot_cannot_post():
@@ -590,34 +504,6 @@ def test_scheduler_shutdown_waits_for_the_running_pass():
 # ------------------------------------------------------------- player lookups
 
 
-def test_scout_next_from_the_summary_opens_the_top_player():
-    async def check():
-        handler = SimpleNamespace(
-            _build_player_data_from_kingshot=PlayerInfoHandler._build_player_data_from_kingshot,
-            _format_number=PlayerInfoHandler._format_number,
-        )
-        entries = [{"rank": index + 1, "fid": index + 100, "name": f"P{index}", "score": 1} for index in range(3)]
-        view = ScoutReportView(handler, 830, entries, 1)
-        shown = []
-
-        async def show(interaction):
-            shown.append(view.current_player)
-            view.showing_summary = False
-            view._update_controls()
-
-        view._show_player = show
-        assert view.previous_button.disabled and not view.next_button.disabled
-        await view.next_button.callback(None)
-        await view.next_button.callback(None)
-        await view.previous_button.callback(None)
-        assert shown == [0, 1, 0]
-
-        single = ScoutReportView(handler, 830, entries[:1], 1)
-        assert not single.next_button.disabled  # the only player is still reachable with Next
-
-    asyncio.run(check())
-
-
 def test_null_filled_profiles_are_retried_and_never_shown_or_cached():
     async def check():
         empty = {"success": True, "data": {"uid": 200, "name": None, "fid": None, "power": None, "kid": None}}
@@ -629,10 +515,12 @@ def test_null_filled_profiles_are_retried_and_never_shown_or_cached():
         assert service.get_player.await_count == 2
 
         service.get_player = AsyncMock(return_value=empty)
-        entry = {"uid": 200, "rank": 1}
-        assert await handler._resolve_scout_player(entry) is None
+        entry = {"uid": 200, "rank": 1, "score": 7}
+        assert await handler._scout_profile(entry) is None
         assert service.get_player.await_count == handler.EMPTY_PROFILE_ATTEMPTS
-        assert "player" not in entry  # opening the player again retries the lookup
+        # The scout row is then drawn from the board entry alone.
+        row = handler._scout_player(entry, None, 0, 830)["row"]
+        assert (row.rank, row.score, row.town_center, row.power) == (1, "7", "", "")
 
     asyncio.run(check())
 

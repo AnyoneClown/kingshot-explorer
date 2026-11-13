@@ -182,7 +182,7 @@ async def test_code_guard_is_shared_case_insensitive_and_released_with_the_task(
     await task
     await asyncio.sleep(0)
     assert guard.get("code1") is None
-    assert guard.claim(manual) is None and guard.manual_job_for_guild(5) is manual
+    assert guard.claim(manual) is None and guard.get("code1") is manual
 
 
 @pytest.mark.asyncio

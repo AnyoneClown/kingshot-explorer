@@ -1,7 +1,5 @@
-import asyncio
 from types import SimpleNamespace
 
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -145,46 +143,7 @@ async def test_auto_redemption_announces_mixed_results_with_a_success(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_manual_result_details_take_the_card_off_and_the_summary_puts_it_back(gift_cards):
-    channel = SimpleNamespace(id=789, sent=[])
-
-    async def send(**kwargs):
-        channel.sent.append(kwargs)
-        return SimpleNamespace(id=1)
-
-    channel.send = send
-    handler = make_handler()
-    results = [
-        {"player_id": "1", "status_category": handler.STATUS_SUCCESS, "kingdom": "795"},
-        {"player_id": "2", "status_category": handler.STATUS_INVALID_ID, "message": "No such player"},
-    ]
-
-    await handler._send_redemption_results_to_channel(
-        channel=channel, requester_user_id=123, gift_code="CODE", results=results
-    )
-
-    (card,) = gift_cards
-    assert card.title == "Redemption finished" and card.stats.counts[handler.STATUS_INVALID_ID] == 1
-    view = channel.sent[0]["view"]
-    click = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock()))
-    await view.details_button.callback(click)
-    opened = click.response.edit_message.call_args.kwargs
-    assert opened["attachments"] == [] and opened["embed"].title.startswith("Redemption · Failure")
-    await view.details_button.callback(click)
-    closed = click.response.edit_message.call_args.kwargs
-    assert [file.filename for file in closed["attachments"]] == ["gift-code.png"]
-    assert closed["embed"].image.url == "attachment://gift-code.png"
-
-
-@pytest.mark.asyncio
-async def test_manual_result_card_breaks_the_run_down_by_the_accounts_stored_kingdoms(gift_cards):
-    channel = SimpleNamespace(sent=[])
-
-    async def send(**kwargs):
-        channel.sent.append(kwargs)
-        return SimpleNamespace(id=1)
-
-    channel.send = send
+async def test_result_card_breaks_the_run_down_by_the_accounts_stored_kingdoms(gift_cards):
     handler = make_handler()
     # An account that already had the code is answered without a kingdom lookup, so its
     # result names no kingdom: the card has to take it from the list.
@@ -202,9 +161,7 @@ async def test_manual_result_card_breaks_the_run_down_by_the_accounts_stored_kin
         SimpleNamespace(player_id="4", kingdom="795"),
     ]
 
-    await handler._send_redemption_results_to_channel(
-        channel=channel, requester_user_id=123, gift_code="CODE", results=results, players=players
-    )
+    assert await handler._render_auto_card("CODE", results, handler._kingdoms_of(players), final=True)
 
     (card,) = gift_cards
     assert [(row.kingdom, sum(row.counts.values())) for row in card.stats.kingdoms] == [
@@ -252,131 +209,6 @@ async def test_auto_redemption_summary_stays_text_when_the_card_cannot_be_used(m
 
 
 @pytest.mark.asyncio
-async def test_manual_result_is_posted_as_normal_channel_message():
-    class FakeChannel:
-        id = 789
-
-        def __init__(self):
-            self.sent = []
-
-        async def send(self, **kwargs):
-            self.sent.append(kwargs)
-
-    channel = FakeChannel()
-    handler = make_handler()
-
-    await handler._send_redemption_results_to_channel(
-        channel=channel,
-        requester_user_id=123,
-        gift_code="CODE",
-        results=[
-            {
-                "player_id": "222",
-                "player_name": "Player",
-                "success": True,
-                "message": "OK",
-                "status_category": handler.STATUS_SUCCESS,
-            }
-        ],
-    )
-
-    assert len(channel.sent) == 2
-    assert channel.sent[0]["embed"].title == "✅ All Gift Codes Redeemed Successfully!"
-    assert "content" not in channel.sent[0]
-    # The counts are on the attached result card.
-    assert channel.sent[0]["embed"].image.url == "attachment://gift-code.png"
-    assert [file.filename for file in channel.sent[0]["files"]] == ["gift-code.png"]
-    assert "Success" not in channel.sent[0]["embed"].description
-    # The ping is a separate new message so Discord notifies the requester.
-    assert channel.sent[1]["content"].startswith("<@123>")
-    assert [user.id for user in channel.sent[1]["allowed_mentions"].users] == [123]
-
-
-@pytest.mark.asyncio
-async def test_manual_redeem_starts_background_job_and_rejects_duplicate(monkeypatch):
-    class FakeResponse:
-        def __init__(self):
-            self.deferred = False
-
-        async def defer(self, **kwargs):
-            self.deferred = True
-            self.defer_kwargs = kwargs
-
-        def is_done(self):
-            return self.deferred
-
-    class FakeFollowup:
-        def __init__(self):
-            self.sent = []
-
-        async def send(self, **kwargs):
-            self.sent.append(kwargs)
-
-    class FakeChannel:
-        id = 789
-
-        async def send(self, **kwargs):
-            del kwargs
-
-    class FakeRegistry:
-        async def get_auto_redeem_targets(self):
-            return [SimpleNamespace(player_id="222", kingdom="830", enabled=True)]
-
-    def make_interaction():
-        return SimpleNamespace(
-            id=456,
-            created_at=None,
-            response=FakeResponse(),
-            followup=FakeFollowup(),
-            user=SimpleNamespace(
-                id=123,
-                name="Admin",
-                discriminator="0",
-                display_name="Admin",
-            ),
-            guild=SimpleNamespace(id=456, name="Guild"),
-            channel=FakeChannel(),
-        )
-
-    handler = make_handler(
-        player_registry_service=FakeRegistry(),
-        config=SimpleNamespace(admin_user_ids=[123]),
-    )
-    job_started = asyncio.Event()
-    release_job = asyncio.Event()
-    captured = {}
-
-    async def fake_job(**kwargs):
-        captured.update(kwargs)
-        job_started.set()
-        await release_job.wait()
-
-    monkeypatch.setattr(handler, "_run_manual_redemption_job", fake_job)
-
-    first_interaction = make_interaction()
-    await handler._handle_redeem_gift_code_slash(first_interaction, " CODE ")
-    await job_started.wait()
-
-    assert first_interaction.response.deferred is True
-    assert first_interaction.followup.sent[0]["embed"].title == "🎁 Redemption Job Started"
-    assert first_interaction.followup.sent[0]["ephemeral"] is True
-    assert captured["gift_code"] == "CODE"
-    assert captured["actor_user_id"] == 123
-
-    # One manual job per server at a time, and one job per code.
-    second_interaction = make_interaction()
-    await handler._handle_redeem_gift_code_slash(second_interaction, "OTHER")
-    assert second_interaction.followup.sent[0]["embed"].title == "⏳ Redemption Job Already Running"
-
-    job = handler._jobs.get("code")
-    assert job is not None and job.kind == "manual" and captured["job"] is job
-    release_job.set()
-    await job.task
-    await asyncio.sleep(0)
-    assert handler._jobs.get("CODE") is None
-
-
-@pytest.mark.asyncio
 async def test_bulk_redemption_prefetches_and_persists_in_batches():
     gift_service = FakeGiftCodeService()
     tracking = FakeTrackingService()
@@ -396,9 +228,9 @@ async def test_bulk_redemption_prefetches_and_persists_in_batches():
         ),
     ]
 
-    results = await handler._run_bulk_redemption(
+    results = await handler._redemption.run_bulk(
         gift_code="CODE",
-        registered_players=players,
+        players=players,
         actor_user_id=123,
         guild_id=456,
         channel_id=789,
@@ -451,9 +283,9 @@ async def test_global_code_error_stops_after_probe_and_skips_remaining_players()
         for player_id in range(222, 232)
     ]
 
-    results = await handler._run_bulk_redemption(
+    results = await handler._redemption.run_bulk(
         gift_code="WRONG-CODE",
-        registered_players=players,
+        players=players,
         actor_user_id=123,
         guild_id=456,
         channel_id=789,
@@ -487,9 +319,9 @@ async def test_cached_kingdom_does_not_call_jeab():
         enabled=True,
     )
 
-    results = await handler._run_bulk_redemption(
+    results = await handler._redemption.run_bulk(
         gift_code="CODE",
-        registered_players=[player],
+        players=[player],
         actor_user_id=123,
         guild_id=456,
         channel_id=789,
@@ -506,9 +338,9 @@ async def test_missing_cached_kingdom_is_resolved_through_jeab():
     handler = make_handler(gift_code_service=gift_service, kingshot_data_service=kingshot)
     player = SimpleNamespace(player_id="222", player_name="Player", kingdom=None, enabled=True)
 
-    results = await handler._run_bulk_redemption(
+    results = await handler._redemption.run_bulk(
         gift_code="CODE",
-        registered_players=[player],
+        players=[player],
         actor_user_id=123,
         guild_id=456,
         channel_id=789,
@@ -551,9 +383,9 @@ async def test_cached_kingdom_mismatch_refreshes_jeab_and_retries_once():
         enabled=True,
     )
 
-    results = await handler._run_bulk_redemption(
+    results = await handler._redemption.run_bulk(
         gift_code="CODE",
-        registered_players=[player],
+        players=[player],
         actor_user_id=123,
         guild_id=456,
         channel_id=789,
@@ -588,9 +420,9 @@ async def test_cached_kingdom_mismatch_does_not_retry_when_jeab_returns_same_kin
     handler = make_handler(gift_code_service=gift_service, kingshot_data_service=kingshot)
     player = SimpleNamespace(player_id="222", player_name="Player", kingdom="830", enabled=True)
 
-    results = await handler._run_bulk_redemption(
+    results = await handler._redemption.run_bulk(
         gift_code="CODE",
-        registered_players=[player],
+        players=[player],
         actor_user_id=123,
         guild_id=456,
         channel_id=789,
@@ -623,7 +455,7 @@ async def test_transient_redemption_failures_retry(monkeypatch):
     gift_service = RetryGiftCodeService()
     handler = make_handler(gift_service)
 
-    result = await handler._redeem_with_retries(
+    result = await handler._redemption.redeem_with_retries(
         player_id_int=222,
         kingdom_id="830",
         gift_code="CODE",
@@ -656,7 +488,7 @@ async def test_rate_limit_retries_use_bounded_budget(monkeypatch):
     gift_service = RateLimitedGiftCodeService()
     handler = make_handler(gift_service)
 
-    result = await handler._redeem_with_retries(
+    result = await handler._redemption.redeem_with_retries(
         player_id_int=222,
         kingdom_id="830",
         gift_code="CODE",
@@ -689,7 +521,7 @@ async def test_non_rate_limit_transient_failures_keep_standard_budget(monkeypatc
     gift_service = FailingGiftCodeService()
     handler = make_handler(gift_service)
 
-    result = await handler._redeem_with_retries(
+    result = await handler._redemption.redeem_with_retries(
         player_id_int=222,
         kingdom_id="830",
         gift_code="CODE",

@@ -6,7 +6,7 @@ import pytest
 from discord import app_commands
 from discord.ext import commands
 
-from handlers.help_handler import GROUPS, HelpHandler, HelpView
+from handlers.help_handler import SECTIONS, HelpHandler
 from handlers.ui import OwnedView
 
 
@@ -21,169 +21,123 @@ def interaction(user_id=1, *, guild=True):
 
 def make_bot(*, local=False):
     bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
-    calls = []
 
     @bot.tree.command(name="player")
     async def player(ctx: discord.Interaction, player_id: str):
-        calls.append(("player", player_id))
+        pass
 
-    @bot.tree.command(name="scout")
-    async def scout(ctx: discord.Interaction, kingdom: int, limit: int = 5):
-        calls.append(("scout", kingdom, limit))
-
-    kvk = app_commands.Group(name="kvk", description="KvK")
-
-    @kvk.command(name="history")
-    async def kvk_history(ctx: discord.Interaction, kingdom: int):
-        calls.append(("kvk history", kingdom))
-
-    bot.tree.add_command(kvk)
+    @bot.tree.command(name="kvk")
+    async def kvk(ctx: discord.Interaction, kingdom: int | None = None):
+        pass
 
     @bot.tree.command(name="status")
     async def status(ctx: discord.Interaction):
-        calls.append(("status",))
+        pass
 
     if local:
-        gift = app_commands.Group(name="gift", description="Gift codes")
         admin = app_commands.Group(name="giftadmin", description="Gift code management")
 
-        @gift.command(name="codes")
-        async def gift_codes(ctx: discord.Interaction):
-            calls.append(("gift codes",))
+        @bot.tree.command(name="gift")
+        async def gift(ctx: discord.Interaction):
+            pass
 
         @admin.command(name="redeem")
         async def redeem(ctx: discord.Interaction, gift_code: str):
-            calls.append(("giftadmin redeem", gift_code))
+            pass
 
         @admin.command(name="import")
         async def import_alliance(ctx: discord.Interaction, kid: int, alliance: str):
-            calls.append(("giftadmin import", kid, alliance))
+            pass
 
-        bot.tree.add_command(gift)
         bot.tree.add_command(admin)
 
         @bot.tree.command(name="settings")
         async def settings(ctx: discord.Interaction):
-            calls.append(("settings",))
+            pass
 
         @bot.command(name="t")
         async def translate(ctx):
             pass
 
-    return bot, calls
+    return bot
+
+
+def fields(embed):
+    return {field.name: field.value for field in embed.fields}
+
+
+def test_help_lists_only_registered_commands_and_keeps_manager_commands_for_managers():
+    handler = HelpHandler(make_bot(), {1})
+    shown = fields(handler.build_embed(in_guild=True, is_manager=True))
+    # Nothing of a feature that is not registered, and no empty section.
+    assert set(shown) == {"🔎 Players and kingdoms", "ℹ️ Bot"}
+    assert "`/player`" in shown["🔎 Players and kingdoms"] and "`/kvk`" in shown["🔎 Players and kingdoms"]
+    assert "scout" not in shown["🔎 Players and kingdoms"]
+
+    handler = HelpHandler(make_bot(local=True), {1})
+    member = fields(handler.build_embed(in_guild=True, is_manager=False))
+    assert "🛠️ Server managers" not in member
+    assert "`/gift`" in member["🎁 Gift codes"]
+    assert "!en" in member["🌐 Translation"]
+    manager = fields(handler.build_embed(in_guild=True, is_manager=True))["🛠️ Server managers"]
+    assert "`/settings`" in manager and "`/giftadmin import`" in manager and "`/giftadmin redeem`" in manager
+    assert "giftadmin panel" not in manager  # not registered on this bot
+
+
+def test_help_hides_server_only_commands_in_direct_messages():
+    handler = HelpHandler(make_bot(local=True), {1})
+    shown = fields(handler.build_embed(in_guild=False, is_manager=False))
+    assert "🎁 Gift codes" not in shown
+    assert "🔎 Players and kingdoms" in shown
+
+
+def test_commands_are_clickable_mentions_once_their_ids_are_known():
+    handler = HelpHandler(make_bot(local=True), {1})
+    assert handler.mention("gift") == "`/gift`"
+    handler.remember_commands(
+        [SimpleNamespace(name="gift", id=11), SimpleNamespace(name="giftadmin", id=22), SimpleNamespace(name="x", id=None)]
+    )
+    assert handler.mention("gift") == "</gift:11>"
+    # A subcommand is mentioned with the ID of its group.
+    assert handler.mention("giftadmin import") == "</giftadmin import:22>"
+    assert handler.mention("player") == "`/player`"
+    manager = fields(handler.build_embed(in_guild=True, is_manager=True))["🛠️ Server managers"]
+    assert "</giftadmin import:22>" in manager
 
 
 @pytest.mark.asyncio
-async def test_calendar_help_opens_the_calendar_without_asking_for_a_kingdom():
-    bot, calls = make_bot()
-
-    @bot.tree.command(name="calendar")
-    async def calendar(ctx: discord.Interaction, kingdom: int | None = None):
-        calls.append(("calendar", kingdom))
-
+async def test_help_is_one_private_message_without_controls():
+    bot = make_bot(local=True)
     handler = HelpHandler(bot, {1})
-    ctx = interaction(2)
-    assert "Calendar" in handler.available_groups(ctx)
-    assert "Alliance" not in handler.available_groups(ctx)
-    await handler.open_command(ctx, name="calendar", label="Event calendar")
-    assert calls == [("calendar", None)]
-
-
-@pytest.mark.asyncio
-async def test_help_only_shows_registered_features_and_available_admin_actions():
-    bot, _ = make_bot()
-    handler = HelpHandler(bot, {1})
-    assert set(handler.available_groups(interaction())) == {"Players", "KVK"}
-
-    bot, _ = make_bot(local=True)
-    handler = HelpHandler(bot, {1})
-    member_groups = handler.available_groups(interaction(2))
-    assert "Translation" in member_groups
-    assert "Settings" not in member_groups
-    assert [action[0] for action in member_groups["Gifts"][1]] == ["gift codes"]
-    manager_gifts = [action[0] for action in handler.available_groups(interaction())["Gifts"][1]]
-    assert manager_gifts == ["gift codes", "giftadmin import", "giftadmin redeem"]
-    assert "Settings" in handler.available_groups(interaction())
-    assert "Gifts" not in handler.available_groups(interaction(guild=False))
-
-
-@pytest.mark.asyncio
-async def test_help_button_opens_modal_and_preserves_command_types_and_defaults():
-    bot, calls = make_bot()
-    handler = HelpHandler(bot)
-    ctx = interaction()
-    view = HelpView(handler, ctx)
-    button = next(item for item in view.children if getattr(item, "label", "") == "Scout kingdom")
-    await button.callback(ctx)
-    modal = ctx.response.send_modal.call_args.args[0]
-    assert len(modal.children) == 1
-    modal.children[0]._value = "830"
-    await modal.on_submit(ctx)
-    assert calls == [("scout", 830, 5)]
-
-
-@pytest.mark.asyncio
-async def test_form_rejects_invalid_numbers_and_other_users_without_running_command():
-    bot, calls = make_bot()
-    handler = HelpHandler(bot)
-    ctx = interaction()
-    await handler.open_command(ctx, name="kvk history", label="Kingdom history")
-    modal = ctx.response.send_modal.call_args.args[0]
-    modal.children[0]._value = "not a number"
-    await modal.on_submit(ctx)
-    assert "whole number" in ctx.response.send_message.call_args.args[0]
-    modal.children[0]._value = "830"
-    other = interaction(2)
-    await modal.on_submit(other)
-    other.response.send_message.assert_awaited_once()
-    assert not calls
-
-
-@pytest.mark.asyncio
-async def test_admin_access_is_rechecked_when_form_is_submitted():
-    bot, calls = make_bot(local=True)
-    admins = {1}
-    handler = HelpHandler(bot, admins)
-    ctx = interaction()
-    await handler.open_command(ctx, name="giftadmin redeem", label="Redeem code")
-    modal = ctx.response.send_modal.call_args.args[0]
-    modal.children[0]._value = "CODE"
-    admins.clear()
-    await modal.on_submit(ctx)
-    assert not calls
-    assert "not available" in ctx.response.send_message.call_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_import_alliance_guides_users_to_native_autocomplete():
-    bot, calls = make_bot(local=True)
-    handler = HelpHandler(bot, {1})
-    ctx = interaction()
-    await handler.open_command(ctx, name="giftadmin import", label="Import alliance")
-    ctx.response.send_modal.assert_not_awaited()
-    sent = ctx.response.send_message.call_args.kwargs
-    assert sent["ephemeral"] is True
-    assert "autocomplete" in sent["embed"].description
-    assert "enter `830` for `kid`, then choose an alliance" in sent["embed"].description
-    assert "aid:" not in sent["embed"].description
-    assert not calls
-
-
-@pytest.mark.asyncio
-async def test_help_is_private_and_expired_controls_are_disabled():
-    bot, _ = make_bot()
-    handler = HelpHandler(bot)
     handler.register_commands()
-    ctx = interaction()
+    ctx = interaction(2)
     await bot.tree.get_command("help").callback(ctx)
     sent = ctx.response.send_message.call_args.kwargs
     assert sent["ephemeral"] is True
-    view = sent["view"]
-    assert await view.interaction_check(interaction(2)) is False
-    await view.on_timeout()
-    assert all(item.disabled for item in view.children)
-    view.message.edit.assert_awaited_once_with(view=view)
-    assert len(view.build_embed()) < 6000
+    assert "view" not in sent
+    assert "🛠️ Server managers" not in fields(sent["embed"])
+    assert len(sent["embed"]) < 6000
+
+    ctx = interaction(1)
+    await bot.tree.get_command("help").callback(ctx)
+    assert "🛠️ Server managers" in fields(ctx.response.send_message.call_args.kwargs["embed"])
+
+
+@pytest.mark.asyncio
+async def test_help_loads_command_ids_itself_when_the_sync_did_not_and_survives_a_failure():
+    bot = make_bot()
+    handler = HelpHandler(bot, {1})
+    bot.tree.fetch_commands = AsyncMock(side_effect=RuntimeError("discord is down"))
+    await handler._ensure_command_ids()
+    assert handler.mention("player") == "`/player`"
+    # A failed lookup is not repeated on every /help.
+    await handler._ensure_command_ids()
+    assert bot.tree.fetch_commands.await_count == 1
+
+    handler = HelpHandler(bot, {1})
+    bot.tree.fetch_commands = AsyncMock(return_value=[SimpleNamespace(name="player", id=5)])
+    await handler._ensure_command_ids()
+    assert handler.mention("player") == "</player:5>"
 
 
 @pytest.mark.asyncio
@@ -194,7 +148,7 @@ async def test_shared_controls_reject_non_owner():
 
 
 @pytest.mark.asyncio
-async def test_help_is_registered_with_all_workflows_and_native_alliance_autocomplete(monkeypatch):
+async def test_commands_are_registered_and_help_names_only_real_ones(monkeypatch):
     from config.bot_config import BotConfig
     from main import TranslatorBot
 
@@ -207,25 +161,21 @@ async def test_help_is_registered_with_all_workflows_and_native_alliance_autocom
     names = {command.name for command in app.bot.tree.get_commands()}
     assert names == {
         "help", "status", "player", "scout", "leaderboard", "kvk", "calendar", "gift", "giftadmin", "reminders",
-        "remind", "settings", "Translate",
+        "settings", "Translate",
     }
-    subcommands = {
-        group: sorted(command.name for command in app.bot.tree.get_command(group).commands)
-        for group in ("kvk", "gift", "giftadmin")
+    # Only the manager actions are a group; everything else is one command.
+    groups = {
+        command.name: sorted(sub.name for sub in command.commands)
+        for command in app.bot.tree.get_commands()
+        if isinstance(command, app_commands.Group)
     }
-    assert subcommands == {
-        "kvk": ["compare", "history", "prep"],
-        "gift": ["accounts", "add", "codes", "remove", "roster", "submit"],
-        "giftadmin": ["import", "panel", "redeem"],
-    }
-    # Every action offered in /help resolves to a registered command.
+    assert groups == {"giftadmin": ["import", "panel", "redeem", "roster"]}
+    # Every command named in /help resolves to a registered command.
     help_handler = HelpHandler(app.bot, {1})
     assert all(
-        help_handler.find_command(action[0]) is not None
-        for _, actions in GROUPS.values()
-        for action in actions
+        help_handler.find_command(name) is not None for _, _, entries in SECTIONS for name, _ in entries
     )
-    assert help_handler.find_command("gift") is None and help_handler.find_command("gift nope") is None
+    assert help_handler.find_command("giftadmin") is None and help_handler.find_command("giftadmin nope") is None
     alliance_parameters = app.bot.tree.get_command("giftadmin").get_command("import").parameters
     assert [parameter.name for parameter in alliance_parameters] == ["kid", "alliance"]
     assert all(parameter.autocomplete for parameter in alliance_parameters)

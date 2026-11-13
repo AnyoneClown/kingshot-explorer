@@ -812,14 +812,13 @@ def test_addalliance_command_is_hidden_from_members_by_default():
     # Discord hides per top-level command: the manager actions are a group of their own.
     admin, gift = bot.tree.get_command("giftadmin"), bot.tree.get_command("gift")
     assert admin.default_permissions is not None and admin.default_permissions.manage_guild
-    assert sorted(command.name for command in admin.commands) == ["import", "panel", "redeem"]
+    assert sorted(command.name for command in admin.commands) == ["import", "panel", "redeem", "roster"]
+    # Members have one command, which opens the panel: no subcommands and no options.
+    assert isinstance(gift, discord.app_commands.Command) and gift.parameters == []
     assert gift.default_permissions is None and gift.guild_only and admin.guild_only
-    assert sorted(command.name for command in gift.commands) == [
-        "accounts", "add", "codes", "remove", "roster", "submit",
-    ]
-    # One list for all servers: a manual redeem has no per-server scope to widen.
+    # One list for all servers: a redeem has no per-server scope to widen.
     redeem_params = [parameter.name for parameter in admin.get_command("redeem").parameters]
     assert redeem_params == ["gift_code"]
     # The roster is this server's kingdom unless an operator names another one.
-    roster_params = [(parameter.name, parameter.required) for parameter in gift.get_command("roster").parameters]
+    roster_params = [(parameter.name, parameter.required) for parameter in admin.get_command("roster").parameters]
     assert roster_params == [("kingdom", False)]

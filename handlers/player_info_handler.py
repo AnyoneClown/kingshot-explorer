@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from io import BytesIO
-from typing import Any
+from typing import Any, Optional
 
 import discord
 from discord import app_commands
@@ -9,176 +9,19 @@ from discord.ext import commands
 
 from services import player_card_renderer as card_renderer
 from services import ranking_card_renderer
-from services.card_drawing import as_number
+from services.card_drawing import as_number, compact_number
+from services.leaderboard_service import town_center_label
 from services.player_info_service import IPlayerInfoService, PlayerInfoUnavailableError
 from services.interaction_tracking_service import InteractionTrackingService
 from services.kingshot_data_service import KingshotDataService
-from handlers.ui import EmbedColors, OwnedView, card_files, render_card
+from handlers.kingdom_default import defer_for_kingdom
+from handlers.ui import EmbedColors, card_files, render_card
 
 logger = logging.getLogger(__name__)
 
 MAX_KINGDOM_NUMBER = 99999
-SCOUT_DEFAULT_LIMIT = 5
-SCOUT_MAX_LIMIT = 15
-# Public browse panels stay usable for a typical channel discussion.
-BROWSE_PANEL_TIMEOUT_SECONDS = 900
-
-
-class ScoutReportView(OwnedView):
-    """Browse a kingdom's scout results in one message."""
-
-    def __init__(self, handler, kingdom_number: int, entries: list[dict[str, Any]], author_id: int):
-        super().__init__(author_id, timeout=BROWSE_PANEL_TIMEOUT_SECONDS)
-        self.handler = handler
-        self.kingdom_number = kingdom_number
-        self.entries = entries
-        self.current_player = 0
-        self.showing_summary = True
-        self._loading = False
-        # The leaderboard picture of the summary; attached again when coming back from a player.
-        self.summary_card: bytes | None = None
-        self._update_controls()
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not await super().interaction_check(interaction):
-            return False
-        if self._loading:
-            await interaction.response.send_message("Loading this player. Try again in a moment.", ephemeral=True)
-            return False
-        return True
-
-    def _update_controls(self):
-        if self.showing_summary:
-            # From the summary, Next opens the current player (the top one on a fresh
-            # report) instead of skipping it.
-            self.previous_button.disabled = True
-            self.next_button.disabled = not self.entries
-        else:
-            self.previous_button.disabled = self.current_player == 0
-            self.next_button.disabled = self.current_player == len(self.entries) - 1
-        self.summary_button.disabled = self.showing_summary
-        self.player_select.options = []
-        for index, entry in enumerate(self.entries):
-            player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
-            self.player_select.options.append(discord.SelectOption(
-                label=f"#{entry.get('rank', index + 1)} {player.get('name') or 'Player'}"[:100],
-                value=str(index),
-                description=f"ID: {player['playerId']}"[:100],
-                default=index == self.current_player and not self.showing_summary,
-            ))
-
-    def leaderboard_rows(self) -> list[ranking_card_renderer.RankedRow]:
-        """The entries as rows of the leaderboard card."""
-        rows = []
-        for index, entry in enumerate(self.entries):
-            player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
-            rank = entry.get("rank", index + 1)
-            score = entry.get("score")
-            rows.append(
-                ranking_card_renderer.RankedRow(
-                    name=str(player.get("name") or "Unknown player"),
-                    value=as_number(score),
-                    text=self.handler._format_number(score) if score is not None else "–",
-                    rank=rank if isinstance(rank, int) else index + 1,
-                )
-            )
-        return rows
-
-    async def render_summary_card(self) -> None:
-        self.summary_card = await render_card(
-            ranking_card_renderer.render_leaderboard_card,
-            f"Kingdom {self.kingdom_number} · Mystic Trial",
-            self.leaderboard_rows(),
-            note="score",
-        )
-
-    def summary_files(self) -> list[discord.File]:
-        return card_files(self.summary_card, ranking_card_renderer.LEADERBOARD_FILENAME)
-
-    def build_summary(self) -> discord.Embed:
-        if self.summary_card:
-            # The ranking is on the attached card.
-            embed = discord.Embed(
-                title=f"🔎 Scout Report · Kingdom {self.kingdom_number}",
-                description="**Mystic Trial leaderboard**",
-                color=EmbedColors.INFO,
-            )
-            embed.set_image(url=f"attachment://{ranking_card_renderer.LEADERBOARD_FILENAME}")
-            embed.set_footer(
-                text=(
-                    f"{len(self.entries)} players · Pick a player to open their profile in this public message · "
-                    "Scores are Mystic Trial scores"
-                )
-            )
-            return embed
-        lines = []
-        for index, entry in enumerate(self.entries):
-            player = self.handler._build_player_data_from_kingshot(entry.get("player") or entry, entry, self.kingdom_number)
-            name = discord.utils.escape_markdown(str(player.get("name") or "Unknown player")[:80])
-            rank = str(entry.get("rank", index + 1))[:12]
-            score = self.handler._format_number(entry["score"])[:40] if entry.get("score") is not None else "Unavailable"
-            lines.append(f"**#{rank} {name}** · {score}")
-        embed = discord.Embed(
-            title=f"🔎 Scout Report · Kingdom {self.kingdom_number}",
-            description="**Mystic Trial leaderboard**\n" + "\n".join(lines),
-            color=EmbedColors.INFO,
-        )
-        embed.set_footer(
-            text=(
-                f"{len(self.entries)} players · Pick a player to open their profile in this public message · "
-                "Scores are Mystic Trial scores"
-            )
-        )
-        return embed
-
-    async def _show_player(self, interaction: discord.Interaction):
-        self._loading = True
-        try:
-            await interaction.response.defer()
-            entry = self.entries[self.current_player]
-            profile = await self.handler._resolve_scout_player(entry)
-            data = profile or entry
-            player_data = self.handler._build_player_data_from_kingshot(data, entry, self.kingdom_number)
-            embed = self.handler._build_stats_embed(
-                player_id=player_data["playerId"],
-                player_name=player_data.get("name") or "Unknown player",
-                player_data=player_data,
-                ks_data=data,
-                mystic_trial={"entry": entry},
-                description=f"Mystic Trial · Rank #{entry.get('rank', self.current_player + 1)}",
-            )
-            heroes = await self.handler._fetch_arena_heroes(self.handler._extract_player_uid(player_data, data))
-            card_file = await self.handler._attach_player_card(embed, heroes, profile)
-            self.showing_summary = False
-            self._update_controls()
-            embed.set_footer(text=f"Player {self.current_player + 1}/{len(self.entries)} · Unavailable means data was not returned")
-            await interaction.edit_original_response(embed=embed, attachments=[card_file] if card_file else [], view=self)
-
-        finally:
-            self._loading = False
-
-    @discord.ui.select(placeholder="Pick a player to view their profile", row=0)
-    async def player_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.current_player = int(select.values[0])
-        await self._show_player(interaction)
-
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.showing_summary:
-            self.current_player = max(0, self.current_player - 1)
-        await self._show_player(interaction)
-
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.showing_summary:
-            self.current_player = min(len(self.entries) - 1, self.current_player + 1)
-        await self._show_player(interaction)
-
-    @discord.ui.button(label="Summary", style=discord.ButtonStyle.secondary, row=1)
-    async def summary_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.showing_summary = True
-        self._update_controls()
-        await interaction.response.edit_message(embed=self.build_summary(), attachments=self.summary_files(), view=self)
+# /scout always shows this many players: one card, no paging.
+SCOUT_PLAYERS = ranking_card_renderer.MAX_SCOUT_ROWS
 
 
 class PlayerInfoHandler:
@@ -195,8 +38,9 @@ class PlayerInfoHandler:
     RENDER_CONCURRENCY = 2
     MYSTIC_TRIAL_BOARD_TYPE = 20
     SCOUT_BOARD_TYPE = MYSTIC_TRIAL_BOARD_TYPE
-    SCOUT_DEFAULT_LIMIT = SCOUT_DEFAULT_LIMIT
-    SCOUT_MAX_LIMIT = SCOUT_MAX_LIMIT
+    SCOUT_PLAYERS = SCOUT_PLAYERS
+    # The card is posted after this long, with or without the players' profiles.
+    SCOUT_PROFILE_SECONDS = 8.0
 
     def __init__(
         self,
@@ -204,6 +48,7 @@ class PlayerInfoHandler:
         bot: commands.Bot,
         interaction_tracking_service: InteractionTrackingService | None = None,
         kingshot_data_service: KingshotDataService | None = None,
+        guild_configuration_service=None,
     ):
         """
         Initialize player info handler.
@@ -211,11 +56,14 @@ class PlayerInfoHandler:
         Args:
             player_info_service: Service for fetching player information
             bot: Discord bot instance
+            guild_configuration_service: Server settings; gives ``/scout`` the
+                server's kingdom when the command names none.
         """
         self._player_info_service = player_info_service
         self._bot = bot
         self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
         self._kingshot_data_service = kingshot_data_service
+        self._guild_configuration_service = guild_configuration_service
         self._render_semaphore = asyncio.Semaphore(self.RENDER_CONCURRENCY)
         logger.info("PlayerInfoHandler initialized")
 
@@ -228,18 +76,17 @@ class PlayerInfoHandler:
             """Fetch and display player statistics."""
             await self._handle_player_stats_slash(interaction, player_id)
 
-        @self._bot.tree.command(name="scout", description="Scout top Mystic Trial players in a kingdom")
-        @app_commands.describe(
-            kingdom="Kingdom number to scout",
-            limit=f"Number of leaderboard players to scout, default {SCOUT_DEFAULT_LIMIT}, max {SCOUT_MAX_LIMIT}",
+        @self._bot.tree.command(
+            name="scout",
+            description=f"Top {SCOUT_PLAYERS} Mystic Trial players of a kingdom: Town Center, power and score",
         )
+        @app_commands.describe(kingdom="Kingdom number. Leave empty to use this server's kingdom")
         async def scout_kingdom(
             interaction: discord.Interaction,
-            kingdom: app_commands.Range[int, 1, MAX_KINGDOM_NUMBER],
-            limit: app_commands.Range[int, 1, SCOUT_MAX_LIMIT] = SCOUT_DEFAULT_LIMIT,
+            kingdom: Optional[app_commands.Range[int, 1, MAX_KINGDOM_NUMBER]] = None,
         ):
             """Scout top Mystic Trial players in a kingdom."""
-            await self._handle_scout_slash(interaction, kingdom, limit)
+            await self._handle_scout_slash(interaction, kingdom)
 
     async def _handle_player_stats_slash(self, interaction: discord.Interaction, player_id: str):
         """
@@ -392,13 +239,13 @@ class PlayerInfoHandler:
                 )
             )
 
-    async def _handle_scout_slash(self, interaction: discord.Interaction, kingdom_number: int, limit: int):
-        """Handle the scout command.
+    async def _handle_scout_slash(self, interaction: discord.Interaction, kingdom_number: int | None = None):
+        """Post the scout report of a kingdom: one card, no controls.
 
-        Discord enforces the option ranges, but /help forms call this directly, so
-        inputs are validated again before deferring and rejected privately.
+        Without a kingdom the server's kingdom is used. Discord enforces the option
+        range, but the value is validated again before deferring and rejected privately.
         """
-        if not 1 <= kingdom_number <= MAX_KINGDOM_NUMBER:
+        if kingdom_number is not None and not 1 <= kingdom_number <= MAX_KINGDOM_NUMBER:
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="⚠️ Invalid Kingdom Number",
@@ -408,19 +255,6 @@ class PlayerInfoHandler:
                 ephemeral=True,
             )
             return
-
-        if limit < 1:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="⚠️ Invalid Limit",
-                    description=f"Limit must be between 1 and {SCOUT_MAX_LIMIT}.",
-                    color=EmbedColors.WARNING,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        limit = min(limit, SCOUT_MAX_LIMIT)
 
         if self._kingshot_data_service is None:
             await interaction.response.send_message(
@@ -433,24 +267,28 @@ class PlayerInfoHandler:
             )
             return
 
-        await interaction.response.defer(thinking=True)
-
-        user_info = f"{interaction.user.name}#{interaction.user.discriminator} (ID: {interaction.user.id})"
-        guild_info = f"{interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
+        kingdom_number, reply = await defer_for_kingdom(
+            interaction,
+            kingdom_number,
+            self._guild_configuration_service,
+            command="scout",
+            receipt="Scout report ready.",
+        )
+        if reply is None:
+            return
 
         logger.info(
-            "Scout command for kingdom %s limit %s requested by %s in %s",
+            "Scout command for kingdom %s requested by %s in guild %s",
             kingdom_number,
-            limit,
-            user_info,
-            guild_info,
+            interaction.user.id,
+            getattr(getattr(interaction, "guild", None), "id", None),
         )
 
         try:
             board_result = await self._kingshot_data_service.get_kingdom_board(
                 self.SCOUT_BOARD_TYPE,
                 kingdom_number,
-                limit=limit,
+                limit=self.SCOUT_PLAYERS,
                 resolve=True,
             )
             if not board_result.get("success"):
@@ -460,58 +298,137 @@ class PlayerInfoHandler:
                     color=EmbedColors.ERROR,
                 )
                 embed.set_footer(text="Try again in a moment or verify the kingdom number")
-                await interaction.followup.send(embed=embed)
+                await reply.fail(embed)
                 return
 
-            board_data = board_result.get("data")
-            entries = self._extract_leaderboard_entries(board_data)
+            entries = self._extract_leaderboard_entries(board_result.get("data"))[: self.SCOUT_PLAYERS]
             if not entries:
-                await interaction.followup.send(
-                    embed=discord.Embed(
-                        title=f"🔎 Scout Report - Kingdom {kingdom_number}",
+                await reply.fail(
+                    discord.Embed(
+                        title=f"🔎 Scout Report · Kingdom {kingdom_number}",
                         description="No Mystic Trial leaderboard entries were returned for this kingdom.",
                         color=EmbedColors.WARNING,
                     )
                 )
                 return
 
-            entries = entries[:limit]
-            semaphore = asyncio.Semaphore(3)
-
-            async def resolve_player(entry):
-                async with semaphore:
-                    await self._resolve_scout_player(entry)
-
-            await asyncio.gather(*(resolve_player(entry) for entry in entries))
-            view = ScoutReportView(self, kingdom_number, entries, interaction.user.id)
-            await view.render_summary_card()
-            view.message = await interaction.followup.send(
-                embed=view.build_summary(), view=view, wait=True, files=view.summary_files()
+            profiles = await self._scout_profiles(entries)
+            players = [
+                self._scout_player(entry, profile, index, kingdom_number)
+                for index, (entry, profile) in enumerate(zip(entries, profiles))
+            ]
+            card = await render_card(
+                ranking_card_renderer.render_scout_card,
+                f"Kingdom {kingdom_number} · Scout report",
+                [player["row"] for player in players],
+                note=f"Mystic Trial top {len(players)}",
             )
-
+            await reply.send(
+                embed=self._build_scout_embed(kingdom_number, players, pictures=bool(card)),
+                files=card_files(card, ranking_card_renderer.SCOUT_FILENAME),
+            )
             logger.info("Successfully sent scout report for kingdom %s", kingdom_number)
 
         except Exception as e:
             logger.error("Error handling scout command for kingdom %s: %s", kingdom_number, e, exc_info=True)
-            await interaction.followup.send(
-                embed=discord.Embed(
+            await reply.fail(
+                discord.Embed(
                     title="❌ Unexpected Error",
                     description="An error occurred while scouting the kingdom. Please try again later.",
                     color=EmbedColors.ERROR,
                 )
             )
 
-    async def _resolve_scout_player(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+    async def _scout_profiles(self, entries: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+        """The profile of each board entry, or None where it could not be loaded in time.
+
+        The board names the players and their alliances but not their Town Center level
+        or power, so each player needs one profile request. They run together, and the
+        report is not held up by a slow one: its row is then drawn without those columns.
+        """
+        tasks = [asyncio.create_task(self._scout_profile(entry)) for entry in entries]
+        if not tasks:
+            return []
+        _, unfinished = await asyncio.wait(tasks, timeout=self.SCOUT_PROFILE_SECONDS)
+        profiles: list[dict[str, Any] | None] = []
+        for task in tasks:
+            if task in unfinished:
+                task.cancel()
+                profiles.append(None)
+            elif task.exception() is not None:
+                logger.warning("Scout profile lookup failed", exc_info=task.exception())
+                profiles.append(None)
+            else:
+                profiles.append(task.result())
+        return profiles
+
+    async def _scout_profile(self, entry: dict[str, Any]) -> dict[str, Any] | None:
         profile = entry.get("player")
         if isinstance(profile, dict) and profile and not profile.get("error"):
             return profile
         uid = self._extract_player_uid(entry, None)
         fid = self._extract_entry_fid(entry)
-        profile = await self._get_kingshot_data_player(str(fid) if fid is not None else None, uid=uid)
-        if profile is not None:
-            # A failed lookup is not remembered, so opening the player again retries it.
-            entry["player"] = profile
-        return profile
+        return await self._get_kingshot_data_player(str(fid) if fid is not None else None, uid=uid)
+
+    @classmethod
+    def _scout_player(
+        cls,
+        entry: dict[str, Any],
+        profile: dict[str, Any] | None,
+        index: int,
+        kingdom_number: int,
+    ) -> dict[str, Any]:
+        """One player of the report: the card row and the Governor ID.
+
+        Rank and score are the board's; a profile only adds what the board lacks.
+        """
+        profile = profile or {}
+        data = cls._build_player_data_from_kingshot(profile, entry, kingdom_number)
+        alliance = next(
+            (source["alliance"] for source in (profile, entry) if isinstance(source.get("alliance"), dict)),
+            {},
+        )
+        rank = entry.get("rank")
+        score = as_number(entry.get("score"))
+        level = as_number(data.get("level"))
+        power = as_number(profile.get("power"))
+        row = ranking_card_renderer.ScoutRow(
+            name=str(data.get("name") or "Unknown player"),
+            rank=rank if isinstance(rank, int) and not isinstance(rank, bool) else index + 1,
+            tag=str(alliance.get("abbr") or ""),
+            town_center=town_center_label(int(level)) if level is not None and level > 0 else "",
+            power=compact_number(power) if power is not None and power > 0 else "",
+            score=cls._format_number(entry["score"]) if entry.get("score") is not None else "",
+            value=score,
+        )
+        return {"row": row, "player_id": data["playerId"] if data["playerId"] != "Unavailable" else None}
+
+    @staticmethod
+    def _build_scout_embed(kingdom_number: int, players: list[dict[str, Any]], *, pictures: bool) -> discord.Embed:
+        """The report's embed. With ``pictures`` the ranking is on the attached card."""
+        embed = discord.Embed(
+            title=f"🔎 Scout Report · Kingdom {kingdom_number}",
+            description=f"**Mystic Trial · top {len(players)}**",
+            color=EmbedColors.INFO,
+        )
+        if pictures:
+            embed.set_image(url=f"attachment://{ranking_card_renderer.SCOUT_FILENAME}")
+        else:
+            lines = []
+            for player in players:
+                row = player["row"]
+                tag = f"`[{discord.utils.escape_markdown(row.tag[:10])}]` " if row.tag else ""
+                name = discord.utils.escape_markdown(row.name[:80])
+                lines.append(
+                    f"**#{row.rank}** {tag}{name} · Town Center {row.town_center or 'unavailable'} · "
+                    f"Power {row.power or 'unavailable'} · Trial stages {row.score or 'unavailable'}"
+                )
+            embed.description += "\n" + "\n".join(lines)
+        ids = [f"#{player['row'].rank} `{player['player_id']}`" for player in players if player["player_id"]]
+        if ids:
+            embed.add_field(name="Governor IDs", value=" · ".join(ids)[:1024], inline=False)
+        embed.set_footer(text="/player with a Governor ID opens a profile · /leaderboard has the full ranking")
+        return embed
 
     @staticmethod
     async def _return_profile(profile: dict[str, Any]) -> dict[str, Any]:

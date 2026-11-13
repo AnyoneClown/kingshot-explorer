@@ -98,7 +98,7 @@ async def test_gift_code_list_with_unreadable_or_odd_payload_never_crashes(monke
     result = await GiftCodeService().get_available_gift_codes()
     assert result == {"success": False, "message": "Gift code API returned an invalid response"}
 
-    # A null gift-code list must still be a list: /gift codes iterates it.
+    # A null gift-code list must still be a list: the active-codes view iterates it.
     _serve(monkeypatch, _FakeRequest(_FakeResponse(payload={"status": "success", "data": {"giftCodes": None}})))
     assert await GiftCodeService().get_available_gift_codes() == {"success": True, "data": []}
 
@@ -378,7 +378,7 @@ def test_sharing_the_list_keeps_the_set_of_redeemed_accounts():
 
     assert not sa.inspect(database.engine).has_table("guild_player_registrations")
     assert [player.player_id for player in asyncio.run(registry.get_auto_redeem_targets())] == ["100", "200", "600"]
-    # No listed account is taken off: paused ones can be switched on again in /gift roster.
+    # No listed account is taken off: paused ones can be switched on again in /giftadmin roster.
     # Only the lookup cache goes, which was never on a list and would now look like one
     # more paused account of the member who looked the player up.
     everyone = asyncio.run(registry.get_registered_players(enabled_only=False))
