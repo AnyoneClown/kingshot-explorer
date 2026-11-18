@@ -27,9 +27,11 @@ class UnknownLanguageError(TranslationError):
 
 
 # Discord markup and links that must survive translation verbatim. Order matters:
-# the suppressed-link form ``<https://...>`` must win over the bare URL form.
+# an inline code span wins over what it contains, and the suppressed-link form
+# ``<https://...>`` must win over the bare URL form.
 _PROTECTED_PATTERN = re.compile(
-    r"<a?:\w{1,32}:\d{5,22}>"  # custom emoji
+    r"`[^`\n]+`"  # inline code: gift codes, command names, button labels
+    r"|<a?:\w{1,32}:\d{5,22}>"  # custom emoji
     r"|<@[!&]?\d{5,22}>"  # user and role mentions
     r"|<#\d{5,22}>"  # channel mentions
     r"|</[\w\- ]{1,64}:\d{5,22}>"  # slash command mentions

@@ -28,6 +28,9 @@ EDITABLE_GUILD_SETTINGS = frozenset(
         "calendar_last_posted_on",
         "time_zone",
         "translation_languages",
+        "update_news_enabled",
+        "update_news_channel_id",
+        "update_news_last_id",
     }
 )
 
@@ -86,6 +89,12 @@ class GuildSettings:
     # Codes of the languages chat is translated between ("en,uk", see
     # ``services.translation_languages``); "" is off, None means never chosen.
     translation_languages: str | None = None
+    # Update news (``services.update_news``): posted unless switched off, in the chosen
+    # channel or, when none is chosen, the server's general channel.
+    update_news_enabled: bool = True
+    update_news_channel_id: int | None = None
+    # Id of the newest update note this server was given; None before the first one.
+    update_news_last_id: str | None = None
 
     @classmethod
     def from_model(cls, model) -> "GuildSettings":
@@ -223,6 +232,25 @@ class GuildConfigurationService:
             self.invalidate(guild_id)
             return settings
         return self._remember(settings)
+
+    async def claim_update_news(self, guild_id: int, seen_id: str | None, new_id: str | None) -> bool:
+        """Move a guild's update-news marker from ``seen_id`` to ``new_id``.
+
+        False when the marker is no longer ``seen_id``: another instance of the bot
+        moved it first, and the news it claimed must not be posted twice.
+        """
+
+        async def operation(session):
+            await self.get_or_create_guild_configuration(session, guild_id, self._default_use_random_replies)
+            return await GuildConfigurationRepository(session).move_update_news_marker(guild_id, seen_id, new_id)
+
+        self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+        self.invalidate(guild_id)
+        try:
+            return bool(await self._run(operation, retry_on_integrity_error=True))
+        finally:
+            self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+            self.invalidate(guild_id)
 
     async def set_use_random_replies_for_guild(self, guild_id: int, use_random_replies: bool) -> GuildSettings:
         return await self.update_for_guild(guild_id, use_random_replies=use_random_replies)

@@ -31,6 +31,7 @@ from handlers import (
     PlayerInfoHandler,
     StatusHandler,
     TranslationHandler,
+    UpdateNewsHandler,
 )
 from handlers.permissions import AccessPolicy, build_denied_embed
 from handlers.ui import EmbedColors
@@ -286,6 +287,11 @@ class TranslatorBot:
             guild_configuration_service=self.guild_configuration_service,
             access_policy=self.access_policy,
         )
+        self.update_news_handler = UpdateNewsHandler(
+            self.bot,
+            self.guild_configuration_service,
+            self.translation_service,
+        )
         self.event_handler = EventHandler(
             self.event_scheduler_service,
             self.bot,
@@ -417,6 +423,8 @@ class TranslatorBot:
             self.gift_code_handler.start_polling_task()
             logger.info("Auto gift code polling task started")
             self.calendar_handler.start_daily_task()
+            # What changed since the last deploy, told once to every server.
+            self.update_news_handler.start()
             if not self._maintenance_loop.is_running():
                 self._maintenance_loop.start()
             if not self._usage_flush_loop.is_running():
@@ -452,6 +460,8 @@ class TranslatorBot:
             """Log the join and post a short setup hint for the server's managers."""
             logger.info(f"Bot joined new guild: {guild.name} (ID: {guild.id}) - {guild.member_count} members")
             await self.translation_handler.adopt_translator_role(guild)
+            # A new server reads the welcome message, not the news of before it joined.
+            await self.update_news_handler.mark_seen(guild.id)
             await self._send_welcome(guild)
 
         @self.bot.event

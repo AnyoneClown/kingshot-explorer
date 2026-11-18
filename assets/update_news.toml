@@ -1,0 +1,25 @@
+# Update news: what the bot tells every server after a deploy.
+#
+# Each [[update]] is one post. The bot posts the entries a server has not seen yet,
+# once, in the server's update-news channel (see /settings), translated into the
+# server's languages. Rules:
+#
+# - Add new entries at the BOTTOM: the order of this file is the order of publication.
+# - Never change the id of an entry that was deployed: it is how the bot knows what a
+#   server has seen. Fixing a typo in the text is fine; it is not posted again.
+# - Write for players, in plain English: what they can do now, not how it was built.
+#   Put command names and button labels in backticks (`/settings`, `Update news`): what
+#   is in backticks is posted as written in every language, and the bot's buttons are
+#   in English.
+# - title: up to 80 characters. text: up to 900 characters, Discord markdown allowed.
+#
+# A server that is new to update news gets only the newest entry, never the history.
+
+[[update]]
+id = "2026-11-christmas-look"
+title = "The bot dressed up for Christmas"
+text = """
+- **A Christmas look.** Every picture card (the event calendar, gift-code results, KvK, rankings, reminders, player cards) now comes with snow, a string of lights and presents. The numbers and layout are the same as before.
+- **Update news.** From now on the bot posts a short note like this one when it learns something new, in your server's languages.
+
+Server managers can move these notes to another channel or turn them off: run `/settings` and press the `Update news` button."""

@@ -342,6 +342,7 @@ def test_setup_checklist_marks_done_steps_and_the_next_one():
     assert (
         "Bot manager role: Not set\nReminder timezone: **UTC**\n"
         "Chat translation: **Off** · pick the server's languages in the **Chat translation** menu\n"
+        "Update news: the server's general channel\n"
         "AI replies: **Disabled**"
     ) in description
 
@@ -357,7 +358,7 @@ def test_finished_setup_reads_as_plain_settings():
         return (await view.build_embed()).description.splitlines(), view
 
     lines, view = asyncio.run(run_test())
-    assert lines[:8] == [
+    assert lines[:9] == [
         "Server: **Test Guild**",
         "Kingdom: **795**",
         "Gift-code announcements: <#444>",
@@ -365,12 +366,13 @@ def test_finished_setup_reads_as_plain_settings():
         "Bot manager role: Not set",
         "Reminder timezone: **Europe/Kyiv**",
         "Chat translation: **English ↔ Ukrainian**",
+        "Update news: the server's general channel",
         "AI replies: **Disabled**",
     ]
     assert not any("Setup:" in line or "**1. " in line for line in lines)
     # Refresh is gone; without a gift handler there is no panel button either.
     assert [item.label for item in view.children if hasattr(item, "label")] == [
-        "Kingdom: 795", "Timezone: Europe/Kyiv", "AI Replies: Off",
+        "Kingdom: 795", "Timezone: Europe/Kyiv", "AI Replies: Off", "Update news",
     ]
     assert [item.placeholder for item in view.children if hasattr(item, "placeholder")] == [
         "Gift-code channel (new codes, results and the sign-up panel)",
@@ -569,7 +571,9 @@ def test_sign_up_panel_button_needs_a_gift_handler_and_a_gift_channel():
         assert _step(embed, 2) == "✅ **2. Gift codes** — <#444>"
 
     view, embed = asyncio.run(run_test(FakeGiftHandler()))
-    assert _button_labels(view) == ["Set kingdom", "Post sign-up panel", "Timezone: UTC", "AI Replies: Off"]
+    assert _button_labels(view) == [
+        "Set kingdom", "Post sign-up panel", "Timezone: UTC", "AI Replies: Off", "Update news",
+    ]
     assert view.post_panel_button.disabled
     assert _step(embed, 2).endswith("menu, then post the sign-up panel there.")
 
@@ -769,3 +773,102 @@ def test_one_language_translates_into_it_and_clearing_the_menu_switches_translat
     assert service.updates == [{"translation_languages": "en"}, {"translation_languages": ""}]
     assert "Chat translation: **Off**" in description and "✅ Chat translation is off." in description
 
+
+# -------------------------------------------------------------- update news
+
+
+class NewsInteraction(ModalInteraction):
+    """A click that can also be answered with a new ephemeral message."""
+
+    def __init__(self):
+        super().__init__()
+        self.original = SimpleNamespace(edits=[])
+
+    async def original_response(self):
+        return self.original
+
+
+class PanelMessage:
+    """The message of the settings panel, as far as redrawing it goes."""
+
+    def __init__(self):
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+
+
+async def _open_news_panel(service):
+    view = _calendar_view(service)
+    view.message = PanelMessage()
+    await view.build_embed()
+    interaction = NewsInteraction()
+    await view.update_news_button.callback(interaction)
+    return view, interaction, interaction.response.sent_view
+
+
+def test_update_news_goes_to_the_general_channel_until_a_manager_decides():
+    async def run_test(**values):
+        view, interaction, news = await _open_news_panel(CalendarConfigService(**values))
+        return (await view.build_embed()).description, interaction, news
+
+    description, interaction, news = asyncio.run(run_test())
+    assert "Update news: the server's general channel" in description
+    # The small panel is private, belongs to the same manager and says the same.
+    assert interaction.response.sent_message == (None, True)
+    assert news.author_id == 111 and news.message is interaction.original
+    assert "Posted in: the server's general channel" in interaction.response.sent_embed.description
+    assert news.toggle_button.label == "Turn off" and news.channel_select.default_values == []
+
+    description, interaction, news = asyncio.run(run_test(update_news_channel_id=777))
+    assert "Update news: <#777>" in description
+    assert [value.id for value in news.channel_select.default_values] == [777]
+
+    description, interaction, news = asyncio.run(run_test(update_news_enabled=False, update_news_channel_id=777))
+    assert "Update news: **Off**" in description
+    assert "Posted in: **Off**" in interaction.response.sent_embed.description
+    assert news.toggle_button.label == "Turn on"
+
+
+def test_update_news_channel_and_switch_are_saved_and_shown_in_both_panels():
+    service = CalendarConfigService(update_news_enabled=False)
+
+    async def run_test():
+        view, _, news = await _open_news_panel(service)
+        picked = NewsInteraction()
+        news.channel_select._values = [SimpleNamespace(id=777)]
+        await news.channel_select.callback(picked)
+        switched = NewsInteraction()
+        await news.toggle_button.callback(switched)
+        cleared = NewsInteraction()
+        news.channel_select._values = []
+        await news.channel_select.callback(cleared)
+        return view, picked, switched, cleared
+
+    view, picked, switched, cleared = asyncio.run(run_test())
+
+    # Picking a channel is asking for the news; clearing it goes back to the general channel.
+    assert service.updates == [
+        {"update_news_channel_id": 777, "update_news_enabled": True},
+        {"update_news_enabled": False},
+        {"update_news_channel_id": None},
+    ]
+    assert "Posted in: <#777>" in picked.edited_original_embed.description
+    assert "Posted in: **Off**" in switched.edited_original_embed.description
+    # The settings panel behind it is redrawn after every change.
+    assert len(view.message.edits) == 3
+    assert "Update news: <#777>" in view.message.edits[0]["embed"].description
+    assert "Update news: **Off**" in view.message.edits[2]["embed"].description
+
+
+def test_update_news_panel_is_only_for_the_manager_who_opened_settings():
+    async def run_test():
+        _, _, news = await _open_news_panel(CalendarConfigService())
+        stranger = NewsInteraction()
+        stranger.user.id = 222
+        return await news.interaction_check(stranger), stranger
+
+    allowed, stranger = asyncio.run(run_test())
+
+    assert allowed is False
+    assert stranger.response.sent_message == ("Only the command user can control this panel.", True)

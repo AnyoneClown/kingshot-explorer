@@ -53,7 +53,7 @@ SECTIONS = (
         "🛠️ Server managers",
         True,
         (
-            ("settings", "the server's kingdom, channels, chat translation, timezone, manager role and AI replies"),
+            ("settings", "the server's kingdom, channels, chat translation, update news, timezone, manager role and AI replies"),
             ("giftadmin panel", "post the gift-code panel with buttons in a channel"),
             ("giftadmin import", "add a whole alliance to the gift-code list"),
             ("giftadmin roster", "the accounts of this server's kingdom: enable, disable, remove"),

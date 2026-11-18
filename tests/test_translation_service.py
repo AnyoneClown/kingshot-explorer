@@ -396,3 +396,17 @@ def test_chat_noises_need_no_translation(text):
 @pytest.mark.parametrize("text", ["ok let's go", "хаха ні", "okay?? de verdad", "", "😂😂", "gg team well played"])
 def test_real_words_still_need_translation(text):
     assert needs_no_translation(text) is False
+
+
+def test_inline_code_is_kept_as_written():
+    # Gift codes, command names and button labels are not text to translate.
+    masked, originals = protect_markup("use `KINGSHOT2026`, run `/settings` or open `https://example.com/a` now")
+
+    assert masked == "use [[1]], run [[2]] or open [[3]] now"
+    assert originals == ["`KINGSHOT2026`", "`/settings`", "`https://example.com/a`"]
+    assert restore_markup("usa [[1]], ejecuta [[2]] o abre [[3]] ahora", originals) == (
+        "usa `KINGSHOT2026`, ejecuta `/settings` o abre `https://example.com/a` ahora"
+    )
+    # A message that is only a code has nothing to translate.
+    assert not has_translatable_text("`KINGSHOT2026`")
+    assert has_translatable_text("código `KINGSHOT2026`")

@@ -10,6 +10,7 @@ from .leaderboard_handler import LeaderboardHandler
 from .player_info_handler import PlayerInfoHandler
 from .status_handler import StatusHandler
 from .translation_handler import TranslationHandler
+from .update_news_handler import UpdateNewsHandler
 
 __all__ = [
     "CalendarHandler",
@@ -22,4 +23,5 @@ __all__ = [
     "KVKHandler",
     "LeaderboardHandler",
     "StatusHandler",
+    "UpdateNewsHandler",
 ]

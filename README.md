@@ -21,12 +21,19 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 - Kingdom event calendar from kingshot.net as picture cards with the event artwork:
   `/calendar` shows what is running today, what is next, and a timeline of this week and
   the next; a server can have the daily card posted every day at 08:00 UTC.
+- Update news: after a deploy the bot tells every server what is new, once, in the
+  server's chat languages. The notes are written by hand in `assets/update_news.toml`
+  (one `[[update]]` per post, new ones at the bottom; the file explains its rules). A
+  server gets them in its general channel (Discord's system channel, else a channel
+  called `general`) until a manager picks another channel or turns them off with the
+  **Update news** button of `/settings`. A server that is new to the notes, or that just
+  added the bot, never gets the history; one that fell behind gets the newest three.
 - Two-way chat translation without roles: a server manager picks the server's languages
   in `/settings` (up to three, for example English + Ukrainian), and every chat message
   gets a reply in each of those languages it is not written in. English is answered in
   Ukrainian, Ukrainian in English, Korean in both. One language (English) translates
   everything else into it; no languages switches chat translation off. Translations keep
-  mentions, emoji, links and line breaks intact, skip text that needs no translation
+  mentions, emoji, links, `inline code` (gift codes, command names) and line breaks intact, skip text that needs no translation
   ("ok", "lol", emoji, links) and cache repeated messages. When more translations are
   waiting than the model can answer promptly, new messages are skipped instead of being
   answered late.
@@ -313,7 +320,7 @@ Additional commands are provided by translation, event, player info, KVK, and da
 
 - `/settings` is the server managers' settings panel: the server's kingdom, gift-code
   announcement channel, event calendar channel, reminder timezone, bot manager role (only
-  members with Manage Server can change it) and AI replies. While setup is incomplete it
+  members with Manage Server can change it), where update news is posted and AI replies. While setup is incomplete it
   opens as a three-step checklist (kingdom, gift-code channel and sign-up panel, daily
   calendar channel) that marks what is done and says what to press next; **Post sign-up
   panel** posts the gift-code panel in the chosen channel. The menus show the saved

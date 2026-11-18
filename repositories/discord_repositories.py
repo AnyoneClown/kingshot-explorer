@@ -153,6 +153,17 @@ class GuildConfigurationRepository:
         await self._session.flush()
         return guild_config
 
+    async def move_update_news_marker(self, guild_id: int, seen_id: Optional[str], new_id: Optional[str]) -> bool:
+        """Set the guild's update-news marker to ``new_id`` if it still is ``seen_id``."""
+        marker = GuildConfiguration.update_news_last_id
+        result = await self._session.execute(
+            update(GuildConfiguration)
+            .where(GuildConfiguration.guild_id == guild_id)
+            .where(marker.is_(None) if seen_id is None else marker == seen_id)
+            .values(update_news_last_id=new_id)
+        )
+        return result.rowcount == 1
+
 
 class RegisteredPlayerRepository:
     """Repository for registered players used in gift code workflow."""

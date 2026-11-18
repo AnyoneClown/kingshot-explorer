@@ -11,7 +11,8 @@ from discord.ext import commands
 
 from handlers.calendar_handler import DAILY_POST_TIME
 from handlers.permissions import AccessPolicy, manager_only_command, send_denied
-from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
+from handlers.ui import EmbedColors, OwnedView, build_status_embed, edit_panel_message, send_ui_error
+from handlers.update_news_handler import describe_destination
 from services.guild_configuration_service import DEFAULT_TIME_ZONE, GuildConfigurationService, canonical_time_zone
 from services.kingshot_calendar_service import MAX_KINGDOM_NUMBER, CalendarError, KingdomNotTrackedError
 from services.translation_languages import (
@@ -208,6 +209,7 @@ class GuildConfigView(OwnedView):
             f"Bot manager role: {_mention_role(manager_role)}",
             f"Reminder timezone: **{time_zone}**",
             f"Chat translation: {_translation_summary(languages)}",
+            f"Update news: {describe_destination(self._guild, guild_config)}",
             f"AI replies: **{ai_replies_status}**",
         ]
         lines = [f"Server: **{self._guild_name}**"]
@@ -227,6 +229,12 @@ class GuildConfigView(OwnedView):
             for warning in (
                 self._channel_warning(gift_channel, "Gift-code announcements"),
                 self._channel_warning(calendar_channel, "Event calendar", pictures=True),
+                self._channel_warning(
+                    getattr(guild_config, "update_news_channel_id", None)
+                    if getattr(guild_config, "update_news_enabled", True)
+                    else None,
+                    "Update news",
+                ),
             )
             if warning
         ] + self._warnings
@@ -350,6 +358,15 @@ class GuildConfigView(OwnedView):
     async def _show(self, interaction: discord.Interaction) -> None:
         await interaction.edit_original_response(embed=await self.build_embed(), view=self)
 
+    async def redraw(self) -> None:
+        """Show the settings again after one was changed outside this panel's own controls."""
+        if self.message is None:
+            return
+        try:
+            await edit_panel_message(self.message, embed=await self.build_embed(), view=self)
+        except discord.HTTPException:
+            logger.debug("Could not redraw the settings panel", exc_info=True)
+
     @discord.ui.button(label="Set kingdom", emoji="🏰", style=discord.ButtonStyle.secondary, row=0)
     async def kingdom_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         del button
@@ -404,6 +421,14 @@ class GuildConfigView(OwnedView):
         )
         self._sync_random_replies_button(updated.use_random_replies)
         await self._show(interaction)
+
+    @discord.ui.button(label="Update news", emoji="📰", style=discord.ButtonStyle.secondary, row=0)
+    async def update_news_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Open the small panel that says where this server gets the bot's update news."""
+        del button
+        view = UpdateNewsView(self)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
     async def apply_kingdom(
         self, interaction: discord.Interaction, raw_kingdom: str, pending_channel_id: int | None = None
@@ -569,6 +594,71 @@ class GuildConfigView(OwnedView):
         await self._update(interaction, translation_languages=setting)
 
 
+class UpdateNewsView(OwnedView):
+    """Where a server gets the bot's update news: a channel, the general channel, or nowhere.
+
+    Opened from the settings panel, whose five rows are taken; every change here is
+    shown there too.
+    """
+
+    def __init__(self, parent: GuildConfigView, timeout: float = 300.0):
+        super().__init__(parent.author_id, timeout=timeout)
+        self._parent = parent
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self._parent.interaction_check(interaction)
+
+    async def build_embed(self) -> discord.Embed:
+        settings = await self._parent._settings()
+        enabled = getattr(settings, "update_news_enabled", True)
+        chosen = self._parent._selectable_channel(getattr(settings, "update_news_channel_id", None))
+        self.toggle_button.label = "Turn off" if enabled else "Turn on"
+        self.toggle_button.style = discord.ButtonStyle.secondary if enabled else discord.ButtonStyle.success
+        self.channel_select.default_values = GuildConfigView._defaults(chosen, discord.SelectDefaultValueType.channel)
+        return build_status_embed(
+            title="Update news",
+            description="\n".join(
+                [
+                    "When the bot learns something new, it posts a short note about it, "
+                    "written in the server's chat languages.",
+                    "",
+                    f"Posted in: {describe_destination(self._parent._guild, settings)}",
+                    "",
+                    "Pick a channel in the menu, or clear the menu to use the server's general channel.",
+                ]
+            ),
+            color=EmbedColors.NEUTRAL,
+        )
+
+    async def _save(self, interaction: discord.Interaction, **changes) -> None:
+        await interaction.response.defer()
+        await self._parent._guild_config_service.update_for_guild(self._parent._guild_id, **changes)
+        await interaction.edit_original_response(embed=await self.build_embed(), view=self)
+        await self._parent.redraw()
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=_TEXT_CHANNEL_TYPES,
+        placeholder="Update news channel (none = the server's general channel)",
+        min_values=0,
+        max_values=1,
+        row=0,
+    )
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        channel_id = select.values[0].id if select.values else None
+        changes = {"update_news_channel_id": channel_id}
+        if channel_id:
+            # Picking a channel is asking for the news.
+            changes["update_news_enabled"] = True
+        await self._save(interaction, **changes)
+
+    @discord.ui.button(label="Turn off", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        del button
+        settings = await self._parent._settings()
+        await self._save(interaction, update_news_enabled=not getattr(settings, "update_news_enabled", True))
+
+
 class GuildConfigHandler:
     """Manager-only guild configuration command handler."""
 
@@ -594,7 +684,7 @@ class GuildConfigHandler:
         logger.info("GuildConfigHandler initialized")
 
     def register_commands(self):
-        @self._bot.tree.command(name="settings", description="Server setup and settings: kingdom, channels, chat translation, timezone, manager role, AI replies")
+        @self._bot.tree.command(name="settings", description="Server settings: kingdom, channels, translation, update news, timezone, manager role, AI replies")
         @manager_only_command
         async def configure(interaction: discord.Interaction):
             await self._handle_configure(interaction)

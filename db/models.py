@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -277,6 +278,14 @@ class GuildConfiguration(Base):
     time_zone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # Language codes chat is translated between ("en,uk"); empty is off, NULL is never chosen.
     translation_languages: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Whether the bot posts its update news in this guild.
+    update_news_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    # Where update news is posted; unset means the guild's general channel.
+    update_news_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # Id of the newest update note this guild was given (see ``services.update_news``).
+    update_news_last_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
