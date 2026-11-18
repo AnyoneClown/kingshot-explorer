@@ -210,7 +210,7 @@ def _segments(card: Card, x: float, y: float, width: float, height: float, count
         # Every status that occurred stays visible, however small its share.
         part = max(2.0, usable * count / total)
         part = min(part, x + width - cursor)
-        card.bar(cursor, y, part, height, STATUS_STYLE[status][1], radius=height / 2)
+        card.bar(cursor, y, part, height, STATUS_STYLE[status][1], radius=height / 2, candy=True)
         cursor += part + gap
 
 

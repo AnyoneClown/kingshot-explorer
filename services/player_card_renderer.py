@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from services.card_theme import THEME
+
 logger = logging.getLogger(__name__)
 
 IMAGES_DIR = Path(__file__).resolve().parents[1] / "images"
@@ -302,7 +304,7 @@ def _hero_portrait(path: str, level: int) -> Image | None:
     canvas = _Canvas.from_image(portrait)
     text = f"LV{level}"
     _, badge_height = badge_size(text)
-    draw_badge(canvas, 1, canvas.height - badge_height - 1, text, (24, 46, 86, 225), (214, 234, 255, 255))
+    draw_badge(canvas, 1, canvas.height - badge_height - 1, text, *THEME.hero_level_badge)
     return canvas.freeze()
 
 
@@ -388,8 +390,7 @@ def annotate_gear_image(image: Image, slv: int, rlv: int) -> Image:
         canvas.width - mystery_width - 1,
         canvas.height - mystery_height - 1,
         mystery_text,
-        (62, 38, 86, 230),
-        (232, 214, 255, 255),
+        *THEME.mystery_level_badge,
     )
     return canvas.freeze()
 
@@ -398,7 +399,7 @@ def format_general_gear_level(slv: int) -> tuple[str, tuple[int, int, int, int],
     """Hero gear above +100 wraps into the red stage (+101 shows as red +1)."""
     if slv > 100:
         return f"+{slv - 100}", (115, 28, 34, 235), (255, 235, 220, 255)
-    return f"+{slv}", (35, 39, 52, 230), (255, 236, 160, 255)
+    return f"+{slv}", *THEME.gear_level_badge
 
 
 # ------------------------------------------------------------------ gear strip
@@ -460,7 +461,7 @@ def build_gear_strip(gear: Iterable[Any], assets: AssetDirs) -> tuple[Image | No
         for charm_index, charm in enumerate(charms):
             x = charm_left + charm_index * (CHARM_ICON_SIZE + CHARM_GAP)
             if charm is None:
-                _draw_rect(canvas, x + 3, charm_top + 3, CHARM_ICON_SIZE - 6, CHARM_ICON_SIZE - 6, (70, 78, 92, 150))
+                _draw_rect(canvas, x + 3, charm_top + 3, CHARM_ICON_SIZE - 6, CHARM_ICON_SIZE - 6, THEME.empty_charm)
             else:
                 _paste(canvas, charm, x, charm_top)
 
@@ -485,25 +486,37 @@ def _charm_icon(path: str, level: int | None) -> Image | None:
         canvas.width - text_width,
         canvas.height - text_height,
         text,
-        (20, 24, 32, 220),
-        (255, 255, 255, 255),
+        *THEME.charm_level_badge,
         scale=2,
     )
     return canvas.freeze()
 
 
 def _stack_sections(sections: list[Image]) -> Image:
-    """Center sections vertically with a thin separator between them."""
+    """Center sections vertically with a separator between them."""
     width = max(section.width for section in sections)
     height = sum(section.height for section in sections) + SECTION_GAP * (len(sections) - 1)
     canvas = _Canvas(width, height)
     top = 0
     for index, section in enumerate(sections):
         if index:
-            _draw_rect(canvas, 0, top - SECTION_GAP // 2 - 1, width, 2, (128, 132, 148, 110))
+            _draw_separator(canvas, top - SECTION_GAP // 2, width)
         _paste(canvas, section, (width - section.width) // 2, top)
         top += section.height + SECTION_GAP
     return canvas.freeze()
+
+
+def _draw_separator(canvas: _Canvas, middle: int, width: int) -> None:
+    """A thin line across the card, or a candy cane when the theme has a second color for it."""
+    if THEME.separator_stripe is None:
+        _draw_rect(canvas, 0, middle - 1, width, 2, THEME.separator)
+        return
+    height, period = 4, 12
+    for row in range(height):
+        for x in range(width):
+            # Slanted bands, half a period each.
+            first = (x + row) % period < period // 2
+            _draw_rect(canvas, x, middle - height // 2 + row, 1, 1, THEME.separator if first else THEME.separator_stripe)
 
 
 # ----------------------------------------------------------------- image cache

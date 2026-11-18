@@ -33,6 +33,7 @@ from handlers import (
     TranslationHandler,
 )
 from handlers.permissions import AccessPolicy, build_denied_embed
+from handlers.ui import EmbedColors
 from services.chat_tools import build_chat_tool_registry
 from services.kvk_dossier_service import KvKDossierService
 from services.leaderboard_service import LeaderboardService
@@ -516,7 +517,7 @@ class TranslatorBot:
                 "for everything else: player lookups, rankings, KvK, the event calendar, reminders and "
                 "translation (right-click a message → Apps → Translate)."
             ),
-            color=discord.Color.blurple(),
+            color=EmbedColors.NEUTRAL,
         )
         try:
             await channel.send(embed=embed)

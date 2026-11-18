@@ -8,6 +8,8 @@ from io import BytesIO
 
 import discord
 
+from services.card_theme import THEME
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,13 +72,15 @@ async def send_ui_error(interaction: discord.Interaction, error: Exception) -> N
 
 
 class EmbedColors:
-    """Consistent embed colors across commands."""
+    """Consistent embed colors across commands, from the active theme."""
 
-    SUCCESS = discord.Color.green()
-    WARNING = discord.Color.orange()
-    ERROR = discord.Color.red()
-    INFO = discord.Color.blue()
-    NEUTRAL = discord.Color.blurple()
+    SUCCESS = discord.Color(THEME.embed_success)
+    WARNING = discord.Color(THEME.embed_warning)
+    ERROR = discord.Color(THEME.embed_error)
+    INFO = discord.Color(THEME.embed_info)
+    NEUTRAL = discord.Color(THEME.embed_neutral)
+    # Days that deserve attention, such as the start of a main event.
+    HIGHLIGHT = discord.Color(THEME.embed_highlight)
 
 
 def build_status_embed(

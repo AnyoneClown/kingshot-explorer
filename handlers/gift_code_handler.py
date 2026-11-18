@@ -3274,7 +3274,7 @@ class GiftCodeHandler:
                         embed=self._build_status_embed(
                             title="❌ Could Not Fetch Alliance",
                             description="The alliance response does not match the selected alliance ID.",
-                            color=discord.Color.red(),
+                            color=EmbedColors.ERROR,
                         )
                     )
                     return

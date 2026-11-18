@@ -96,8 +96,11 @@ def _seasons(card: Card, top: float, history: Sequence[Mapping]) -> None:
         season = match.get("season_id")
         card.text(center, top + 13, f"#{season}" if season is not None else "–", small, MUTED, anchor="mm")
         for offset, key in ((23, "prepResult"), (43, "castleResult")):
-            color = RESULT_COLORS.get(str(match.get(key)), TRACK)
-            card.bar(center - 8, top + offset, 16, 16, color, radius=4)
+            color = RESULT_COLORS.get(str(match.get(key)))
+            if color is None:
+                card.bar(center - 8, top + offset, 16, 16, TRACK, radius=4)
+            else:
+                card.present(center - 8, top + offset, 16, color)
         opponent = match.get("opponent")
         card.text(center, top + 69, f"K{opponent}" if opponent is not None else "–", small, MUTED, anchor="mm")
     if not shown:
@@ -208,12 +211,12 @@ def _metric_row(card: Card, top: float, row) -> None:
         if side == "a":
             edge = PADDING + bar_width
             card.bar(PADDING, middle - 3, bar_width, 6, TRACK)
-            card.bar(edge - length, middle - 3, length, 6, fill)
+            card.bar(edge - length, middle - 3, length, 6, fill, candy=True)
             card.text(edge + 8, middle, text(value), font, TEXT if ahead or leader is None else MUTED, anchor="lm")
         else:
             edge = CARD_WIDTH - PADDING - bar_width
             card.bar(edge, middle - 3, bar_width, 6, TRACK)
-            card.bar(edge, middle - 3, length, 6, fill)
+            card.bar(edge, middle - 3, length, 6, fill, candy=True)
             card.text(edge - 8, middle, text(value), font, TEXT if ahead or leader is None else MUTED, anchor="rm")
 
 

@@ -5,6 +5,12 @@ text set in Space Grotesk, thin separators and rounded bars. Layout sizes are in
 points; the image is ``SCALE`` times larger, so cards stay sharp on high-density
 screens and when opened full size.
 
+The palette comes from the active theme (``card_theme``). A festive theme also
+decorates every card: snow in the background, a string of lights along the top edge,
+a bauble in place of the header dot and candy stripes on value bars. Decoration never
+changes the size of a card or where its content sits, apart from the first header,
+which moves down a little to hang clear of the lights.
+
 Everything here is CPU-bound and synchronous: callers on the event loop must go
 through ``asyncio.to_thread``. Renderers hold ``RENDER_LOCK`` while drawing, because
 FreeType font objects are shared between calls and are not safe to use from several
@@ -16,13 +22,16 @@ from __future__ import annotations
 import functools
 import io
 import logging
+import random
 import threading
 import unicodedata
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+
+from services.card_theme import THEME
 
 logger = logging.getLogger(__name__)
 
@@ -50,17 +59,32 @@ HEADER_HEIGHT = 34
 
 Color = tuple[int, int, int]
 
-# The dark theme of kingshot.net.
-BACKGROUND: Color = (34, 31, 29)
-LINE: Color = (56, 53, 51)
-TRACK: Color = (58, 55, 53)
-PILL: Color = (46, 42, 41)
-TEXT: Color = (250, 250, 249)
-MUTED: Color = (166, 160, 155)
-GOOD: Color = (103, 187, 107)
-AMBER: Color = (240, 165, 50)
-RED: Color = (255, 100, 103)
-BLUE: Color = (70, 153, 254)
+BACKGROUND: Color = THEME.background
+LINE: Color = THEME.line
+TRACK: Color = THEME.track
+PILL: Color = THEME.pill
+TODAY_TINT: Color = THEME.today_tint
+TEXT: Color = THEME.text
+MUTED: Color = THEME.muted
+INK: Color = THEME.ink
+GOOD: Color = THEME.good
+AMBER: Color = THEME.amber
+RED: Color = THEME.red
+BLUE: Color = THEME.blue
+SPECIAL: Color = THEME.special
+PODIUM: dict[int, Color] = dict(enumerate(THEME.podium, start=1))
+
+FESTIVE = THEME.festive
+# How far the first header moves down to hang clear of the string of lights.
+GARLAND_SHIFT = 3.0
+# Decoration colors are deliberately not palette colors: a card must show GOOD, RED,
+# AMBER or BLUE only where its data does.
+_WHITE: Color = (255, 255, 255)
+_WIRE: Color = (64, 98, 84)
+_BULB_CAP: Color = (120, 146, 134)
+_BULBS: tuple[Color, ...] = ((255, 96, 104), (255, 214, 110), (112, 232, 156), (132, 206, 255), (255, 244, 214))
+_BAUBLE_CAP: Color = (232, 204, 136)
+_RIBBON: Color = (255, 232, 168)
 
 RENDER_LOCK = threading.Lock()
 
@@ -187,12 +211,115 @@ def format_duration(delta: timedelta) -> str:
     return f"{mins}m"
 
 
+# ----------------------------------------------------------------- decoration
+
+# Decoration is drawn this many times larger and scaled down, for smooth edges.
+_SUPERSAMPLE = 3
+GARLAND_SPANS = 11
+GARLAND_HEIGHT = 15.0
+BAUBLE_BOX = 12.0
+# Where the ball of a bauble sits inside its box.
+_BAUBLE_CENTER = (6.0, 7.2)
+
+
+def _snowflake(draw: ImageDraw.ImageDraw, x: float, y: float, radius: float, fill: Color) -> None:
+    """A six-armed crystal, each arm with a pair of barbs."""
+    for arm in range(6):
+        direction = complex(0, 1) * complex(0.5, 0.8660254) ** arm
+        tip = direction * radius
+        draw.line((x, y, x + tip.real, y + tip.imag), fill=fill, width=1)
+        fork = direction * radius * 0.58
+        for turn in (complex(0.5, 0.8660254), complex(0.5, -0.8660254)):
+            barb = fork + direction * turn * radius * 0.3
+            draw.line((x + fork.real, y + fork.imag, x + barb.real, y + barb.imag), fill=fill, width=1)
+
+
+@functools.lru_cache(maxsize=2)
+def _garland(width: int) -> Image.Image:
+    """A string of lights for the top edge of a card ``width`` pixels wide."""
+    unit = SCALE * _SUPERSAMPLE
+    size = (width * _SUPERSAMPLE, round(GARLAND_HEIGHT * unit))
+    glow = Image.new("RGBA", size, (0, 0, 0, 0))
+    lights = Image.new("RGBA", size, (0, 0, 0, 0))
+    halo, draw = ImageDraw.Draw(glow), ImageDraw.Draw(lights)
+    span = CARD_WIDTH / GARLAND_SPANS
+
+    def wire(x: float) -> float:
+        """How low the wire hangs at ``x``: pinned at the ends of a span, sagging between."""
+        along = (x % span) / span
+        return 0.8 + 13.6 * along * (1 - along)
+
+    def box(left: float, top: float, right: float, bottom: float) -> tuple[float, float, float, float]:
+        return (left * unit, top * unit, right * unit, bottom * unit)
+
+    steps = int(CARD_WIDTH * 2)
+    draw.line(
+        [(step / 2 * unit, wire(step / 2) * unit) for step in range(steps + 1)],
+        fill=_WIRE + (255,),
+        width=max(1, round(0.55 * unit)),
+        joint="curve",
+    )
+    for index in range(GARLAND_SPANS * 2):
+        x = (index // 2 + (0.73 if index % 2 else 0.27)) * span
+        y = wire(x)
+        color = _BULBS[index % len(_BULBS)]
+        halo.ellipse(box(x - 5.6, y - 2.4, x + 5.6, y + 8.8), fill=color + (135,))
+        draw.rectangle(box(x - 0.8, y - 0.1, x + 0.8, y + 1.3), fill=_BULB_CAP + (255,))
+        draw.ellipse(box(x - 1.6, y + 1.0, x + 1.6, y + 5.2), fill=color + (255,))
+        draw.ellipse(box(x - 0.95, y + 1.7, x - 0.2, y + 2.9), fill=_WHITE + (150,))
+    strip = Image.alpha_composite(glow.filter(ImageFilter.GaussianBlur(2.2 * unit)), lights)
+    return strip.resize((width, round(GARLAND_HEIGHT * SCALE)), Image.LANCZOS)
+
+
+@functools.lru_cache(maxsize=32)
+def _bauble(color: Color) -> Image.Image:
+    """A tree ornament in ``color``: what a header wears instead of a plain dot."""
+    unit = SCALE * _SUPERSAMPLE
+    side = round(BAUBLE_BOX * unit)
+    image = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    x, y = _BAUBLE_CENTER
+
+    def box(left: float, top: float, right: float, bottom: float) -> tuple[float, float, float, float]:
+        return (left * unit, top * unit, right * unit, bottom * unit)
+
+    draw.arc(box(x - 0.95, y - 6.9, x + 0.95, y - 4.9), 0, 360, fill=_BAUBLE_CAP + (255,), width=max(1, round(0.45 * unit)))
+    draw.rounded_rectangle(box(x - 1.3, y - 5.4, x + 1.3, y - 3.7), radius=0.4 * unit, fill=_BAUBLE_CAP + (255,))
+    draw.ellipse(box(x - 4.1, y - 4.1, x + 4.1, y + 4.1), fill=color + (255,))
+    draw.ellipse(box(x - 2.7, y - 2.9, x - 0.9, y - 1.2), fill=mix(_WHITE, color, 0.6) + (255,))
+    return image.resize((px(BAUBLE_BOX), px(BAUBLE_BOX)), Image.LANCZOS)
+
+
+def _backdrop(size: tuple[int, int]) -> Image.Image:
+    """The empty card: a plain panel, or a winter night with snow and a string of lights."""
+    if not FESTIVE:
+        return Image.new("RGB", size, BACKGROUND)
+    width, height = size
+    fade = Image.new("RGB", (1, 2), BACKGROUND)
+    fade.putpixel((0, 1), THEME.background_bottom)
+    image = fade.resize(size, Image.BILINEAR)
+    draw = ImageDraw.Draw(image)
+    # Seeded by the size, so a card of a given size always gets the same snowfall.
+    rng = random.Random(width * 8191 + height)
+    area = (width / SCALE) * (height / SCALE)
+    for _ in range(max(1, round(area / 13000))):
+        x, y = rng.uniform(0, width), rng.uniform(px(HEADER_HEIGHT), max(px(HEADER_HEIGHT) + 1, height))
+        _snowflake(draw, x, y, SCALE * rng.uniform(4.0, 7.0), mix(_WHITE, BACKGROUND, 0.06))
+    for _ in range(round(area / 420)):
+        x, y = rng.uniform(0, width), rng.uniform(0, height)
+        radius = SCALE * rng.uniform(0.35, 1.05)
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=mix(_WHITE, BACKGROUND, rng.uniform(0.07, 0.2)))
+    garland = _garland(width)
+    image.paste(garland, (0, 0), garland)
+    return image
+
+
 class Card:
     """A card being drawn. Coordinates are layout points, converted on the way in."""
 
     def __init__(self, height: float):
         self.height = height
-        self.image = Image.new("RGB", (px(CARD_WIDTH), px(height)), BACKGROUND)
+        self.image = _backdrop((px(CARD_WIDTH), px(height)))
         self.draw = ImageDraw.Draw(self.image)
 
     def text(self, x: float, baseline: float, text: str, font, fill: Color, *, anchor: str = "ls") -> float:
@@ -222,13 +349,54 @@ class Card:
     def line(self, x1: float, y1: float, x2: float, y2: float, fill: Color = LINE) -> None:
         self.draw.line((px(x1), px(y1), px(x2), px(y2)), fill=fill, width=max(1, px(0.5)))
 
-    def bar(self, x: float, y: float, width: float, height: float, fill: Color, *, radius: Optional[float] = None) -> None:
+    def bar(
+        self,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        fill: Color,
+        *,
+        radius: Optional[float] = None,
+        candy: bool = False,
+    ) -> None:
+        """A rounded bar. ``candy`` marks a value bar, which a festive theme stripes like a candy cane."""
         if width <= 0:
             return
         radius = height / 2 if radius is None else radius
-        self.draw.rounded_rectangle(
-            (px(x), px(y), max(px(x) + 1, px(x + width)), px(y + height)), radius=px(radius), fill=fill
-        )
+        box = (px(x), px(y), max(px(x) + 1, px(x + width)), px(y + height))
+        self.draw.rounded_rectangle(box, radius=px(radius), fill=fill)
+        # Thin or short bars stay plain: stripes would only blur them.
+        if candy and FESTIVE and height >= 5 and width >= 6:
+            self._candy_stripes(box, px(radius), fill)
+
+    def _candy_stripes(self, box: tuple[int, int, int, int], radius: int, fill: Color) -> None:
+        """Lighter diagonal stripes over a bar already drawn in ``fill``."""
+        left, top, right, bottom = box
+        width, height = right - left + 1, bottom - top + 1
+        big_width, big_height = width * 2, height * 2
+        stripes = Image.new("L", (big_width, big_height), 0)
+        pen = ImageDraw.Draw(stripes)
+        for offset in range(-big_height, big_width + big_height, px(5) * 2):
+            pen.line((offset, big_height, offset + big_height, 0), fill=255, width=px(1.5) * 2)
+        shape = Image.new("L", (big_width, big_height), 0)
+        ImageDraw.Draw(shape).rounded_rectangle((0, 0, big_width - 1, big_height - 1), radius=radius * 2, fill=255)
+        mask = ImageChops.multiply(stripes, shape).resize((width, height), Image.LANCZOS)
+        # Lightened in proportion to the bar's own brightness, so a dimmed bar keeps quiet stripes.
+        self.image.paste(mix(_WHITE, fill, 0.3 * max(fill) / 255), (left, top), mask)
+
+    def present(self, x: float, y: float, size: float, fill: Color, *, radius: float = 4.0) -> None:
+        """A square mark; a festive theme ties it up with a ribbon and a bow."""
+        self.bar(x, y, size, size, fill, radius=radius)
+        if not FESTIVE:
+            return
+        half = px(0.75)
+        center_x, center_y = px(x + size / 2), px(y + size / 2)
+        self.draw.rectangle((center_x - half, px(y), center_x + half, px(y + size)), fill=_RIBBON)
+        self.draw.rectangle((px(x), center_y - half, px(x + size), center_y + half), fill=_RIBBON)
+        for side in (-1, 1):
+            loop_x = x + size / 2 + side * 1.9
+            self.draw.ellipse((px(loop_x - 1.9), px(y - 1.9), px(loop_x + 1.9), px(y + 1.3)), fill=_RIBBON)
 
     def striped_bar(self, x: float, y: float, width: float, height: float, color: Color, *, radius: float) -> None:
         """A hatched bar: the mark for a date that is only estimated."""
@@ -267,9 +435,14 @@ class Card:
         self, top: float, title: str, color: Color, *, count: Optional[int | str] = None, note: str = ""
     ) -> None:
         middle = top + HEADER_HEIGHT / 2
-        self.draw.ellipse(
-            (px(PADDING), px(middle - 3.5), px(PADDING + 7), px(middle + 3.5)), fill=color
-        )
+        if FESTIVE:
+            if top == 0:
+                middle += GARLAND_SHIFT
+            bauble = _bauble(color)
+            center_x, center_y = _BAUBLE_CENTER
+            self.image.paste(bauble, (px(PADDING + 3.5 - center_x), px(middle - center_y)), bauble)
+        else:
+            self.draw.ellipse((px(PADDING), px(middle - 3.5), px(PADDING + 7), px(middle + 3.5)), fill=color)
         self.text(PADDING + 14, middle, title, get_font(13.5, 600), TEXT, anchor="lm")
         right = CARD_WIDTH - PADDING
         if count is not None:

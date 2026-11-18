@@ -65,6 +65,9 @@ jobs:
       - name: Run tests
         run: uv run pytest -q
 
+      - name: Run card tests in the classic theme
+        run: BOT_THEME=classic uv run pytest -q tests/test_card_theme.py tests/test_*_card_renderer.py
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest

@@ -186,6 +186,11 @@ ignores), `MAX_SELF_REGISTERED_PLAYERS` (3),
 `KINGSHOT_RAG_MAX_DISTANCE` (0.7) and `TRANSLATION_LOG_RETENTION_DAYS` (30; `0` keeps
 stored translation text forever). See `.env.local.example`.
 
+`BOT_THEME` (`christmas`) is the look of the picture cards and embeds: `christmas` puts
+snow, a string of lights, baubles and candy stripes on every card and switches embeds to
+holly green, berry red, gold and frost blue; `classic` is the everyday dark look. It is
+read once, when the bot starts.
+
 `TRANSLATOR_ROLE` (`Translator`) is a leftover of role-based translation. It is read only
 to carry a server over: a server that has not chosen its languages yet gets English
 translation for everyone if that role exists there and somebody has it, and no chat

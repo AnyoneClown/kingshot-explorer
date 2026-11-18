@@ -9,6 +9,7 @@ import pytest
 
 from config.bot_config import BotConfig
 from handlers.status_handler import StatusHandler
+from handlers.ui import EmbedColors
 from main import TranslatorBot
 from services.database_health_service import DatabaseHealthService
 
@@ -115,7 +116,7 @@ async def test_status_distinguishes_disabled_and_stopped_workers():
     assert fields["Scheduler"] == "⚠️ Stopped"
     assert fields["Gift Polling"] == "⏸️ Disabled"
     assert fields["AI Chat Model"] == "`nvidia/nemotron-3.5-super-vl-120b-a12b`"
-    assert embed.color == discord.Color.orange()
+    assert embed.color == EmbedColors.WARNING
 
     member_fields = field_values(await render_status(handler, user_id=999))
     assert "AI Chat Model" not in member_fields
@@ -145,7 +146,7 @@ async def test_enabled_gift_polling_and_data_gateway_failures_affect_health():
     assert fields["KingShot Data API"] == "⚠️ Degraded"
     assert fields["Scheduler"] == "✅ Running"
     assert fields["Gift Polling"] == "⚠️ Stopped"
-    assert embed.color == discord.Color.orange()
+    assert embed.color == EmbedColors.WARNING
 
 
 @pytest.mark.asyncio

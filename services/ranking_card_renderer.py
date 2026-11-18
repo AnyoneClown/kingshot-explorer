@@ -18,8 +18,10 @@ from services.card_drawing import (
     BLUE,
     CARD_WIDTH,
     HEADER_HEIGHT,
+    INK,
     MUTED,
     PADDING,
+    PODIUM,
     RENDER_LOCK,
     TEXT,
     TRACK,
@@ -46,7 +48,6 @@ VERSUS_COLUMN_HEADER = 20
 VERSUS_ROW_HEIGHT = 26
 MAX_VERSUS_ROWS = 5
 
-PODIUM: dict[int, Color] = {1: (240, 190, 70), 2: (196, 200, 208), 3: (205, 135, 80)}
 SIDE_A: Color = BLUE
 SIDE_B: Color = AMBER
 
@@ -119,13 +120,20 @@ def render_leaderboard_card(
             color = PODIUM.get(rank)
             if color is not None:
                 card.bar(PADDING, middle - 8, 18, 16, color, radius=4)
-                card.text(PADDING + 9, middle, str(rank), rank_font, (34, 31, 29), anchor="mm")
+                card.text(PADDING + 9, middle, str(rank), rank_font, INK, anchor="mm")
             else:
                 card.text(PADDING + 9, middle, str(rank), rank_font, MUTED, anchor="mm")
             _name(card, name_left, middle, row, name_font, bar_left - name_left - 8, anchor="lm")
             card.bar(bar_left, middle - 3, bar_right - bar_left, 6, TRACK)
             if row.value:
-                card.bar(bar_left, middle - 3, (bar_right - bar_left) * min(1.0, row.value / largest), 6, color or accent)
+                card.bar(
+                    bar_left,
+                    middle - 3,
+                    (bar_right - bar_left) * min(1.0, row.value / largest),
+                    6,
+                    color or accent,
+                    candy=True,
+                )
             card.text(CARD_WIDTH - PADDING, middle, row.shown_value, value_font, TEXT, anchor="rm")
         return card.png()
 
@@ -177,7 +185,7 @@ def render_scout_card(title: str, rows: Sequence[ScoutRow], *, note: str = "", a
             color = PODIUM.get(rank)
             if color is not None:
                 card.bar(PADDING, middle - 8, 18, 16, color, radius=4)
-                card.text(PADDING + 9, middle, str(rank), rank_font, (34, 31, 29), anchor="mm")
+                card.text(PADDING + 9, middle, str(rank), rank_font, INK, anchor="mm")
             else:
                 card.text(PADDING + 9, middle, str(rank), rank_font, MUTED, anchor="mm")
             _name(card, name_left, middle, row, name_font, town_center_right - 62 - name_left, anchor="lm")
