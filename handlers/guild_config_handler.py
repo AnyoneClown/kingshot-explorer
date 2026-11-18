@@ -14,6 +14,13 @@ from handlers.permissions import AccessPolicy, manager_only_command, send_denied
 from handlers.ui import EmbedColors, OwnedView, build_status_embed, send_ui_error
 from services.guild_configuration_service import DEFAULT_TIME_ZONE, GuildConfigurationService, canonical_time_zone
 from services.kingshot_calendar_service import MAX_KINGDOM_NUMBER, CalendarError, KingdomNotTrackedError
+from services.translation_languages import (
+    MAX_SERVER_LANGUAGES,
+    SERVER_LANGUAGES,
+    Language,
+    languages_from_setting,
+    setting_from_codes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +33,31 @@ def _mention_channel(channel_id: int | None) -> str:
 
 def _mention_role(role_id: int | None) -> str:
     return f"<@&{role_id}>" if role_id else "Not set"
+
+
+def _translation_summary(languages: tuple[Language, ...]) -> str:
+    """What chat translation does on this server, for the settings list."""
+    if not languages:
+        return "**Off** · pick the server's languages in the **Chat translation** menu"
+    if len(languages) == 1:
+        return f"other languages → **{languages[0].name}**"
+    return "**" + " ↔ ".join(language.name for language in languages) + "**"
+
+
+def _translation_note(languages: tuple[Language, ...]) -> str:
+    """What changes in chat after the manager picked these languages."""
+    if not languages:
+        return (
+            "Chat translation is off. Members can still right-click a message → "
+            "**Apps → Translate** to read it in their own language."
+        )
+    if len(languages) == 1:
+        return f"Chat messages in other languages now get a reply in **{languages[0].name}**."
+    names = " ↔ ".join(language.name for language in languages)
+    return (
+        f"Chat is now translated between **{names}**: every message gets a reply in the "
+        f"other language{'s' if len(languages) > 2 else ''}. No roles needed."
+    )
 
 
 class ServerKingdomModal(discord.ui.Modal, title="Server kingdom"):
@@ -157,6 +189,8 @@ class GuildConfigView(OwnedView):
         self._sync_kingdom_button(kingdom)
         self._sync_time_zone_button(time_zone)
         self._sync_panel_button(gift_channel)
+        languages = languages_from_setting(getattr(guild_config, "translation_languages", None))
+        self._sync_translation_menu(languages)
         # Show what is saved inside the menus too, instead of empty placeholders.
         # Only values the menu can hold: a deleted channel or role, or a channel of
         # another type, as a default would make Discord reject the whole panel.
@@ -173,6 +207,7 @@ class GuildConfigView(OwnedView):
         other_settings = [
             f"Bot manager role: {_mention_role(manager_role)}",
             f"Reminder timezone: **{time_zone}**",
+            f"Chat translation: {_translation_summary(languages)}",
             f"AI replies: **{ai_replies_status}**",
         ]
         lines = [f"Server: **{self._guild_name}**"]
@@ -289,6 +324,20 @@ class GuildConfigView(OwnedView):
 
     def _sync_time_zone_button(self, time_zone: str) -> None:
         self.time_zone_button.label = f"Timezone: {time_zone}"[:80]
+
+    def _sync_translation_menu(self, languages: tuple[Language, ...]) -> None:
+        # Fresh options for this panel: the ones on the class are shared by every panel.
+        chosen = {language.code for language in languages}
+        self.translation_languages_select.options = [
+            discord.SelectOption(
+                label=language.name,
+                value=language.code,
+                description=language.native,
+                emoji=language.flag,
+                default=language.code in chosen,
+            )
+            for language in SERVER_LANGUAGES
+        ]
 
     def _sync_panel_button(self, gift_channel: int | None) -> None:
         self.post_panel_button.disabled = not gift_channel
@@ -506,6 +555,19 @@ class GuildConfigView(OwnedView):
             return
         await self._update(interaction, manager_role_id=role.id if role is not None else None)
 
+    @discord.ui.select(
+        placeholder=f"Chat translation: the server's languages (up to {MAX_SERVER_LANGUAGES}, none = off)",
+        min_values=0,
+        max_values=MAX_SERVER_LANGUAGES,
+        options=[discord.SelectOption(label=language.name, value=language.code) for language in SERVER_LANGUAGES],
+        row=4,
+    )
+    async def translation_languages_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        """Chat is translated between the picked languages; with none picked it is off."""
+        setting = setting_from_codes(select.values)
+        self._notes.append(_translation_note(languages_from_setting(setting)))
+        await self._update(interaction, translation_languages=setting)
+
 
 class GuildConfigHandler:
     """Manager-only guild configuration command handler."""
@@ -532,7 +594,7 @@ class GuildConfigHandler:
         logger.info("GuildConfigHandler initialized")
 
     def register_commands(self):
-        @self._bot.tree.command(name="settings", description="Server setup and bot settings: kingdom, channels, timezone, manager role, AI replies")
+        @self._bot.tree.command(name="settings", description="Server setup and settings: kingdom, channels, chat translation, timezone, manager role, AI replies")
         @manager_only_command
         async def configure(interaction: discord.Interaction):
             await self._handle_configure(interaction)

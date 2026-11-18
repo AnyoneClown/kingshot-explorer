@@ -21,9 +21,16 @@ A Discord bot focused on translation, scheduling, player lookup, KVK tracking, a
 - Kingdom event calendar from kingshot.net as picture cards with the event artwork:
   `/calendar` shows what is running today, what is next, and a timeline of this week and
   the next; a server can have the daily card posted every day at 08:00 UTC.
-- Auto-translation and manual translation features that keep mentions, emoji, links and
-  line breaks intact, skip text that needs no translation, and cache repeated messages.
-  Right-click a message → **Apps → Translate** shows a private translation in the
+- Two-way chat translation without roles: a server manager picks the server's languages
+  in `/settings` (up to three, for example English + Ukrainian), and every chat message
+  gets a reply in each of those languages it is not written in. English is answered in
+  Ukrainian, Ukrainian in English, Korean in both. One language (English) translates
+  everything else into it; no languages switches chat translation off. Translations keep
+  mentions, emoji, links and line breaks intact, skip text that needs no translation
+  ("ok", "lol", emoji, links) and cache repeated messages. When more translations are
+  waiting than the model can answer promptly, new messages are skipped instead of being
+  answered late.
+- Right-click a message → **Apps → Translate** shows a private translation in the
   reader's own Discord language. Forwarded messages are translated from the forwarded
   text.
 - NVIDIA NIM powered translation plus contextual chat replies. Mentioning the bot (or
@@ -163,7 +170,6 @@ KS_DATA_API_KEY=your_kingshot_data_api_key
 KS_DATA_API_BASE_URL=https://ks.jeab.dev
 KS_DATA_TIMEOUT_SECONDS=30
 COMMAND_PREFIX=!
-TRANSLATOR_ROLE=Translator
 AUTO_REDEEM_CHANNELS=123456789012345678,876543210987654321
 RANDOM_REPLY_CHANCE=0
 RANDOM_REPLY_COOLDOWN_SECONDS=180
@@ -179,6 +185,11 @@ ignores), `MAX_SELF_REGISTERED_PLAYERS` (3),
 `LLM_TIMEOUT_SECONDS` (30), `CHAT_USER_COOLDOWN_SECONDS` (10),
 `KINGSHOT_RAG_MAX_DISTANCE` (0.7) and `TRANSLATION_LOG_RETENTION_DAYS` (30; `0` keeps
 stored translation text forever). See `.env.local.example`.
+
+`TRANSLATOR_ROLE` (`Translator`) is a leftover of role-based translation. It is read only
+to carry a server over: a server that has not chosen its languages yet gets English
+translation for everyone if that role exists there and somebody has it, and no chat
+translation otherwise. After that the role is not used and can be deleted.
 
 ## Permissions
 

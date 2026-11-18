@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import logging
 import random
@@ -15,6 +16,7 @@ from services.chatbot_service import IChatbotService
 from services.guild_configuration_service import GuildConfigurationService
 from services.interaction_tracking_service import InteractionTrackingService
 from services.text_utils import split_for_discord, truncate_cleanly
+from services.translation_languages import ENGLISH, Language, languages_from_setting, same_language
 from services.translation_service import (
     ITranslationService,
     TranslationUnavailableError,
@@ -22,6 +24,7 @@ from services.translation_service import (
     has_translatable_text,
     is_english_language,
     looks_clearly_english,
+    needs_no_translation,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +60,11 @@ class TranslationHandler:
     EMBED_TEXT_LIMIT = 3800
     MESSAGE_CHUNK_LIMIT = 1800
     MAX_TRANSLATION_MESSAGES = 3
+    # Chat translation asks the model about almost every message of a server with two
+    # languages. A burst waits its turn; past the backlog limit messages are skipped
+    # rather than answered minutes late or pushing the API key over its rate limit.
+    MAX_CONCURRENT_AUTO_TRANSLATIONS = 3
+    MAX_PENDING_AUTO_TRANSLATIONS = 12
 
     def __init__(
         self,
@@ -75,7 +83,7 @@ class TranslationHandler:
             translation_service: Service for handling translations
             chatbot_service: Service for contextual conversational replies
             bot: Discord bot instance
-            config: Bot configuration (role name, chat limits, legacy banned list)
+            config: Bot configuration (chat limits, legacy banned list and role name)
             access_policy: ``AccessPolicy``; banned users are ignored everywhere
         """
         self._translation_service = translation_service
@@ -87,6 +95,8 @@ class TranslationHandler:
         self._interaction_tracking_service = interaction_tracking_service or InteractionTrackingService()
         self._guild_configuration_service = guild_configuration_service
         self._access = access_policy
+        self._auto_translation_slots = asyncio.Semaphore(self.MAX_CONCURRENT_AUTO_TRANSLATIONS)
+        self._pending_auto_translations = 0
 
     def register_commands(self):
         """Register all translation commands with the bot."""
@@ -426,15 +436,7 @@ class TranslationHandler:
 
     async def _handle_command_error(self, ctx, error):
         """Handle errors for translation commands."""
-        if isinstance(error, commands.MissingRole):
-            await ctx.reply(
-                embed=build_status_embed(
-                    title="Missing Role",
-                    description="You need the `Translator` role to use this command.",
-                    color=EmbedColors.ERROR,
-                )
-            )
-        elif isinstance(error, commands.MissingRequiredArgument):
+        if isinstance(error, commands.MissingRequiredArgument):
             prefix = getattr(ctx, "clean_prefix", None) or "!"
             await ctx.reply(
                 embed=build_status_embed(
@@ -455,16 +457,52 @@ class TranslationHandler:
 
     # ------------------------------------------------------------------ auto translation
 
-    def _has_translator_role(self, message: discord.Message) -> bool:
-        role_name = self._config.translator_role_name if self._config else "Translator"
-        guild = getattr(message, "guild", None)
-        if guild is None:
-            return False
-        role = discord.utils.get(guild.roles, name=role_name)
-        return bool(role and role in getattr(message.author, "roles", ()))
+    async def adopt_translator_role(self, guild) -> None:
+        """Carry a server over from the old ``Translator`` role, once.
+
+        Translation used to be switched on per member by a role. A server that never
+        chose its languages keeps what it had: English translation if the role is in
+        use there, nothing otherwise. Called for every server when the bot starts or
+        joins; servers that have a choice stored are left alone.
+        """
+        service = self._guild_configuration_service
+        if service is None or guild is None:
+            return
+        try:
+            settings = await service.get_or_create_for_guild(guild.id)
+            if getattr(settings, "translation_languages", None) is not None:
+                return
+            role_name = getattr(self._config, "translator_role_name", None) or "Translator"
+            role = discord.utils.get(getattr(guild, "roles", None) or (), name=role_name)
+            in_use = bool(role is not None and getattr(role, "members", None))
+            if role is not None and not in_use and getattr(guild, "chunked", True) is False:
+                # The member list is not loaded, so "nobody has the role" proves nothing.
+                return
+            await service.update_for_guild(guild.id, translation_languages=ENGLISH.code if in_use else "")
+            logger.info(
+                "Chat translation for guild %s: %s (carried over from the %r role)",
+                guild.id,
+                "English" if in_use else "off",
+                role_name,
+            )
+        except Exception:
+            logger.warning("Could not carry over the translator role of guild %s", guild.id, exc_info=True)
+
+    async def _server_languages(self, guild) -> tuple[Language, ...]:
+        """The languages this server translates its chat into (none: translation is off)."""
+        service = self._guild_configuration_service
+        if service is None or guild is None:
+            return ()
+        try:
+            settings = await service.get_or_create_for_guild(guild.id)
+        except Exception as exc:
+            # Translation is chosen per server: a database hiccup must not switch it on.
+            logger.error("Guild configuration lookup failed for translation in guild %s: %s", guild.id, exc)
+            return ()
+        return languages_from_setting(getattr(settings, "translation_languages", None))
 
     async def _handle_auto_translation(self, message: discord.Message):
-        """Automatically translate messages from users with Translator role."""
+        """Translate a chat message into every server language it is not written in."""
         content = message.content or ""
         # Skip empty or command-like messages ("!rank", "?help"); "?? 왜" and "$100 es
         # mucho" are ordinary chat.
@@ -475,35 +513,62 @@ class TranslationHandler:
             logger.debug(f"User {message.author.id} is banned from auto-translation")
             return
 
-        if not self._has_translator_role(message):
+        # Cheap local gates before the settings lookup and the LLM call.
+        if not has_translatable_text(content) or needs_no_translation(content):
             return
 
-        # Cheap local gates before paying for an LLM call.
-        if not has_translatable_text(content) or looks_clearly_english(content):
+        languages = await self._server_languages(message.guild)
+        if not languages:
             return
+        if looks_clearly_english(content):
+            # No need to ask the model which language this is.
+            languages = tuple(language for language in languages if language.code != ENGLISH.code)
+            if not languages:
+                return
 
+        if self._pending_auto_translations >= self.MAX_PENDING_AUTO_TRANSLATIONS:
+            logger.warning(
+                "Auto-translation skipped in guild %s: %s translations are already waiting",
+                message.guild.id,
+                self._pending_auto_translations,
+            )
+            return
+        self._pending_auto_translations += 1
         try:
-            result = await self._translation_service.translate_to_english(content)
+            async with self._auto_translation_slots:
+                result = await self._translation_service.translate_to_languages(
+                    content, [language.name for language in languages]
+                )
         except TranslationUnavailableError as exc:
             logger.warning("Auto-translation skipped, service unavailable: %s", exc)
             return
         except Exception as e:
             logger.error(f"Auto-translation error: {e}", exc_info=True)
             return
+        finally:
+            self._pending_auto_translations -= 1
 
         if not result:
             return
-        translated_text = result.get("text")
         source_language = result.get("language")
-        if (
-            not translated_text
-            or is_english_language(source_language)
-            or self._same_text(translated_text, content)
-        ):
+        raw_translations = result.get("translations")
+        if not isinstance(raw_translations, dict):
+            return
+        translations: list[tuple[Language, str]] = []
+        for language in languages:
+            translated_text = raw_translations.get(language.name)
+            if (
+                not translated_text
+                or same_language(source_language, language.name)
+                or self._same_text(translated_text, content)
+            ):
+                continue
+            translations.append((language, translated_text))
+        if not translations:
             return
 
         try:
-            chunks = self._quoted_chunks(translated_text)
+            chunks = self._translation_messages(translations)
             await self._send_reply(
                 message.reply,
                 content=chunks[0],
@@ -515,16 +580,17 @@ class TranslationHandler:
             logger.error(f"Auto-translation reply failed: {e}", exc_info=True)
             return
 
-        await self._track_translation(
-            message.author,
-            original_text=content,
-            translated_text=translated_text,
-            target_language="en",
-            source_language=source_language,
-            translation_type="auto",
-            guild=message.guild,
-            channel=message.channel,
-        )
+        for language, translated_text in translations:
+            await self._track_translation(
+                message.author,
+                original_text=content,
+                translated_text=translated_text,
+                target_language=language.code,
+                source_language=source_language,
+                translation_type="auto",
+                guild=message.guild,
+                channel=message.channel,
+            )
 
     async def _track_translation(
         self,
@@ -897,6 +963,28 @@ class TranslationHandler:
             if all(len(chunk) <= 2000 for chunk in quoted) or limit <= 400:
                 return [chunk if len(chunk) <= 2000 else truncate_cleanly(chunk, 2000) for chunk in quoted]
             limit -= 200
+
+    def _translation_messages(self, translations: list[tuple[Language, str]]) -> list[str]:
+        """The reply for one message's translations, as Discord messages of at most 2000 characters.
+
+        One translation is a plain quote. Several are quotes under a small heading
+        with each language's flag and own name, packed into as few messages as fit.
+        """
+        if len(translations) == 1:
+            return self._quoted_chunks(translations[0][1])
+        blocks: list[str] = []
+        for language, text in translations:
+            heading = f"-# {language.flag} {language.native}"
+            chunks = self._quoted_chunks(text)
+            blocks.append(truncate_cleanly(f"{heading}\n{chunks[0]}", 2000))
+            blocks.extend(chunks[1:])
+        messages: list[str] = []
+        for block in blocks:
+            if messages and len(messages[-1]) + 1 + len(block) <= 2000:
+                messages[-1] = f"{messages[-1]}\n{block}"
+            else:
+                messages.append(block)
+        return messages
 
     @staticmethod
     def _as_quote_block(text: str) -> str:

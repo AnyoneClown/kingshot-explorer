@@ -339,26 +339,32 @@ def test_setup_checklist_marks_done_steps_and_the_next_one():
     assert "**Setup: 2 of 3 steps done**" in description
     assert steps[2] == "✅ **3. Daily event calendar** — <#555> · every day at 08:00 UTC"
     # The other settings stay listed under the checklist.
-    assert "Bot manager role: Not set\nReminder timezone: **UTC**\nAI replies: **Disabled**" in description
+    assert (
+        "Bot manager role: Not set\nReminder timezone: **UTC**\n"
+        "Chat translation: **Off** · pick the server's languages in the **Chat translation** menu\n"
+        "AI replies: **Disabled**"
+    ) in description
 
 
 def test_finished_setup_reads_as_plain_settings():
     async def run_test():
         view = _calendar_view(
             CalendarConfigService(
-                kingdom_id=795, gift_code_channel_id=444, calendar_channel_id=555, time_zone="Europe/Kyiv"
+                kingdom_id=795, gift_code_channel_id=444, calendar_channel_id=555, time_zone="Europe/Kyiv",
+                translation_languages="uk,en",
             )
         )
         return (await view.build_embed()).description.splitlines(), view
 
     lines, view = asyncio.run(run_test())
-    assert lines[:7] == [
+    assert lines[:8] == [
         "Server: **Test Guild**",
         "Kingdom: **795**",
         "Gift-code announcements: <#444>",
         "Event calendar: <#555> · every day at 08:00 UTC",
         "Bot manager role: Not set",
         "Reminder timezone: **Europe/Kyiv**",
+        "Chat translation: **English ↔ Ukrainian**",
         "AI replies: **Disabled**",
     ]
     assert not any("Setup:" in line or "**1. " in line for line in lines)
@@ -370,6 +376,7 @@ def test_finished_setup_reads_as_plain_settings():
         "Gift-code channel (new codes, results and the sign-up panel)",
         "Event calendar channel (daily post at 08:00 UTC)",
         "Bot manager role (optional)",
+        "Chat translation: the server's languages (up to 3, none = off)",
     ]
 
 
@@ -695,3 +702,70 @@ def test_unknown_timezones_are_rejected_with_examples():
 
     # The form belongs to the panel's owner.
     assert asyncio.run(run_test("Europe/Kyiv", user_id=222)) == ([], None)
+
+
+# ---------------------------------------------------------------- chat translation
+
+
+def test_chat_translation_menu_shows_the_saved_languages():
+    async def run_test(**values):
+        view = _calendar_view(CalendarConfigService(**values))
+        embed = await view.build_embed()
+        options = view.translation_languages_select.options
+        return embed.description, [option.value for option in options if option.default], options
+
+    description, chosen, options = asyncio.run(run_test(translation_languages="en"))
+    assert "Chat translation: other languages → **English**" in description and chosen == ["en"]
+    assert len(options) <= 25 and options[1].label == "Ukrainian" and options[1].description == "Українська"
+
+    description, chosen, _ = asyncio.run(run_test(translation_languages="ko,en,uk"))
+    assert "Chat translation: **English ↔ Ukrainian ↔ Korean**" in description
+    assert chosen == ["en", "uk", "ko"]
+
+    # One panel's saved choice does not leak into the next panel.
+    _, chosen, _ = asyncio.run(run_test())
+    assert chosen == []
+
+
+def test_picking_languages_turns_two_way_chat_translation_on():
+    service = CalendarConfigService(kingdom_id=795)
+    interaction = ModalInteraction()
+
+    async def run_test():
+        view = _calendar_view(service)
+        await view.build_embed()
+        view.translation_languages_select._values = ["uk", "en"]
+        await view.translation_languages_select.callback(interaction)
+        return view
+
+    view = asyncio.run(run_test())
+
+    assert service.updates == [{"translation_languages": "en,uk"}]
+    description = interaction.edited_original_embed.description
+    assert "Chat translation: **English ↔ Ukrainian**" in description
+    assert (
+        "✅ Chat is now translated between **English ↔ Ukrainian**: every message gets a reply in the "
+        "other language. No roles needed."
+    ) in description
+    assert [option.value for option in view.translation_languages_select.options if option.default] == ["en", "uk"]
+
+
+def test_one_language_translates_into_it_and_clearing_the_menu_switches_translation_off():
+    service = CalendarConfigService(translation_languages="en,uk")
+    interaction = ModalInteraction()
+
+    async def run_test(values):
+        view = _calendar_view(service)
+        await view.build_embed()
+        view.translation_languages_select._values = values
+        await view.translation_languages_select.callback(interaction)
+        return interaction.edited_original_embed.description
+
+    description = asyncio.run(run_test(["en"]))
+    assert "✅ Chat messages in other languages now get a reply in **English**." in description
+
+    description = asyncio.run(run_test([]))
+    # Stored as "": switched off on purpose, unlike a server that never chose.
+    assert service.updates == [{"translation_languages": "en"}, {"translation_languages": ""}]
+    assert "Chat translation: **Off**" in description and "✅ Chat translation is off." in description
+

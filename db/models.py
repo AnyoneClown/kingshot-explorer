@@ -275,6 +275,8 @@ class GuildConfiguration(Base):
     calendar_last_posted_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     # IANA timezone the server's managers enter reminder times in; unset means UTC.
     time_zone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Language codes chat is translated between ("en,uk"); empty is off, NULL is never chosen.
+    translation_languages: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

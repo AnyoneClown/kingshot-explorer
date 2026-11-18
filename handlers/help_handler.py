@@ -53,7 +53,7 @@ SECTIONS = (
         "🛠️ Server managers",
         True,
         (
-            ("settings", "the server's kingdom, channels, timezone, manager role and AI replies"),
+            ("settings", "the server's kingdom, channels, chat translation, timezone, manager role and AI replies"),
             ("giftadmin panel", "post the gift-code panel with buttons in a channel"),
             ("giftadmin import", "add a whole alliance to the gift-code list"),
             ("giftadmin roster", "the accounts of this server's kingdom: enable, disable, remove"),
@@ -148,6 +148,8 @@ class HelpHandler:
             embed.add_field(
                 name="🌐 Translation",
                 value=(
+                    "Chat is translated automatically between the languages a server manager picks in "
+                    "`/settings`; nobody needs a role for it.\n"
                     "Right-click a message (long-press on mobile) → **Apps → Translate** to read it in your "
                     "Discord language; only you see the result.\n"
                     f"To translate for everyone, reply to a message with `{prefix}en` for English or "

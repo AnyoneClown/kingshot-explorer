@@ -27,6 +27,7 @@ EDITABLE_GUILD_SETTINGS = frozenset(
         "kingdom_id",
         "calendar_last_posted_on",
         "time_zone",
+        "translation_languages",
     }
 )
 
@@ -82,6 +83,9 @@ class GuildSettings:
     calendar_last_posted_on: date | None = None
     # IANA name the server's reminder times are entered in; None means UTC.
     time_zone: str | None = None
+    # Codes of the languages chat is translated between ("en,uk", see
+    # ``services.translation_languages``); "" is off, None means never chosen.
+    translation_languages: str | None = None
 
     @classmethod
     def from_model(cls, model) -> "GuildSettings":

@@ -67,6 +67,18 @@ def test_time_zone_is_an_editable_setting_and_defaults_to_unset():
     assert GuildSettings.from_model(stored).time_zone == "Europe/Kyiv"
 
 
+def test_translation_languages_are_an_editable_setting_and_default_to_never_chosen():
+    from services.guild_configuration_service import EDITABLE_GUILD_SETTINGS, GuildSettings
+
+    assert "translation_languages" in EDITABLE_GUILD_SETTINGS
+    # None (never chosen) is not the same as "" (switched off).
+    assert GuildSettings(guild_id=1).translation_languages is None
+    assert GuildSettings.from_model(SimpleNamespace(guild_id=1)).translation_languages is None
+    assert GuildSettings.from_model(SimpleNamespace(guild_id=1, translation_languages="")).translation_languages == ""
+    stored = SimpleNamespace(guild_id=1, translation_languages="en,uk")
+    assert GuildSettings.from_model(stored).translation_languages == "en,uk"
+
+
 def test_typed_timezones_resolve_to_tz_database_names():
     from services.guild_configuration_service import canonical_time_zone
 

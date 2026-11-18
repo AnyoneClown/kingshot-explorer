@@ -5,7 +5,6 @@ from handlers.translation_handler import TranslationHandler
 from services.chatbot_service import ChatReply
 from services.translation_service import TranslationUnavailableError, UnknownLanguageError
 
-TRANSLATOR = SimpleNamespace(name="Translator", id=1)
 BOT_USER = SimpleNamespace(id=42)
 
 
@@ -53,14 +52,14 @@ class FakeChannel:
 
 
 class FakeMessage:
-    def __init__(self, content, *, author_id=10, roles=(TRANSLATOR,), mentions=(), reference=None, channel=None):
+    def __init__(self, content, *, author_id=10, roles=(), mentions=(), reference=None, channel=None):
         self.id = 1
         self.content = content
         self.clean_content = content
         self.author = SimpleNamespace(
             id=author_id, name="user", discriminator="0", display_name="User", roles=list(roles), bot=False
         )
-        self.guild = SimpleNamespace(id=456, roles=[TRANSLATOR])
+        self.guild = SimpleNamespace(id=456, roles=[])
         self.channel = channel or FakeChannel()
         self.mentions = list(mentions)
         self.reference = reference
@@ -76,11 +75,26 @@ class FakeTranslation:
         self.result = result
         self.error = error
         self.calls = []
+        # The target languages of each ``translate_to_languages`` call.
+        self.targets = []
 
     async def translate_to_english(self, text):
         self.calls.append(text)
         if self.error:
             raise self.error
+        return self.result
+
+    async def translate_to_languages(self, text, target_languages):
+        self.calls.append(text)
+        self.targets.append(list(target_languages))
+        if self.error:
+            raise self.error
+        if self.result and "translations" not in self.result:
+            # ``{"language", "text"}``: the same text for every language asked for.
+            return {
+                "language": self.result.get("language"),
+                "translations": {target: self.result["text"] for target in target_languages},
+            }
         return self.result
 
     async def translate_to_language(self, text, target_language):
@@ -117,10 +131,22 @@ class FakeAccess:
 
 
 class FakeGuildConfig:
-    def __init__(self, use_random_replies=True):
-        self.settings = SimpleNamespace(use_random_replies=use_random_replies)
+    def __init__(self, use_random_replies=True, translation_languages="en", error=None):
+        self.settings = SimpleNamespace(
+            use_random_replies=use_random_replies, translation_languages=translation_languages
+        )
+        self.error = error
+        self.updates = []
 
     async def get_or_create_for_guild(self, guild_id):
+        if self.error:
+            raise self.error
+        return self.settings
+
+    async def update_for_guild(self, guild_id, **changes):
+        self.updates.append((guild_id, changes))
+        for name, value in changes.items():
+            setattr(self.settings, name, value)
         return self.settings
 
 
@@ -137,8 +163,11 @@ def make_config(**overrides):
     return SimpleNamespace(**values)
 
 
-def make_handler(translation=None, chatbot=None, *, access=None, guild_config=None, **config):
+def make_handler(translation=None, chatbot=None, *, access=None, guild_config=None, languages="en", **config):
+    """A handler on a server whose chat is translated between ``languages`` (codes)."""
     tracking = FakeTracking()
+    if guild_config is None:
+        guild_config = FakeGuildConfig(translation_languages=languages)
     handler = TranslationHandler(
         translation_service=translation or FakeTranslation(),
         chatbot_service=chatbot or FakeChatbot(),
@@ -178,7 +207,9 @@ def test_auto_translation_replies_without_pinging_and_tracks():
     assert reply["content"] == "> Attack at five <@123456789012345678>"
     assert reply["mention_author"] is False
     assert reply["allowed_mentions"].users is False and reply["allowed_mentions"].replied_user is False
+    assert translation.targets == [["English"]]
     assert tracking.calls[0]["source_language"] == "Spanish"
+    assert tracking.calls[0]["target_language"] == "en"
     assert tracking.calls[0]["translation_type"] == "auto"
 
 
@@ -201,14 +232,145 @@ def test_auto_translation_outage_is_silent():
     assert message.replies == [] and tracking.calls == []
 
 
-def test_auto_translation_ignores_banned_users_and_non_translators():
+def test_auto_translation_needs_no_role_and_ignores_banned_users():
     translation = FakeTranslation({"language": "Spanish", "text": "Hi friends"})
     handler, _ = make_handler(translation, access=FakeAccess(banned={10}))
 
     asyncio.run(handler._handle_auto_translation(FakeMessage("hola amigos")))
-    asyncio.run(handler._handle_auto_translation(FakeMessage("hola amigos", author_id=11, roles=())))
-
     assert translation.calls == []
+
+    member = FakeMessage("hola amigos", author_id=11, roles=())
+    asyncio.run(handler._handle_auto_translation(member))
+    assert translation.calls == ["hola amigos"] and member.replies[0]["content"] == "> Hi friends"
+
+
+def test_auto_translation_is_off_until_a_server_picks_its_languages():
+    for languages in (None, "", "xx"):
+        translation = FakeTranslation({"language": "Spanish", "text": "Hi friends"})
+        handler, _ = make_handler(translation, languages=languages)
+        message = FakeMessage("hola amigos")
+        asyncio.run(handler._handle_auto_translation(message))
+        assert translation.calls == [] and message.replies == []
+
+    # A database failure must not switch translation on, nor break the chat handler.
+    translation = FakeTranslation({"language": "Spanish", "text": "Hi friends"})
+    handler, _ = make_handler(translation, guild_config=FakeGuildConfig(error=RuntimeError("db down")))
+    asyncio.run(handler._handle_auto_translation(FakeMessage("hola amigos")))
+    assert translation.calls == []
+
+
+def test_two_server_languages_translate_in_both_directions():
+    translation = FakeTranslation()
+    handler, tracking = make_handler(translation, languages="en,uk")
+
+    # Clearly English: only the other language is asked for, without language detection.
+    translation.result = {"language": "English", "translations": {"Ukrainian": "Ралі на ведмедя о 17:00"}}
+    english = FakeMessage("we need to rally the bear at 5 pm")
+    asyncio.run(handler._handle_auto_translation(english))
+    assert translation.targets[-1] == ["Ukrainian"]
+    assert english.replies[0]["content"] == "> Ралі на ведмедя о 17:00"
+    assert tracking.calls[-1]["target_language"] == "uk"
+
+    # Ukrainian: the model is asked for both and leaves out the message's own language.
+    translation.result = {"language": "Ukrainian", "translations": {"English": "Who is leading the rally?"}}
+    ukrainian = FakeMessage("Хто веде ралі?")
+    asyncio.run(handler._handle_auto_translation(ukrainian))
+    assert translation.targets[-1] == ["English", "Ukrainian"]
+    assert ukrainian.replies[0]["content"] == "> Who is leading the rally?"
+    assert [call["target_language"] for call in tracking.calls] == ["uk", "en"]
+
+
+def test_a_third_language_is_translated_into_every_server_language_in_one_reply():
+    translation = FakeTranslation(
+        {"language": "Korean", "translations": {"English": "Why attack?", "Ukrainian": "Навіщо атакувати?"}}
+    )
+    handler, tracking = make_handler(translation, languages="uk,en")
+    message = FakeMessage("왜 공격해요")
+
+    asyncio.run(handler._handle_auto_translation(message))
+
+    assert len(message.replies) == 1 and message.channel.sent == []
+    assert message.replies[0]["content"] == (
+        "-# 🇬🇧 English\n> Why attack?\n-# 🇺🇦 Українська\n> Навіщо атакувати?"
+    )
+    assert message.replies[0]["allowed_mentions"].users is False
+    assert [(call["target_language"], call["source_language"]) for call in tracking.calls] == [
+        ("en", "Korean"), ("uk", "Korean"),
+    ]
+
+
+def test_translations_into_the_messages_own_language_are_dropped():
+    # The model echoed the text for its own language instead of leaving it out.
+    translation = FakeTranslation(
+        {"language": "Brazilian Portuguese", "translations": {"Portuguese": "bom dia a todos", "English": "x"}}
+    )
+    handler, tracking = make_handler(translation, languages="en,pt")
+    message = FakeMessage("bom dia a todos")
+    asyncio.run(handler._handle_auto_translation(message))
+    assert message.replies[0]["content"] == "> x" and len(tracking.calls) == 1
+
+    # Reported as another language, but the "translation" is the message itself.
+    translation.result = {"language": "Spanish", "translations": {"English": "Hola Amigos", "Portuguese": None}}
+    message = FakeMessage("hola amigos")
+    asyncio.run(handler._handle_auto_translation(message))
+    assert message.replies == []
+
+
+def test_chat_noises_are_not_translated_in_any_direction():
+    translation = FakeTranslation({"language": "English", "text": "x"})
+    handler, _ = make_handler(translation, languages="en,uk")
+
+    for content in ("ok", "lol gg", "Хахаха", "ок 👍", "jajaja xD", "ㅋㅋㅋ"):
+        message = FakeMessage(content)
+        asyncio.run(handler._handle_auto_translation(message))
+        assert message.replies == [], content
+    assert translation.calls == []
+
+
+def test_a_backlog_of_translations_skips_new_messages_instead_of_queueing_forever():
+    translation = FakeTranslation({"language": "Spanish", "text": "Hi friends"})
+    handler, _ = make_handler(translation)
+    handler._pending_auto_translations = handler.MAX_PENDING_AUTO_TRANSLATIONS
+
+    asyncio.run(handler._handle_auto_translation(FakeMessage("hola amigos")))
+    assert translation.calls == []
+
+    # The counter is given back after a translation, also a failed one.
+    handler._pending_auto_translations = 0
+    asyncio.run(handler._handle_auto_translation(FakeMessage("hola amigos")))
+    translation.error = TranslationUnavailableError("down")
+    asyncio.run(handler._handle_auto_translation(FakeMessage("buenas noches")))
+    assert len(translation.calls) == 2 and handler._pending_auto_translations == 0
+
+
+def test_servers_that_used_the_translator_role_keep_english_translation():
+    def guild(*, members=(), chunked=True, with_role=True):
+        role = SimpleNamespace(name="Translator", id=1, members=list(members))
+        return SimpleNamespace(id=456, roles=[role] if with_role else [], chunked=chunked)
+
+    async def adopt(guild_config, server):
+        handler, _ = make_handler(guild_config=guild_config)
+        await handler.adopt_translator_role(server)
+        return guild_config
+
+    in_use = asyncio.run(adopt(FakeGuildConfig(translation_languages=None), guild(members=[object()])))
+    assert in_use.updates == [(456, {"translation_languages": "en"})]
+
+    for unused in (guild(), guild(with_role=False)):
+        config = asyncio.run(adopt(FakeGuildConfig(translation_languages=None), unused))
+        assert config.updates == [(456, {"translation_languages": ""})]
+
+    # A choice that is already stored (also "off") is never overwritten.
+    for chosen in ("", "uk,en"):
+        config = asyncio.run(adopt(FakeGuildConfig(translation_languages=chosen), guild(members=[object()])))
+        assert config.updates == []
+
+    # Without the member list "nobody has the role" is unknown: decide on a later start.
+    config = asyncio.run(adopt(FakeGuildConfig(translation_languages=None), guild(chunked=False)))
+    assert config.updates == []
+
+    # A failing database is logged, not raised into on_ready.
+    asyncio.run(adopt(FakeGuildConfig(error=RuntimeError("db down")), guild(members=[object()])))
 
 
 def test_long_auto_translation_is_split_cleanly():

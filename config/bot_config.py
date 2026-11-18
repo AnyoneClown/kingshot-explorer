@@ -33,6 +33,8 @@ class BotConfig:
     database_url: str
     nvidia_api_key: str
     command_prefix: str = "!"
+    # Legacy: only read to carry servers over from role-based translation (see
+    # ``TranslationHandler.adopt_translator_role``); languages are chosen in /settings.
     translator_role_name: str = "Translator"
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"

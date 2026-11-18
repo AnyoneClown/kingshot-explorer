@@ -402,6 +402,10 @@ class TranslatorBot:
                 except Exception as e:
                     logger.error(f"Failed to sync slash commands: {e}")
 
+            # Servers that used the old Translator role keep their translation.
+            for guild in self.bot.guilds:
+                await self.translation_handler.adopt_translator_role(guild)
+
             # Buttons of gift-code panels posted before this start work again.
             self.gift_code_handler.register_persistent_views()
             self.calendar_handler.register_persistent_views()
@@ -446,6 +450,7 @@ class TranslatorBot:
         async def on_guild_join(guild):
             """Log the join and post a short setup hint for the server's managers."""
             logger.info(f"Bot joined new guild: {guild.name} (ID: {guild.id}) - {guild.member_count} members")
+            await self.translation_handler.adopt_translator_role(guild)
             await self._send_welcome(guild)
 
         @self.bot.event
@@ -505,7 +510,8 @@ class TranslatorBot:
             title=f"Thanks for adding {getattr(self.bot.user, 'display_name', None) or 'the bot'}",
             description=(
                 "**Server managers:** run `/settings`. Its three-step checklist sets the server's kingdom, "
-                "the gift-code channel with the sign-up panel, and the daily event calendar.\n"
+                "the gift-code channel with the sign-up panel, and the daily event calendar. Pick the "
+                "server's languages there too, and chat is translated between them automatically.\n"
                 "**Everyone:** run `/gift` to get new gift codes redeemed for you automatically, and `/help` "
                 "for everything else: player lookups, rankings, KvK, the event calendar, reminders and "
                 "translation (right-click a message → Apps → Translate)."
