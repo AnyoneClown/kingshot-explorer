@@ -4,6 +4,7 @@ from services.translation_languages import (
     ENGLISH,
     MAX_SERVER_LANGUAGES,
     SERVER_LANGUAGES,
+    language_by_code,
     languages_from_setting,
     same_language,
     setting_from_codes,
@@ -25,8 +26,11 @@ def test_setting_round_trips_in_catalogue_order_and_ignores_junk():
     assert setting_from_codes(["uk", "en"]) == "en,uk"
     assert setting_from_codes([]) == ""
     assert setting_from_codes(["zh-TW", "ko"]) == "ko,zh-TW"
+    # Russian is not offered: a server that had it stored keeps its other languages.
+    assert language_by_code("ru") is None
+    assert [language.code for language in languages_from_setting("en,ru,uk")] == ["en", "uk"]
     # Never more than the limit, whatever was stored.
-    assert len(languages_from_setting("en,uk,ru,es,pt")) == MAX_SERVER_LANGUAGES
+    assert len(languages_from_setting("en,uk,de,es,pt")) == MAX_SERVER_LANGUAGES
 
 
 @pytest.mark.parametrize(

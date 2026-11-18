@@ -37,7 +37,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 
 # Discord client languages -> the language the "Translate" message command targets.
 LOCALE_LANGUAGES = {
-    "en-US": "English", "en-GB": "English", "uk": "Ukrainian", "ru": "Russian", "de": "German",
+    "en-US": "English", "en-GB": "English", "uk": "Ukrainian", "de": "German",
     "fr": "French", "es-ES": "Spanish", "es-419": "Spanish", "pt-BR": "Portuguese", "it": "Italian",
     "pl": "Polish", "tr": "Turkish", "nl": "Dutch", "cs": "Czech", "ro": "Romanian", "hu": "Hungarian",
     "el": "Greek", "bg": "Bulgarian", "hr": "Croatian", "lt": "Lithuanian", "sv-SE": "Swedish",

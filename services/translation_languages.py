@@ -27,7 +27,6 @@ class Language:
 SERVER_LANGUAGES: tuple[Language, ...] = (
     Language("en", "English", "English", "🇬🇧"),
     Language("uk", "Ukrainian", "Українська", "🇺🇦"),
-    Language("ru", "Russian", "Русский", "🇷🇺"),
     Language("es", "Spanish", "Español", "🇪🇸"),
     Language("pt", "Portuguese", "Português", "🇵🇹"),
     Language("de", "German", "Deutsch", "🇩🇪"),

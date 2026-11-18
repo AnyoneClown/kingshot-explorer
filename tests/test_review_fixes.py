@@ -206,6 +206,9 @@ def test_translate_message_command_answers_privately_in_the_callers_language():
     asyncio.run(check())
     assert language_for_locale(discord.Locale.american_english) == "English"
     assert language_for_locale("xx-unknown") == "English" and language_for_locale(None) == "English"
+    # Russian is not a language the bot offers: such a client reads translations in English.
+    assert language_for_locale(discord.Locale.russian) == "English"
+    assert language_for_locale(discord.Locale.ukrainian) == "Ukrainian"
 
 
 def test_translate_message_command_is_registered_as_a_context_menu():
